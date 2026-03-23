@@ -13,6 +13,8 @@ from backend.models import AudiobookResult, AudiobookDetail
 logger = logging.getLogger(__name__)
 
 QBITTORRENT_URL = os.getenv("QBITTORRENT_URL", "http://qbittorrent.servarr.svc.cluster.local")
+QBITTORRENT_USER = os.getenv("QBITTORRENT_USER", "admin")
+QBITTORRENT_PASS = os.getenv("QBITTORRENT_PASS", "")
 AUDIOBOOKSHELF_URL = os.getenv("AUDIOBOOKSHELF_URL", "http://audiobookshelf.audiobookshelf.svc.cluster.local")
 AUDIOBOOKSHELF_TOKEN = os.getenv("AUDIOBOOKSHELF_TOKEN", "")
 
@@ -91,7 +93,15 @@ async def download_audiobook(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Add torrent to qBittorrent
+            # Login to qBittorrent
+            login_resp = await client.post(
+                f"{QBITTORRENT_URL}/api/v2/auth/login",
+                data={"username": QBITTORRENT_USER, "password": QBITTORRENT_PASS},
+            )
+            if login_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"qBittorrent login failed: {login_resp.status_code}")
+
+            # Add torrent to qBittorrent (cookies from login are on the client)
             resp = await client.post(
                 f"{QBITTORRENT_URL}/api/v2/torrents/add",
                 data={
@@ -127,6 +137,16 @@ async def _poll_and_scan(magnet_url: str, author: str, title: str):
     max_polls = 120  # 1 hour max
 
     async with httpx.AsyncClient(timeout=15.0) as client:
+        # Login to qBittorrent for polling
+        try:
+            await client.post(
+                f"{QBITTORRENT_URL}/api/v2/auth/login",
+                data={"username": QBITTORRENT_USER, "password": QBITTORRENT_PASS},
+            )
+        except Exception as e:
+            logger.warning(f"qBittorrent login for polling failed: {e}")
+            return
+
         for i in range(max_polls):
             await asyncio.sleep(poll_interval)
             try:
@@ -501,41 +521,57 @@ async def web_ui():
                 return;
             }
 
-            resultsEl.innerHTML = results.map(book => `
-                <div class="card">
-                    ${book.cover_url ? `<img src="${book.cover_url}" alt="${book.title}" class="card-image">` : ''}
-                    <div class="card-content">
-                        <div class="card-title">${book.title}</div>
-                        ${book.author ? `<div class="card-meta">Author: ${book.author}</div>` : ''}
-                        ${book.narrator ? `<div class="card-meta">Narrator: ${book.narrator}</div>` : ''}
-                        ${book.format ? `<div class="card-meta">Format: ${book.format}</div>` : ''}
-                        ${book.size ? `<div class="card-meta">Size: ${book.size}</div>` : ''}
-                        <div class="card-actions">
-                            <button class="download-btn" onclick="prepareDownload('${book.id}', '${escapeHtml(book.author || '')}', '${escapeHtml(book.title)}')">
-                                Download
-                            </button>
+            resultsEl.innerHTML = results.map(book => {
+                const div = document.createElement('div');
+                div.textContent = book.title;
+                const escapedTitle = div.innerHTML;
+                div.textContent = book.author || '';
+                const escapedAuthor = div.innerHTML;
+
+                return `
+                    <div class="card">
+                        ${book.cover_url ? `<img src="${book.cover_url}" alt="${escapedTitle}" class="card-image">` : ''}
+                        <div class="card-content">
+                            <div class="card-title">${escapedTitle}</div>
+                            ${book.author ? `<div class="card-meta">Author: ${escapedAuthor}</div>` : ''}
+                            ${book.narrator ? `<div class="card-meta">Narrator: ${book.narrator}</div>` : ''}
+                            ${book.format ? `<div class="card-meta">Format: ${book.format}</div>` : ''}
+                            ${book.size ? `<div class="card-meta">Size: ${book.size}</div>` : ''}
+                            <div class="card-actions">
+                                <button class="download-btn"
+                                    data-book-id="${book.id}"
+                                    data-book-author="${escapedAuthor}"
+                                    data-book-title="${escapedTitle}"
+                                    onclick="prepareDownload(this)">
+                                    Download
+                                </button>
+                            </div>
                         </div>
                     </div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
 
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
+        async function prepareDownload(button) {
+            const bookId = button.dataset.bookId;
+            const author = button.dataset.bookAuthor;
+            const title = button.dataset.bookTitle;
 
-        async function prepareDownload(bookId, author, title) {
             showStatus('Fetching download details...', 'info');
 
             try {
                 const response = await fetch(`/audiobook/${encodeURIComponent(bookId)}`);
                 if (!response.ok) {
-                    throw new Error('Failed to fetch audiobook details');
+                    const errorText = await response.text();
+                    console.error('Server response:', response.status, errorText);
+                    throw new Error(`Server returned ${response.status}`);
                 }
 
                 const detail = await response.json();
+                if (!detail.magnet_url) {
+                    throw new Error('No magnet URL in response');
+                }
+
                 currentMagnetUrl = detail.magnet_url;
 
                 // Pre-fill the modal
@@ -566,6 +602,7 @@ async def web_ui():
 
             if (!currentMagnetUrl) {
                 showStatus('No magnet URL available', 'error');
+                console.error('currentMagnetUrl is null or undefined:', currentMagnetUrl);
                 return;
             }
 
@@ -574,23 +611,29 @@ async def web_ui():
             showStatus('Sending download request...', 'info');
 
             try {
+                const requestBody = {
+                    magnet_url: magnetUrl,
+                    author: author,
+                    title: title,
+                };
+                console.log('Sending download request:', requestBody);
+
                 const response = await fetch('/download', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        magnet_url: magnetUrl,
-                        author: author,
-                        title: title,
-                    }),
+                    body: JSON.stringify(requestBody),
                 });
 
                 if (!response.ok) {
-                    throw new Error('Download request failed');
+                    const errorText = await response.text();
+                    console.error('Download failed:', response.status, errorText);
+                    throw new Error(`Server returned ${response.status}`);
                 }
 
-                showStatus('Download started successfully!', 'success');
+                const result = await response.json();
+                showStatus(result.message || 'Download started successfully!', 'success');
             } catch (error) {
                 showStatus('Failed to start download: ' + error.message, 'error');
                 console.error('Download error:', error);
