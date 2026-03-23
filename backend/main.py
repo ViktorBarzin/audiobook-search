@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
@@ -75,8 +75,16 @@ async def get_audiobook_detail(book_id: str):
 
 
 @app.post("/download")
-async def download_audiobook(req: DownloadRequest):
+async def download_audiobook(request: Request):
     """Send magnet to qBittorrent, save to audiobookshelf path, trigger scan when done."""
+    try:
+        body = await request.json()
+        req = DownloadRequest(**body)
+    except Exception as e:
+        raw = await request.body()
+        logger.error(f"Failed to parse download request: {e}, raw body: {raw[:200]}, content-type: {request.headers.get('content-type')}")
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+
     author = req.author.strip() or "Unknown Author"
     title = req.title.strip() or "Unknown Title"
     save_path = f"/audiobooks/{author}/{title}"
