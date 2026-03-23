@@ -101,6 +101,16 @@ async def download_audiobook(request: Request):
             if login_resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"qBittorrent login failed: {login_resp.status_code}")
 
+            # Delete existing torrent if present (supports re-download after deletion)
+            import re as _re
+            hash_match = _re.search(r"btih:([a-fA-F0-9]{40})", req.magnet_url)
+            if hash_match:
+                info_hash = hash_match.group(1).lower()
+                await client.post(
+                    f"{QBITTORRENT_URL}/api/v2/torrents/delete",
+                    data={"hashes": info_hash, "deleteFiles": "false"},
+                )
+
             # Add torrent to qBittorrent (cookies from login are on the client)
             resp = await client.post(
                 f"{QBITTORRENT_URL}/api/v2/torrents/add",
@@ -195,6 +205,39 @@ async def _trigger_audiobookshelf_scan(client: httpx.AsyncClient):
             )
     except Exception as e:
         logger.warning(f"Failed to trigger Audiobookshelf scan: {e}")
+
+
+@app.get("/downloads")
+async def list_downloads():
+    """Get status of all audiobook downloads from qBittorrent."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Login
+            await client.post(
+                f"{QBITTORRENT_URL}/api/v2/auth/login",
+                data={"username": QBITTORRENT_USER, "password": QBITTORRENT_PASS},
+            )
+            # Get audiobook torrents
+            resp = await client.get(
+                f"{QBITTORRENT_URL}/api/v2/torrents/info",
+                params={"category": "audiobooks"},
+            )
+            torrents = resp.json()
+            return [
+                {
+                    "name": t["name"],
+                    "progress": t["progress"],
+                    "size": t["total_size"],
+                    "downloaded": t["downloaded"],
+                    "speed": t["dlspeed"],
+                    "eta": t["eta"],
+                    "state": t["state"],
+                    "save_path": t["save_path"],
+                }
+                for t in torrents
+            ]
+    except Exception as e:
+        return []
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -432,6 +475,112 @@ async def web_ui():
         .cancel-btn:hover {
             background: #555;
         }
+
+        .section-title {
+            font-size: 24px;
+            margin: 30px 0 20px 0;
+            color: #ffffff;
+            border-bottom: 2px solid #444;
+            padding-bottom: 10px;
+        }
+
+        .downloads-list {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .download-item {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 16px;
+        }
+
+        .download-name {
+            font-size: 16px;
+            font-weight: bold;
+            color: #ffffff;
+            margin-bottom: 8px;
+        }
+
+        .download-meta {
+            font-size: 14px;
+            color: #aaa;
+            margin-bottom: 4px;
+        }
+
+        .download-state {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-top: 8px;
+        }
+
+        .state-downloading {
+            background: #1a3a5c;
+            color: #b3d9ff;
+        }
+
+        .state-seeding {
+            background: #2d5016;
+            color: #90ee90;
+        }
+
+        .state-paused {
+            background: #5c5c1a;
+            color: #ffff90;
+        }
+
+        .state-error {
+            background: #5c1a1a;
+            color: #ffb3b3;
+        }
+
+        .state-stalled {
+            background: #5c4a1a;
+            color: #ffd9b3;
+        }
+
+        .state-queued {
+            background: #3a3a3a;
+            color: #ccc;
+        }
+
+        .progress-bar-container {
+            width: 100%;
+            height: 24px;
+            background: #1a1a1a;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 8px 0;
+            border: 1px solid #444;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: #5a9fd4;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .progress-bar-fill.complete {
+            background: #4a8025;
+        }
+
+        .no-downloads {
+            text-align: center;
+            padding: 40px;
+            color: #aaa;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -446,6 +595,9 @@ async def web_ui():
         <div id="status" class="status"></div>
 
         <div id="results" class="results"></div>
+
+        <h2 class="section-title">Active Downloads</h2>
+        <div id="downloads" class="downloads-list"></div>
     </div>
 
     <div id="downloadModal" class="modal">
@@ -478,6 +630,117 @@ async def web_ui():
             setTimeout(() => {
                 statusEl.style.display = 'none';
             }, 5000);
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function formatSpeed(bytesPerSecond) {
+            if (bytesPerSecond === 0) return '0 B/s';
+            const k = 1024;
+            const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+            const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
+            return parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function formatETA(seconds) {
+            if (seconds === 8640000 || seconds < 0) return 'Unknown';
+            if (seconds === 0) return 'Complete';
+
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+
+            if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            }
+            return `${minutes}m`;
+        }
+
+        function getStateClass(state) {
+            const stateMap = {
+                'downloading': 'state-downloading',
+                'stalledDL': 'state-stalled',
+                'uploading': 'state-seeding',
+                'stalledUP': 'state-seeding',
+                'pausedDL': 'state-paused',
+                'pausedUP': 'state-paused',
+                'queuedDL': 'state-queued',
+                'queuedUP': 'state-queued',
+                'error': 'state-error',
+                'checkingUP': 'state-queued',
+                'checkingDL': 'state-queued',
+            };
+            return stateMap[state] || 'state-queued';
+        }
+
+        function getStateText(state) {
+            const stateMap = {
+                'downloading': 'Downloading',
+                'stalledDL': 'Stalled',
+                'uploading': 'Seeding',
+                'stalledUP': 'Seeding',
+                'pausedDL': 'Paused',
+                'pausedUP': 'Paused',
+                'queuedDL': 'Queued',
+                'queuedUP': 'Queued',
+                'error': 'Error',
+                'checkingUP': 'Checking',
+                'checkingDL': 'Checking',
+            };
+            return stateMap[state] || state;
+        }
+
+        async function refreshDownloads() {
+            try {
+                const response = await fetch('/downloads');
+                if (!response.ok) {
+                    throw new Error('Failed to fetch downloads');
+                }
+
+                const downloads = await response.json();
+                displayDownloads(downloads);
+            } catch (error) {
+                console.error('Failed to refresh downloads:', error);
+            }
+        }
+
+        function displayDownloads(downloads) {
+            const downloadsEl = document.getElementById('downloads');
+
+            if (downloads.length === 0) {
+                downloadsEl.innerHTML = '<div class="no-downloads">No active downloads</div>';
+                return;
+            }
+
+            downloadsEl.innerHTML = downloads.map(dl => {
+                const progressPercent = (dl.progress * 100).toFixed(1);
+                const isComplete = dl.progress >= 1.0;
+                const progressBarClass = isComplete ? 'progress-bar-fill complete' : 'progress-bar-fill';
+
+                const div = document.createElement('div');
+                div.textContent = dl.name;
+                const escapedName = div.innerHTML;
+
+                return `
+                    <div class="download-item">
+                        <div class="download-name">${escapedName}</div>
+                        <div class="progress-bar-container">
+                            <div class="${progressBarClass}" style="width: ${progressPercent}%">
+                                ${progressPercent}%
+                            </div>
+                        </div>
+                        <div class="download-meta">Size: ${formatBytes(dl.size)} (${formatBytes(dl.downloaded)} downloaded)</div>
+                        <div class="download-meta">Speed: ${formatSpeed(dl.speed)} | ETA: ${formatETA(dl.eta)}</div>
+                        <div class="download-meta">Path: ${dl.save_path}</div>
+                        <span class="download-state ${getStateClass(dl.state)}">${getStateText(dl.state)}</span>
+                    </div>
+                `;
+            }).join('');
         }
 
         async function search() {
@@ -634,6 +897,8 @@ async def web_ui():
 
                 const result = await response.json();
                 showStatus(result.message || 'Download started successfully!', 'success');
+                // Trigger immediate refresh of downloads list
+                refreshDownloads();
             } catch (error) {
                 showStatus('Failed to start download: ' + error.message, 'error');
                 console.error('Download error:', error);
@@ -653,6 +918,12 @@ async def web_ui():
                 closeModal();
             }
         });
+
+        // Auto-refresh downloads every 10 seconds
+        setInterval(refreshDownloads, 10000);
+
+        // Initial load of downloads
+        refreshDownloads();
     </script>
 </body>
 </html>
