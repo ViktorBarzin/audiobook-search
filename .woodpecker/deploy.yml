@@ -1,0 +1,23 @@
+when:
+  - event: [manual, push]
+
+steps:
+  - name: check-vars
+    image: alpine
+    commands:
+      - "[ -n \"$IMAGE_TAG\" ] || (echo 'IMAGE_TAG not set, skipping deploy'; exit 78)"
+
+  - name: deploy
+    image: bitnami/kubectl:latest
+    commands:
+      - "kubectl set image deployment/audiobook-search audiobook-search=${IMAGE_NAME}:${IMAGE_TAG} -n servarr"
+      - "kubectl rollout status deployment/audiobook-search -n servarr --timeout=300s"
+
+  - name: notify
+    image: woodpeckerci/plugin-slack
+    settings:
+      webhook:
+        from_secret: slack-webhook-url
+      channel: general
+    when:
+      - status: [success, failure]
