@@ -569,6 +569,7 @@ async def web_ui():
                 return;
             }
 
+            const magnetUrl = currentMagnetUrl;
             closeModal();
             showStatus('Sending download request...', 'info');
 
@@ -579,7 +580,7 @@ async def web_ui():
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        magnet_url: currentMagnetUrl,
+                        magnet_url: magnetUrl,
                         author: author,
                         title: title,
                     }),
