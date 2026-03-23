@@ -1,4 +1,6 @@
 import os
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -7,6 +9,12 @@ import httpx
 
 from backend.scraper import AudioBookBayScraper
 from backend.models import AudiobookResult, AudiobookDetail
+
+logger = logging.getLogger(__name__)
+
+QBITTORRENT_URL = os.getenv("QBITTORRENT_URL", "http://qbittorrent.servarr.svc.cluster.local")
+AUDIOBOOKSHELF_URL = os.getenv("AUDIOBOOKSHELF_URL", "http://audiobookshelf.audiobookshelf.svc.cluster.local")
+AUDIOBOOKSHELF_TOKEN = os.getenv("AUDIOBOOKSHELF_TOKEN", "")
 
 
 class DownloadRequest(BaseModel):
@@ -68,19 +76,97 @@ async def get_audiobook_detail(book_id: str):
 
 @app.post("/download")
 async def download_audiobook(req: DownloadRequest):
-    """Forward download request to n8n webhook (server-side, avoids CORS)."""
-    webhook_url = os.getenv("N8N_DOWNLOAD_WEBHOOK_URL", "http://n8n.n8n.svc.cluster.local/webhook/audiobook-download")
+    """Send magnet to qBittorrent, save to audiobookshelf path, trigger scan when done."""
+    author = req.author.strip() or "Unknown Author"
+    title = req.title.strip() or "Unknown Title"
+    save_path = f"/audiobooks/{author}/{title}"
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(webhook_url, json={
-                "magnet_url": req.magnet_url,
-                "author": req.author,
-                "title": req.title,
-            })
-            resp.raise_for_status()
-            return {"status": "ok", "message": "Download started"}
+            # Add torrent to qBittorrent
+            resp = await client.post(
+                f"{QBITTORRENT_URL}/api/v2/torrents/add",
+                data={
+                    "urls": req.magnet_url,
+                    "savepath": save_path,
+                    "category": "audiobooks",
+                },
+            )
+            if resp.status_code != 200 or resp.text.strip().lower() != "ok.":
+                raise HTTPException(status_code=502, detail=f"qBittorrent rejected torrent: {resp.text}")
+
+        # Start background task to poll completion and trigger library scan
+        asyncio.create_task(_poll_and_scan(req.magnet_url, author, title))
+
+        return {"status": "ok", "message": f"Download started → {save_path}"}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to trigger download: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to add torrent: {e}")
+
+
+async def _poll_and_scan(magnet_url: str, author: str, title: str):
+    """Poll qBittorrent until download completes, then trigger Audiobookshelf scan."""
+    # Extract info hash from magnet URL
+    import re
+    hash_match = re.search(r"btih:([a-fA-F0-9]{40})", magnet_url)
+    if not hash_match:
+        logger.warning("Could not extract info hash from magnet URL")
+        return
+
+    info_hash = hash_match.group(1).lower()
+    poll_interval = 30
+    max_polls = 120  # 1 hour max
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for i in range(max_polls):
+            await asyncio.sleep(poll_interval)
+            try:
+                resp = await client.get(
+                    f"{QBITTORRENT_URL}/api/v2/torrents/info",
+                    params={"hashes": info_hash},
+                )
+                torrents = resp.json()
+                if not torrents:
+                    continue
+
+                torrent = torrents[0]
+                progress = torrent.get("progress", 0)
+                state = torrent.get("state", "")
+                logger.info(f"[{author} - {title}] Progress: {progress:.0%}, State: {state}")
+
+                if progress >= 1.0:
+                    logger.info(f"[{author} - {title}] Download complete, triggering library scan")
+                    await _trigger_audiobookshelf_scan(client)
+                    return
+            except Exception as e:
+                logger.warning(f"Poll error: {e}")
+
+    logger.warning(f"[{author} - {title}] Timed out waiting for download")
+
+
+async def _trigger_audiobookshelf_scan(client: httpx.AsyncClient):
+    """Trigger Audiobookshelf library scan."""
+    if not AUDIOBOOKSHELF_TOKEN:
+        logger.warning("AUDIOBOOKSHELF_TOKEN not set, skipping library scan")
+        return
+
+    try:
+        # Get libraries
+        resp = await client.get(
+            f"{AUDIOBOOKSHELF_URL}/api/libraries",
+            headers={"Authorization": f"Bearer {AUDIOBOOKSHELF_TOKEN}"},
+        )
+        libraries = resp.json().get("libraries", [])
+        for lib in libraries:
+            lib_id = lib["id"]
+            logger.info(f"Scanning library: {lib['name']} ({lib_id})")
+            await client.post(
+                f"{AUDIOBOOKSHELF_URL}/api/libraries/{lib_id}/scan",
+                headers={"Authorization": f"Bearer {AUDIOBOOKSHELF_TOKEN}"},
+            )
+    except Exception as e:
+        logger.warning(f"Failed to trigger Audiobookshelf scan: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
