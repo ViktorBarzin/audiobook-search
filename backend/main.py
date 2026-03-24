@@ -3,7 +3,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 import httpx
 
@@ -288,6 +288,39 @@ async def delete_download(torrent_hash: str, delete_files: bool = False):
             return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to delete torrent: {e}")
+
+
+@app.get("/files/{path:path}")
+async def list_files(path: str):
+    """List files in a download directory."""
+    # Only allow access under /audiobooks/
+    base = "/audiobooks"
+    full_path = os.path.normpath(os.path.join(base, path))
+    if not full_path.startswith(base):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.exists(full_path):
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    if os.path.isfile(full_path):
+        return FileResponse(full_path, filename=os.path.basename(full_path))
+
+    files = []
+    for entry in sorted(os.listdir(full_path)):
+        entry_path = os.path.join(full_path, entry)
+        rel_path = os.path.relpath(entry_path, base)
+        if os.path.isfile(entry_path):
+            files.append({
+                "name": entry,
+                "size": os.path.getsize(entry_path),
+                "path": rel_path,
+            })
+        elif os.path.isdir(entry_path):
+            files.append({
+                "name": entry + "/",
+                "size": 0,
+                "path": rel_path,
+            })
+    return files
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -661,9 +694,10 @@ async def web_ui():
                 <label for="titleInput">Title:</label>
                 <input type="text" id="titleInput">
             </div>
-            <div class="modal-actions">
+            <div class="modal-actions" style="flex-wrap: wrap;">
                 <button class="cancel-btn" onclick="closeModal()">Cancel</button>
-                <button onclick="confirmDownload()">Download</button>
+                <button onclick="copyMagnetLink()" style="background: #6a5acd;">Copy Magnet Link</button>
+                <button onclick="confirmDownload()">Send to Library</button>
             </div>
         </div>
     </div>
@@ -801,11 +835,13 @@ async def web_ui():
                         <div class="download-meta">Size: ${formatBytes(dl.size)} (${formatBytes(dl.downloaded)} downloaded)</div>
                         <div class="download-meta">Speed: ${formatSpeed(dl.speed)} | ETA: ${formatETA(dl.eta)}</div>
                         <div class="download-meta">Path: ${dl.save_path}</div>
-                        <div style="display: flex; align-items: center; gap: 10px; margin-top: 8px;">
+                        <div style="display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap;">
                             <span class="download-state ${getStateClass(dl.state)}">${getStateText(dl.state)}</span>
+                            ${isComplete ? `<button style="padding: 4px 12px; font-size: 12px; background: #4a8025; border: none; border-radius: 4px; color: white; cursor: pointer;" onclick="browseFiles('${encodeURIComponent(dl.save_path.replace(/^\\/audiobooks\\//, ''))}')">Browse Files</button>` : ''}
                             <button class="cancel-btn" style="padding: 4px 12px; font-size: 12px;" onclick="cancelDownload('${dl.hash}', false)">Remove</button>
                             <button class="cancel-btn" style="padding: 4px 12px; font-size: 12px; background: #8b2020;" onclick="cancelDownload('${dl.hash}', true)">Delete + Files</button>
                         </div>
+                        <div id="files-${dl.hash}" style="display: none; margin-top: 10px; padding: 10px; background: #1a1a1a; border-radius: 4px;"></div>
                     </div>
                 `;
             }).join('');
@@ -922,6 +958,21 @@ async def web_ui():
             currentMagnetUrl = null;
         }
 
+        async function copyMagnetLink() {
+            if (!currentMagnetUrl) {
+                showStatus('No magnet URL available', 'error');
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(currentMagnetUrl);
+                showStatus('Magnet link copied to clipboard!', 'success');
+                closeModal();
+            } catch (e) {
+                // Fallback for non-HTTPS or denied clipboard
+                prompt('Copy this magnet link:', currentMagnetUrl);
+            }
+        }
+
         async function confirmDownload(force = false) {
             const author = document.getElementById('authorInput').value.trim();
             const title = document.getElementById('titleInput').value.trim();
@@ -981,6 +1032,49 @@ async def web_ui():
             } catch (error) {
                 showStatus('Failed to start download: ' + error.message, 'error');
                 console.error('Download error:', error);
+            }
+        }
+
+        async function browseFiles(relativePath) {
+            try {
+                const response = await fetch(`/files/${relativePath}`);
+                if (!response.ok) throw new Error(`Server returned ${response.status}`);
+                const files = await response.json();
+
+                // Find the files div by looking for it near the clicked button
+                const allFileDivs = document.querySelectorAll('[id^="files-"]');
+                // Toggle: find the one whose parent download-item contains this path
+                let targetDiv = null;
+                for (const div of allFileDivs) {
+                    const item = div.closest('.download-item');
+                    if (item && item.querySelector(`[onclick*="${CSS.escape(relativePath)}"]`)) {
+                        targetDiv = div;
+                        break;
+                    }
+                }
+                if (!targetDiv) return;
+
+                if (targetDiv.style.display !== 'none') {
+                    targetDiv.style.display = 'none';
+                    return;
+                }
+
+                if (files.length === 0) {
+                    targetDiv.innerHTML = '<div style="color: #aaa; font-style: italic;">No files found</div>';
+                } else {
+                    targetDiv.innerHTML = files.map(f => {
+                        const isDir = f.name.endsWith('/');
+                        const icon = isDir ? '&#128193;' : '&#128196;';
+                        const link = isDir
+                            ? `<a href="javascript:void(0)" onclick="browseFiles('${encodeURIComponent(f.path)}')" style="color: #5a9fd4; text-decoration: none;">${f.name}</a>`
+                            : `<a href="/files/${encodeURIComponent(f.path)}" download style="color: #5a9fd4; text-decoration: none;">${f.name}</a>
+                               <span style="color: #888; margin-left: 8px;">(${formatBytes(f.size)})</span>`;
+                        return `<div style="padding: 4px 0;">${icon} ${link}</div>`;
+                    }).join('');
+                }
+                targetDiv.style.display = 'block';
+            } catch (error) {
+                showStatus('Failed to list files: ' + error.message, 'error');
             }
         }
 
