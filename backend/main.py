@@ -225,6 +225,7 @@ async def list_downloads():
             torrents = resp.json()
             return [
                 {
+                    "hash": t["hash"],
                     "name": t["name"],
                     "progress": t["progress"],
                     "size": t["total_size"],
@@ -238,6 +239,24 @@ async def list_downloads():
             ]
     except Exception as e:
         return []
+
+
+@app.delete("/downloads/{torrent_hash}")
+async def delete_download(torrent_hash: str, delete_files: bool = False):
+    """Delete a torrent from qBittorrent."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await client.post(
+                f"{QBITTORRENT_URL}/api/v2/auth/login",
+                data={"username": QBITTORRENT_USER, "password": QBITTORRENT_PASS},
+            )
+            await client.post(
+                f"{QBITTORRENT_URL}/api/v2/torrents/delete",
+                data={"hashes": torrent_hash, "deleteFiles": str(delete_files).lower()},
+            )
+            return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to delete torrent: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -695,6 +714,20 @@ async def web_ui():
             return stateMap[state] || state;
         }
 
+        async function cancelDownload(hash, deleteFiles) {
+            const action = deleteFiles ? 'delete with files' : 'remove';
+            if (!confirm(`Are you sure you want to ${action} this download?`)) return;
+
+            try {
+                const response = await fetch(`/downloads/${hash}?delete_files=${deleteFiles}`, {method: 'DELETE'});
+                if (!response.ok) throw new Error(`Server returned ${response.status}`);
+                showStatus('Download removed', 'success');
+                refreshDownloads();
+            } catch (error) {
+                showStatus('Failed to remove download: ' + error.message, 'error');
+            }
+        }
+
         async function refreshDownloads() {
             try {
                 const response = await fetch('/downloads');
@@ -737,7 +770,11 @@ async def web_ui():
                         <div class="download-meta">Size: ${formatBytes(dl.size)} (${formatBytes(dl.downloaded)} downloaded)</div>
                         <div class="download-meta">Speed: ${formatSpeed(dl.speed)} | ETA: ${formatETA(dl.eta)}</div>
                         <div class="download-meta">Path: ${dl.save_path}</div>
-                        <span class="download-state ${getStateClass(dl.state)}">${getStateText(dl.state)}</span>
+                        <div style="display: flex; align-items: center; gap: 10px; margin-top: 8px;">
+                            <span class="download-state ${getStateClass(dl.state)}">${getStateText(dl.state)}</span>
+                            <button class="cancel-btn" style="padding: 4px 12px; font-size: 12px;" onclick="cancelDownload('${dl.hash}', false)">Remove</button>
+                            <button class="cancel-btn" style="padding: 4px 12px; font-size: 12px; background: #8b2020;" onclick="cancelDownload('${dl.hash}', true)">Delete + Files</button>
+                        </div>
                     </div>
                 `;
             }).join('');
