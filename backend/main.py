@@ -23,6 +23,7 @@ class DownloadRequest(BaseModel):
     magnet_url: str
     author: str = ""
     title: str = ""
+    force: bool = False
 
 
 # Global scraper instance
@@ -90,6 +91,36 @@ async def download_audiobook(request: Request):
     author = req.author.strip() or "Unknown Author"
     title = req.title.strip() or "Unknown Title"
     save_path = f"/audiobooks/{author}/{title}"
+
+    # Check if book already exists in Audiobookshelf (unless force=True)
+    if not req.force and AUDIOBOOKSHELF_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as abs_client:
+                libs_resp = await abs_client.get(
+                    f"{AUDIOBOOKSHELF_URL}/api/libraries",
+                    headers={"Authorization": f"Bearer {AUDIOBOOKSHELF_TOKEN}"},
+                )
+                for lib in libs_resp.json().get("libraries", []):
+                    search_resp = await abs_client.get(
+                        f"{AUDIOBOOKSHELF_URL}/api/libraries/{lib['id']}/search",
+                        params={"q": title, "limit": 10},
+                        headers={"Authorization": f"Bearer {AUDIOBOOKSHELF_TOKEN}"},
+                    )
+                    results = search_resp.json().get("book", [])
+                    for item in results:
+                        book_data = item.get("libraryItem", {}).get("media", {}).get("metadata", {})
+                        existing_title = book_data.get("title", "").lower()
+                        existing_author = book_data.get("authorName", "").lower()
+                        if title.lower() in existing_title or existing_title in title.lower():
+                            if not author or author == "Unknown Author" or author.lower() in existing_author or existing_author in author.lower():
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=f"Book already exists in Audiobookshelf: '{book_data.get('title')}' by {book_data.get('authorName')}"
+                                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Audiobookshelf duplicate check failed (proceeding anyway): {e}")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -891,7 +922,7 @@ async def web_ui():
             currentMagnetUrl = null;
         }
 
-        async function confirmDownload() {
+        async function confirmDownload(force = false) {
             const author = document.getElementById('authorInput').value.trim();
             const title = document.getElementById('titleInput').value.trim();
 
@@ -915,6 +946,7 @@ async def web_ui():
                     magnet_url: magnetUrl,
                     author: author,
                     title: title,
+                    force: force,
                 };
                 console.log('Sending download request:', requestBody);
 
@@ -925,6 +957,16 @@ async def web_ui():
                     },
                     body: JSON.stringify(requestBody),
                 });
+
+                if (response.status === 409) {
+                    const errorData = await response.json();
+                    const detail = errorData.detail || 'Book already exists in library';
+                    const statusEl = document.getElementById('status');
+                    statusEl.innerHTML = `${detail} <button onclick="redownload('${btoa(magnetUrl)}', '${btoa(author)}', '${btoa(title)}')" style="margin-left: 10px; padding: 4px 12px; background: #b8860b; border: none; border-radius: 4px; color: white; cursor: pointer;">Download Anyway</button>`;
+                    statusEl.className = 'status info';
+                    statusEl.style.display = 'block';
+                    return;
+                }
 
                 if (!response.ok) {
                     const errorText = await response.text();
@@ -939,6 +981,26 @@ async def web_ui():
             } catch (error) {
                 showStatus('Failed to start download: ' + error.message, 'error');
                 console.error('Download error:', error);
+            }
+        }
+
+        async function redownload(magnetB64, authorB64, titleB64) {
+            const magnetUrl = atob(magnetB64);
+            const author = atob(authorB64);
+            const title = atob(titleB64);
+            showStatus('Re-sending download (force)...', 'info');
+            try {
+                const response = await fetch('/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ magnet_url: magnetUrl, author, title, force: true }),
+                });
+                if (!response.ok) throw new Error(`Server returned ${response.status}`);
+                const result = await response.json();
+                showStatus(result.message || 'Download started successfully!', 'success');
+                refreshDownloads();
+            } catch (error) {
+                showStatus('Failed to start download: ' + error.message, 'error');
             }
         }
 
