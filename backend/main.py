@@ -289,6 +289,7 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                 data={
                     "savepath": CWA_INGEST_PATH,
                     "category": "ebooks",
+                    "tags": "mam",
                 },
             )
             if resp.status_code != 200 or resp.text.strip().lower() != "ok.":
@@ -362,6 +363,7 @@ async def _download_audiobook(req: DownloadRequest, author: str, title: str):
                     data={
                         "savepath": save_path,
                         "category": "audiobooks",
+                        "tags": "mam",
                     },
                 )
             else:
@@ -508,11 +510,16 @@ async def list_downloads():
                         "progress": t["progress"],
                         "size": t["total_size"],
                         "downloaded": t["downloaded"],
+                        "uploaded": t["uploaded"],
                         "speed": t["dlspeed"],
+                        "up_speed": t["upspeed"],
                         "eta": t["eta"],
                         "state": t["state"],
                         "save_path": t["save_path"],
                         "category": category,
+                        "ratio": round(t["ratio"], 2),
+                        "tags": t.get("tags", ""),
+                        "tracker": t.get("tracker", ""),
                     })
             return results
     except Exception as e:
@@ -566,6 +573,11 @@ async def _run_sync():
         for t in torrents:
             save_path = t.get("save_path", "")
             if not save_path or not save_path.startswith("/audiobooks/"):
+                continue
+            # Never remove MAM torrents — keep seeding for ratio
+            tracker = t.get("tracker", "")
+            tags = t.get("tags", "")
+            if "myanonamouse" in tracker or "mam" in tags.lower():
                 continue
             if not os.path.exists(save_path):
                 logger.info(f"Sync: removing orphaned torrent '{t['name']}' (path gone: {save_path})")
@@ -1559,8 +1571,8 @@ async def web_ui():
                     <div class="progress-track">
                         <div class="progress-fill ${done ? 'complete' : ''}" style="width:${pct}%">${pct}%</div>
                     </div>
-                    <div class="dl-meta">Size: ${formatBytes(dl.size)} &middot; Downloaded: ${formatBytes(dl.downloaded)}</div>
-                    <div class="dl-meta">Speed: ${formatSpeed(dl.speed)} &middot; ETA: ${formatETA(dl.eta)}</div>
+                    <div class="dl-meta">Size: ${formatBytes(dl.size)} &middot; Down: ${formatBytes(dl.downloaded)} &middot; Up: ${formatBytes(dl.uploaded || 0)}</div>
+                    <div class="dl-meta">${dl.progress < 1 ? 'DL: ' + formatSpeed(dl.speed) + ' &middot; ETA: ' + formatETA(dl.eta) : ''} ${dl.up_speed > 0 ? 'UL: ' + formatSpeed(dl.up_speed) : ''} &middot; Ratio: <strong style="color:${dl.ratio >= 1 ? 'var(--accent-green)' : 'var(--accent-amber)'}">${dl.ratio.toFixed(2)}</strong></div>
                     <div class="dl-meta">Path: ${esc(dl.save_path)}</div>
                     <div class="dl-actions">
                         <span class="dl-state ${stateClass(dl.state)}">${stateText(dl.state)}</span>
