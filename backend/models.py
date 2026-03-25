@@ -10,6 +10,7 @@ class AudiobookResult(BaseModel):
     size: str | None = None
     url: str
     cover_url: str | None = None
+    source: str = "abb"  # "abb" = AudioBookBay, "mam" = MyAnonamouse
 
 
 class AudiobookDetail(AudiobookResult):

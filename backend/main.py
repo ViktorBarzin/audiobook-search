@@ -8,6 +8,7 @@ from pydantic import BaseModel
 import httpx
 
 from backend.scraper import AudioBookBayScraper
+from backend.mam import MAMScraper
 from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ QBITTORRENT_USER = os.getenv("QBITTORRENT_USER", "admin")
 QBITTORRENT_PASS = os.getenv("QBITTORRENT_PASS", "")
 AUDIOBOOKSHELF_URL = os.getenv("AUDIOBOOKSHELF_URL", "http://audiobookshelf.audiobookshelf.svc.cluster.local")
 AUDIOBOOKSHELF_TOKEN = os.getenv("AUDIOBOOKSHELF_TOKEN", "")
+MAM_ID = os.getenv("MAM_ID", "")  # MyAnonamouse session cookie
 
 
 class DownloadRequest(BaseModel):
@@ -26,18 +28,24 @@ class DownloadRequest(BaseModel):
     force: bool = False
 
 
-# Global scraper instance
+# Global scraper instances
 scraper: AudioBookBayScraper | None = None
+mam_scraper: MAMScraper | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize and cleanup scraper."""
-    global scraper
+    """Initialize and cleanup scrapers."""
+    global scraper, mam_scraper
     scraper = AudioBookBayScraper()
+    if MAM_ID:
+        mam_scraper = MAMScraper(MAM_ID)
+        logger.info("MAM scraper initialized")
     yield
     if scraper:
         await scraper.close()
+    if mam_scraper:
+        await mam_scraper.close()
 
 
 app = FastAPI(
@@ -56,21 +64,43 @@ async def health():
 
 @app.get("/search", response_model=list[AudiobookResult])
 async def search_audiobooks(q: str = Query(..., description="Search query")):
-    """Search for audiobooks on AudioBookBay."""
+    """Search for audiobooks across all sources."""
     if not scraper:
         raise HTTPException(status_code=500, detail="Scraper not initialized")
 
-    results = await scraper.search(q)
+    # Search all sources in parallel
+    tasks = [scraper.search(q)]
+    if mam_scraper:
+        tasks.append(mam_scraper.search(q))
+
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    for r in all_results:
+        if isinstance(r, list):
+            results.extend(r)
+        elif isinstance(r, Exception):
+            logger.warning(f"Search source failed: {r}")
+
+    # MAM results first (private tracker = better quality), then ABB
+    results.sort(key=lambda x: (0 if x.source == "mam" else 1))
     return results
 
 
 @app.get("/audiobook/{book_id:path}", response_model=AudiobookDetail)
 async def get_audiobook_detail(book_id: str):
     """Get detailed information for a specific audiobook."""
-    if not scraper:
-        raise HTTPException(status_code=500, detail="Scraper not initialized")
+    # Route to correct scraper based on source prefix
+    if book_id.startswith("mam:"):
+        if not mam_scraper:
+            raise HTTPException(status_code=500, detail="MAM scraper not configured")
+        torrent_id = book_id[4:]  # Strip "mam:" prefix
+        detail = await mam_scraper.get_detail(torrent_id)
+    else:
+        if not scraper:
+            raise HTTPException(status_code=500, detail="Scraper not initialized")
+        detail = await scraper.get_detail(book_id)
 
-    detail = await scraper.get_detail(book_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Audiobook not found or magnet link unavailable")
 
@@ -122,6 +152,8 @@ async def download_audiobook(request: Request):
         except Exception as e:
             logger.warning(f"Audiobookshelf duplicate check failed (proceeding anyway): {e}")
 
+    is_mam_torrent = req.magnet_url.startswith("https://www.myanonamouse.net/")
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Login to qBittorrent
@@ -132,25 +164,52 @@ async def download_audiobook(request: Request):
             if login_resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"qBittorrent login failed: {login_resp.status_code}")
 
-            # Delete existing torrent if present (supports re-download after deletion)
-            import re as _re
-            hash_match = _re.search(r"btih:([a-fA-F0-9]{40})", req.magnet_url)
-            if hash_match:
-                info_hash = hash_match.group(1).lower()
-                await client.post(
-                    f"{QBITTORRENT_URL}/api/v2/torrents/delete",
-                    data={"hashes": info_hash, "deleteFiles": "false"},
+            if is_mam_torrent:
+                # MAM: download .torrent file and upload to qBittorrent
+                if not mam_scraper:
+                    raise HTTPException(status_code=500, detail="MAM scraper not configured")
+
+                # Extract torrent ID from URL
+                import re as _re
+                tid_match = _re.search(r"/download\.php/(\d+)", req.magnet_url)
+                if not tid_match:
+                    raise HTTPException(status_code=400, detail="Invalid MAM torrent URL")
+
+                torrent_data = await mam_scraper.download_torrent_file(tid_match.group(1))
+                if not torrent_data:
+                    raise HTTPException(status_code=502, detail="Failed to download .torrent file from MAM")
+
+                # Upload .torrent file to qBittorrent
+                resp = await client.post(
+                    f"{QBITTORRENT_URL}/api/v2/torrents/add",
+                    files={"torrents": ("audiobook.torrent", torrent_data, "application/x-bittorrent")},
+                    data={
+                        "savepath": save_path,
+                        "category": "audiobooks",
+                    },
+                )
+            else:
+                # AudioBookBay: use magnet link
+                # Delete existing torrent if present (supports re-download after deletion)
+                import re as _re
+                hash_match = _re.search(r"btih:([a-fA-F0-9]{40})", req.magnet_url)
+                if hash_match:
+                    info_hash = hash_match.group(1).lower()
+                    await client.post(
+                        f"{QBITTORRENT_URL}/api/v2/torrents/delete",
+                        data={"hashes": info_hash, "deleteFiles": "false"},
+                    )
+
+                # Add torrent to qBittorrent (cookies from login are on the client)
+                resp = await client.post(
+                    f"{QBITTORRENT_URL}/api/v2/torrents/add",
+                    data={
+                        "urls": req.magnet_url,
+                        "savepath": save_path,
+                        "category": "audiobooks",
+                    },
                 )
 
-            # Add torrent to qBittorrent (cookies from login are on the client)
-            resp = await client.post(
-                f"{QBITTORRENT_URL}/api/v2/torrents/add",
-                data={
-                    "urls": req.magnet_url,
-                    "savepath": save_path,
-                    "category": "audiobooks",
-                },
-            )
             if resp.status_code != 200 or resp.text.strip().lower() != "ok.":
                 raise HTTPException(status_code=502, detail=f"qBittorrent rejected torrent: {resp.text}")
 
@@ -899,7 +958,10 @@ async def web_ui():
                     <div class="card">
                         ${book.cover_url ? `<img src="${book.cover_url}" alt="${escapedTitle}" class="card-image">` : ''}
                         <div class="card-content">
-                            <div class="card-title">${escapedTitle}</div>
+                            <div class="card-title">
+                                <span style="display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: bold; margin-right: 6px; vertical-align: middle; background: ${book.source === 'mam' ? '#6a5acd' : '#4a8fc4'}; color: white;">${book.source === 'mam' ? 'MAM' : 'ABB'}</span>
+                                ${escapedTitle}
+                            </div>
                             ${book.author ? `<div class="card-meta">Author: ${escapedAuthor}</div>` : ''}
                             ${book.narrator ? `<div class="card-meta">Narrator: ${book.narrator}</div>` : ''}
                             ${book.format ? `<div class="card-meta">Format: ${book.format}</div>` : ''}
