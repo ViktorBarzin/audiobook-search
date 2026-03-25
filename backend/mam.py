@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re as _re
 from urllib.parse import quote
 import httpx
@@ -7,6 +8,10 @@ import httpx
 from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
+
+# MAM session cookie from browser — set via MAM_ID env var
+# To get this: log into MAM in a browser, copy the mam_id cookie value
+MAM_SESSION_ID = os.getenv("MAM_ID", "")
 
 
 class MAMScraper:
@@ -28,12 +33,27 @@ class MAMScraper:
         )
 
     async def _login(self):
-        """Login to MAM and obtain session cookie."""
+        """Login to MAM. Prefers MAM_ID session cookie, falls back to email/password."""
         if self._logged_in:
             return True
 
+        # Method 1: Use MAM_ID session cookie (most reliable)
+        if MAM_SESSION_ID:
+            self.client.cookies.set("mam_id", MAM_SESSION_ID, domain=".myanonamouse.net")
+            # Verify the cookie works
+            try:
+                r = await self.client.get(f"{self.BASE_URL}/jsonLoad.php")
+                if r.status_code == 200 and "error" not in r.text.lower():
+                    self._logged_in = True
+                    logger.info("MAM login via mam_id cookie successful")
+                    return True
+                else:
+                    logger.warning("MAM mam_id cookie invalid or expired — trying email/password")
+            except Exception as e:
+                logger.warning(f"MAM cookie check failed: {e}")
+
+        # Method 2: Email/password login (may fail if MAM requires JS validation)
         try:
-            # Step 1: GET login page for CSRF tokens
             r = await self.client.get(f"{self.BASE_URL}/login.php")
             t_match = _re.search(r'name="t" value="([^"]+)"', r.text)
             a_match = _re.search(r'name="a" value="([^"]+)"', r.text)
@@ -44,7 +64,6 @@ class MAMScraper:
             t_val = t_match.group(1)
             a_val = a_match.group(1)
 
-            # Step 2: POST login (j = length of t value, added by JS)
             data = {
                 "email": self.email,
                 "password": self.password,
@@ -55,13 +74,13 @@ class MAMScraper:
             }
             r2 = await self.client.post(f"{self.BASE_URL}/takelogin.php", data=data)
 
-            # Check if we landed on a logged-in page
-            if "/login.php" in str(r2.url):
-                logger.error("MAM login failed - redirected back to login")
+            # Check cookies were set (not just redirect check)
+            if not self.client.cookies.get("mam_id"):
+                logger.error("MAM login failed — no session cookie set. Set MAM_ID env var with a browser cookie value.")
                 return False
 
             self._logged_in = True
-            logger.info("MAM login successful")
+            logger.info("MAM login via email/password successful")
             return True
         except Exception as e:
             logger.error(f"MAM login failed: {e}")
