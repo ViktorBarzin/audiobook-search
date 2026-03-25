@@ -172,7 +172,7 @@ async def download_audiobook(request: Request):
 
                 # Extract torrent ID from URL
                 import re as _re
-                tid_match = _re.search(r"/download\.php/(\d+)", req.magnet_url)
+                tid_match = _re.search(r"tid=(\d+)", req.magnet_url) or _re.search(r"/download\.php/(\d+)", req.magnet_url)
                 if not tid_match:
                     raise HTTPException(status_code=400, detail="Invalid MAM torrent URL")
 

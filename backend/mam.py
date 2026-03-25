@@ -245,7 +245,7 @@ class MAMScraper:
         description = item.get("description", None)
 
         # Torrent download URL (will be downloaded server-side and sent to qBittorrent)
-        torrent_url = f"{self.BASE_URL}/tor/download.php/{torrent_id}"
+        torrent_url = f"{self.BASE_URL}/tor/download.php?tid={torrent_id}"
 
         return AudiobookDetail(
             id=f"mam:{torrent_id}",
@@ -267,7 +267,7 @@ class MAMScraper:
         if not await self._login():
             return None
 
-        url = f"{self.BASE_URL}/tor/download.php/{torrent_id}"
+        url = f"{self.BASE_URL}/tor/download.php?tid={torrent_id}"
         try:
             response = await self.client.get(url)
             response.raise_for_status()
