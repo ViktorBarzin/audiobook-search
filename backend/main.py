@@ -18,7 +18,8 @@ QBITTORRENT_USER = os.getenv("QBITTORRENT_USER", "admin")
 QBITTORRENT_PASS = os.getenv("QBITTORRENT_PASS", "")
 AUDIOBOOKSHELF_URL = os.getenv("AUDIOBOOKSHELF_URL", "http://audiobookshelf.audiobookshelf.svc.cluster.local")
 AUDIOBOOKSHELF_TOKEN = os.getenv("AUDIOBOOKSHELF_TOKEN", "")
-MAM_ID = os.getenv("MAM_ID", "")  # MyAnonamouse session cookie
+MAM_EMAIL = os.getenv("MAM_EMAIL", "")
+MAM_PASSWORD = os.getenv("MAM_PASSWORD", "")
 
 
 class DownloadRequest(BaseModel):
@@ -38,8 +39,8 @@ async def lifespan(app: FastAPI):
     """Initialize and cleanup scrapers."""
     global scraper, mam_scraper
     scraper = AudioBookBayScraper()
-    if MAM_ID:
-        mam_scraper = MAMScraper(MAM_ID)
+    if MAM_EMAIL and MAM_PASSWORD:
+        mam_scraper = MAMScraper(MAM_EMAIL, MAM_PASSWORD)
         logger.info("MAM scraper initialized")
     yield
     if scraper:
