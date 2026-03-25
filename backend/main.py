@@ -84,15 +84,37 @@ async def mam_status():
             result["ip"] = data.get("ip")
             result["authenticated"] = data.get("Success", False)
             if not result["authenticated"]:
+                result["setup_url"] = "/mam-activate"
                 result["instructions"] = (
                     f"Server IP: {data.get('ip')}. "
-                    "To enable MAM: log into MAM in your browser, then visit "
-                    "https://www.myanonamouse.net/json/dynamicSeedbox.php "
-                    "to whitelist this IP for 24h."
+                    "Visit /mam-activate while logged into MAM to whitelist this IP."
                 )
     except Exception as e:
         result["error"] = str(e)
     return result
+
+
+@app.post("/mam-activate")
+async def mam_activate(request: Request):
+    """Activate MAM dynamic seedbox. User provides their lid cookie, server proxies
+    the call to MAM from the server's IP with the user's session."""
+    body = await request.json()
+    lid = body.get("lid", "").strip()
+    if not lid:
+        return {"Success": False, "msg": "No lid cookie provided"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                "https://www.myanonamouse.net/json/dynamicSeedbox.php",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                },
+                cookies={"lid": lid},
+            )
+            return r.json()
+    except Exception as e:
+        return {"Success": False, "msg": str(e)}
 
 
 async def _enrich_covers(results: list[AudiobookResult], query: str):
@@ -1227,6 +1249,7 @@ async def web_ui():
                 <a href="https://audiobookshelf.viktorbarzin.me" target="_blank">Audiobookshelf</a>
                 <a href="https://calibre.viktorbarzin.me" target="_blank">Calibre Library</a>
                 <a href="https://stacks.viktorbarzin.me" target="_blank">Stacks</a>
+                <a href="#" onclick="showMamSetup(); return false;" id="mamLink" style="opacity:0.5">MAM Setup</a>
             </nav>
         </div>
     </header>
@@ -1613,7 +1636,91 @@ async def web_ui():
 
     setInterval(refreshDownloads, 10000);
     refreshDownloads();
+
+    // MAM setup
+    async function checkMamStatus() {
+        try {
+            const r = await fetch('/mam-status');
+            const data = await r.json();
+            const link = document.getElementById('mamLink');
+            if (data.authenticated) {
+                link.style.opacity = '1';
+                link.style.color = 'var(--accent-green)';
+                link.title = 'MAM: Active';
+            } else {
+                link.style.opacity = '0.7';
+                link.style.color = 'var(--accent-red)';
+                link.title = 'MAM: Not connected — click to setup';
+            }
+        } catch(e) {}
+    }
+
+    function showMamSetup() {
+        const overlay = document.getElementById('mamSetupModal');
+        overlay.style.display = 'block';
+        fetch('/mam-status').then(r => r.json()).then(data => {
+            document.getElementById('mamIp').textContent = data.ip || 'unknown';
+            document.getElementById('mamAuth').textContent = data.authenticated ? 'Active' : 'Not connected';
+            document.getElementById('mamAuth').style.color = data.authenticated ? 'var(--accent-green)' : 'var(--accent-red)';
+        });
+    }
+
+    async function activateMam() {
+        const lid = document.getElementById('mamLidInput').value.trim();
+        if (!lid) { alert('Paste your MAM lid cookie'); return; }
+        const el = document.getElementById('mamResult');
+        el.textContent = 'Activating...';
+        el.style.color = 'var(--accent-amber)';
+        try {
+            const r = await fetch('/mam-activate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({lid}),
+            });
+            const data = await r.json();
+            if (data.Success) {
+                el.textContent = 'Success! IP whitelisted for 24h.';
+                el.style.color = 'var(--accent-green)';
+                checkMamStatus();
+            } else {
+                el.textContent = 'Failed: ' + (data.msg || 'Unknown error');
+                el.style.color = 'var(--accent-red)';
+            }
+        } catch(e) {
+            el.textContent = 'Error: ' + e.message;
+            el.style.color = 'var(--accent-red)';
+        }
+    }
+
+    checkMamStatus();
 </script>
+
+<div id="mamSetupModal" class="modal-overlay" onclick="if(event.target===this)this.style.display='none'">
+    <div class="modal">
+        <h2>MAM Setup</h2>
+        <div style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">
+            Server IP: <strong id="mamIp">...</strong> &middot;
+            Status: <strong id="mamAuth">...</strong>
+        </div>
+        <div style="font-size:13px;line-height:1.7;margin-bottom:16px;">
+            <strong>Steps:</strong><br>
+            1. Log into <a href="https://www.myanonamouse.net" target="_blank" style="color:var(--accent-amber)">MAM</a><br>
+            2. Open DevTools (F12) &rarr; Application &rarr; Cookies &rarr; myanonamouse.net<br>
+            3. Copy the <code style="background:var(--bg-input);padding:2px 4px;border-radius:3px;">lid</code> cookie value<br>
+            4. Paste below and click Activate
+        </div>
+        <div class="modal-field">
+            <label for="mamLidInput">lid cookie value</label>
+            <input type="text" id="mamLidInput" placeholder="Paste lid cookie here...">
+        </div>
+        <div id="mamResult" style="font-size:13px;min-height:20px;margin:8px 0;"></div>
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="document.getElementById('mamSetupModal').style.display='none'">Close</button>
+            <button class="btn-confirm" onclick="activateMam()">Activate</button>
+        </div>
+    </div>
+</div>
+
 </body>
 </html>
 """
