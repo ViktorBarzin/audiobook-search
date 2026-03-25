@@ -71,16 +71,21 @@ class AnnasArchiveScraper:
 
     async def _fetch(self, url: str) -> str | None:
         """Fetch a URL, using FlareSolverr if available, falling back to direct."""
+        # Try FlareSolverr first
         if await self._check_flaresolverr():
-            return await self._fetch_via_flaresolverr(url)
+            html = await self._fetch_via_flaresolverr(url)
+            if html and "/md5/" in html:
+                return html
+            # FlareSolverr got a page but no results (client-side rendering)
+            if html:
+                logger.warning("Anna's Archive results are client-side rendered — FlareSolverr can't extract them. Use Stacks UI instead.")
 
-        # Direct fetch (will fail on JS-protected pages but works on some mirrors)
+        # Direct fetch fallback
         try:
             r = await self.client.get(url)
             r.raise_for_status()
-            # Check for JS challenge page
             if len(r.text) < 500 and "Verifying" in r.text:
-                logger.warning(f"Anna's Archive returned JS challenge — FlareSolverr required")
+                logger.warning("Anna's Archive returned JS challenge — use Stacks UI for ebook search")
                 return None
             return r.text
         except Exception as e:

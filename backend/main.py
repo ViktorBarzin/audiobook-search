@@ -73,6 +73,48 @@ async def health():
     return {"status": "ok"}
 
 
+async def _enrich_covers(results: list[AudiobookResult], query: str):
+    """Fetch covers from Open Library for results that don't have them."""
+    needs_cover = [r for r in results if not r.cover_url]
+    if not needs_cover:
+        return
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        # Search Open Library for the query to get OLIDs
+        try:
+            resp = await client.get(
+                "https://openlibrary.org/search.json",
+                params={"q": query, "limit": 20, "fields": "key,title,author_name,cover_i"},
+            )
+            if resp.status_code != 200:
+                return
+            ol_results = resp.json().get("docs", [])
+        except Exception:
+            return
+
+        # Build a lookup of normalized title → cover_id
+        cover_lookup: dict[str, int] = {}
+        for doc in ol_results:
+            cover_id = doc.get("cover_i")
+            if not cover_id:
+                continue
+            title = doc.get("title", "").lower().strip()
+            cover_lookup[title] = cover_id
+
+        # Match results by title similarity
+        for r in needs_cover:
+            r_title = r.title.lower().strip()
+            # Exact match
+            if r_title in cover_lookup:
+                r.cover_url = f"https://covers.openlibrary.org/b/id/{cover_lookup[r_title]}-M.jpg"
+                continue
+            # Substring match
+            for ol_title, cover_id in cover_lookup.items():
+                if ol_title in r_title or r_title in ol_title:
+                    r.cover_url = f"https://covers.openlibrary.org/b/id/{cover_lookup[ol_title]}-M.jpg"
+                    break
+
+
 @app.get("/search", response_model=list[AudiobookResult])
 async def search_books(
     q: str = Query(..., description="Search query"),
@@ -116,6 +158,13 @@ async def search_books(
     # MAM first, then Annas, then ABB
     source_order = {"mam": 0, "annas": 1, "abb": 2}
     results.sort(key=lambda x: source_order.get(x.source, 3))
+
+    # Enrich missing covers from Open Library (non-blocking, best-effort)
+    try:
+        await _enrich_covers(results, q)
+    except Exception as e:
+        logger.warning(f"Cover enrichment failed: {e}")
+
     return results
 
 
@@ -796,6 +845,18 @@ async def web_ui():
             object-fit: cover;
         }
 
+        .card-image-placeholder {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 48px;
+            background: linear-gradient(135deg, var(--bg-input) 0%, var(--bg-card) 100%);
+            color: var(--text-dim);
+            opacity: 0.6;
+        }
+
         .card-badges {
             position: absolute;
             top: 8px;
@@ -1310,7 +1371,7 @@ async def web_ui():
             return `
                 <div class="card">
                     <div class="card-image-wrap">
-                        ${b.cover_url ? `<img src="${b.cover_url}" alt="" class="card-image" loading="lazy">` : ''}
+                        ${b.cover_url ? `<img src="${b.cover_url}" alt="" class="card-image" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="card-image-placeholder" style="display:none">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>` : `<div class="card-image-placeholder">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>`}
                         <div class="card-badges">
                             ${sourceBadge(b.source)}
                             ${typeBadge(b.content_type)}
