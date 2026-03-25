@@ -73,6 +73,28 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/mam-status")
+async def mam_status():
+    """Check MAM authentication status and show setup instructions."""
+    result = {"mam_configured": bool(MAM_EMAIL), "authenticated": False, "ip": None}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get("https://www.myanonamouse.net/json/dynamicSeedbox.php")
+            data = r.json()
+            result["ip"] = data.get("ip")
+            result["authenticated"] = data.get("Success", False)
+            if not result["authenticated"]:
+                result["instructions"] = (
+                    f"Server IP: {data.get('ip')}. "
+                    "To enable MAM: log into MAM in your browser, then visit "
+                    "https://www.myanonamouse.net/json/dynamicSeedbox.php "
+                    "to whitelist this IP for 24h."
+                )
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
 async def _enrich_covers(results: list[AudiobookResult], query: str):
     """Fetch covers from Open Library for results that don't have them."""
     needs_cover = [r for r in results if not r.cover_url]
