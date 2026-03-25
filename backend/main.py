@@ -42,7 +42,10 @@ async def lifespan(app: FastAPI):
     if MAM_EMAIL and MAM_PASSWORD:
         mam_scraper = MAMScraper(MAM_EMAIL, MAM_PASSWORD)
         logger.info("MAM scraper initialized")
+    # Start periodic sync between Audiobookshelf and qBittorrent
+    sync_task = asyncio.create_task(_periodic_sync())
     yield
+    sync_task.cancel()
     if scraper:
         await scraper.close()
     if mam_scraper:
@@ -343,7 +346,7 @@ async def list_downloads():
 
 @app.delete("/downloads/{torrent_hash}")
 async def delete_download(torrent_hash: str, delete_files: bool = False):
-    """Delete a torrent from qBittorrent."""
+    """Delete a torrent from qBittorrent. If files are deleted, triggers Audiobookshelf scan."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             await client.post(
@@ -354,9 +357,76 @@ async def delete_download(torrent_hash: str, delete_files: bool = False):
                 f"{QBITTORRENT_URL}/api/v2/torrents/delete",
                 data={"hashes": torrent_hash, "deleteFiles": str(delete_files).lower()},
             )
+            # If files were deleted, trigger Audiobookshelf scan to remove the book
+            if delete_files:
+                await _trigger_audiobookshelf_scan(client)
             return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to delete torrent: {e}")
+
+
+async def _periodic_sync():
+    """Periodically sync Audiobookshelf and qBittorrent — remove orphaned torrents/books."""
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        try:
+            await _run_sync()
+        except Exception as e:
+            logger.warning(f"Sync error: {e}")
+
+
+async def _run_sync():
+    """Remove torrents whose files have been deleted (e.g. book removed from Audiobookshelf)
+    and trigger a library scan if torrent files were cleaned up."""
+    if not AUDIOBOOKSHELF_TOKEN:
+        return
+
+    changed = False
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Login to qBittorrent
+        await client.post(
+            f"{QBITTORRENT_URL}/api/v2/auth/login",
+            data={"username": QBITTORRENT_USER, "password": QBITTORRENT_PASS},
+        )
+
+        # Get all audiobook torrents
+        resp = await client.get(
+            f"{QBITTORRENT_URL}/api/v2/torrents/info",
+            params={"category": "audiobooks"},
+        )
+        torrents = resp.json()
+
+        for t in torrents:
+            save_path = t.get("save_path", "")
+            if not save_path or not save_path.startswith("/audiobooks/"):
+                continue
+
+            # If save_path no longer exists on disk, the book was deleted — remove torrent
+            if not os.path.exists(save_path):
+                logger.info(f"Sync: removing orphaned torrent '{t['name']}' (path gone: {save_path})")
+                await client.post(
+                    f"{QBITTORRENT_URL}/api/v2/torrents/delete",
+                    data={"hashes": t["hash"], "deleteFiles": "true"},
+                )
+                changed = True
+
+        # Also check: completed torrents whose files exist but aren't in Audiobookshelf
+        # (reverse direction is handled by Audiobookshelf's own library scan)
+
+    # If we cleaned up torrents, trigger a library scan
+    if changed:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await _trigger_audiobookshelf_scan(client)
+
+
+@app.post("/sync")
+async def trigger_sync():
+    """Manually trigger sync between Audiobookshelf and qBittorrent."""
+    try:
+        await _run_sync()
+        return {"status": "ok", "message": "Sync completed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
 
 
 @app.get("/files/{path:path}")
@@ -738,6 +808,9 @@ async def web_ui():
 <body>
     <div class="container">
         <h1>Audiobook Search</h1>
+        <div style="text-align: center; margin-bottom: 20px;">
+            <a href="https://audiobookshelf.viktorbarzin.me" target="_blank" style="color: #5a9fd4; text-decoration: none; font-size: 14px;">Open Audiobookshelf Library &rarr;</a>
+        </div>
 
         <div class="search-box">
             <input type="text" id="searchInput" placeholder="Search for audiobooks...">
