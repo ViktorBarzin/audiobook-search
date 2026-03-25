@@ -215,7 +215,7 @@ async def download_audiobook(request: Request):
                 raise HTTPException(status_code=502, detail=f"qBittorrent rejected torrent: {resp.text}")
 
         # Start background task to poll completion and trigger library scan
-        asyncio.create_task(_poll_and_scan(req.magnet_url, author, title))
+        asyncio.create_task(_poll_and_scan(req.magnet_url, author, title, save_path))
 
         return {"status": "ok", "message": f"Download started → {save_path}"}
     except HTTPException:
@@ -224,16 +224,16 @@ async def download_audiobook(request: Request):
         raise HTTPException(status_code=502, detail=f"Failed to add torrent: {e}")
 
 
-async def _poll_and_scan(magnet_url: str, author: str, title: str):
+async def _poll_and_scan(magnet_url: str, author: str, title: str, save_path: str = ""):
     """Poll qBittorrent until download completes, then trigger Audiobookshelf scan."""
-    # Extract info hash from magnet URL
     import re
-    hash_match = re.search(r"btih:([a-fA-F0-9]{40})", magnet_url)
-    if not hash_match:
-        logger.warning("Could not extract info hash from magnet URL")
-        return
 
-    info_hash = hash_match.group(1).lower()
+    # Try to extract info hash from magnet URL (works for ABB)
+    info_hash = None
+    hash_match = re.search(r"btih:([a-fA-F0-9]{40})", magnet_url)
+    if hash_match:
+        info_hash = hash_match.group(1).lower()
+
     poll_interval = 30
     max_polls = 120  # 1 hour max
 
@@ -251,11 +251,20 @@ async def _poll_and_scan(magnet_url: str, author: str, title: str):
         for i in range(max_polls):
             await asyncio.sleep(poll_interval)
             try:
-                resp = await client.get(
-                    f"{QBITTORRENT_URL}/api/v2/torrents/info",
-                    params={"hashes": info_hash},
-                )
-                torrents = resp.json()
+                if info_hash:
+                    resp = await client.get(
+                        f"{QBITTORRENT_URL}/api/v2/torrents/info",
+                        params={"hashes": info_hash},
+                    )
+                    torrents = resp.json()
+                else:
+                    # For MAM torrents, find by save_path
+                    resp = await client.get(
+                        f"{QBITTORRENT_URL}/api/v2/torrents/info",
+                        params={"category": "audiobooks"},
+                    )
+                    torrents = [t for t in resp.json() if t.get("save_path", "") == save_path]
+
                 if not torrents:
                     continue
 
