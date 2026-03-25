@@ -93,7 +93,7 @@ class MAMScraper:
             logger.error(f"MAM search failed: {e}")
             return []
 
-        if data.get("status") != "Success" or not data.get("data"):
+        if not data.get("data"):
             return []
 
         results = []
@@ -115,9 +115,15 @@ class MAMScraper:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                narrator = item.get("narrator", None)
-                if narrator:
-                    narrator = narrator.strip()
+                narrator = None
+                narrator_info = item.get("narrator_info")
+                if narrator_info:
+                    try:
+                        narrators = json.loads(narrator_info) if isinstance(narrator_info, str) else narrator_info
+                        if isinstance(narrators, dict):
+                            narrator = ", ".join(narrators.values())
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
                 # Size in bytes
                 size_bytes = item.get("size")
@@ -135,7 +141,7 @@ class MAMScraper:
                         pass
 
                 filetype = item.get("filetype", "")
-                category = item.get("cat_name", "")
+                category = item.get("catname", "")
                 format_str = f"{filetype}" if filetype else None
                 if category and format_str:
                     format_str = f"{category} / {format_str}"
@@ -186,7 +192,7 @@ class MAMScraper:
             logger.error(f"MAM detail fetch failed: {e}")
             return None
 
-        if data.get("status") != "Success" or not data.get("data"):
+        if not data.get("data"):
             return None
 
         item = data["data"][0]
@@ -202,12 +208,18 @@ class MAMScraper:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        narrator = item.get("narrator")
-        if narrator:
-            narrator = narrator.strip()
+        narrator = None
+        narrator_info = item.get("narrator_info")
+        if narrator_info:
+            try:
+                narrators = json.loads(narrator_info) if isinstance(narrator_info, str) else narrator_info
+                if isinstance(narrators, dict):
+                    narrator = ", ".join(narrators.values())
+            except (json.JSONDecodeError, TypeError):
+                pass
 
         filetype = item.get("filetype", "")
-        category = item.get("cat_name", "")
+        category = item.get("catname", "")
         lang_list = item.get("language")
         language = None
         if lang_list:
