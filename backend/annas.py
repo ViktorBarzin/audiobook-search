@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from urllib.parse import quote
 import httpx
@@ -8,15 +9,18 @@ from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
 
+# Anna's Archive changes domains frequently — configurable via env var
+ANNAS_DOMAIN = os.getenv("ANNAS_DOMAIN", "annas-archive.gs")
+
 
 class AnnasArchiveScraper:
     """Anna's Archive ebook search scraper."""
 
-    BASE_URL = "https://annas-archive.org"
     TIMEOUT = 20.0
     USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     def __init__(self):
+        self.base_url = f"https://{ANNAS_DOMAIN}"
         self.client = httpx.AsyncClient(
             timeout=self.TIMEOUT,
             headers={"User-Agent": self.USER_AGENT},
@@ -28,7 +32,7 @@ class AnnasArchiveScraper:
 
     async def search(self, query: str) -> list[AudiobookResult]:
         """Search Anna's Archive for ebooks."""
-        search_url = f"{self.BASE_URL}/search?q={quote(query)}&content=book_nonfiction&content=book_fiction&ext=epub&ext=pdf&ext=mobi&sort=&lang=en"
+        search_url = f"{self.base_url}/search?q={quote(query)}&content=book_nonfiction&content=book_fiction&ext=epub&ext=pdf&ext=mobi&sort=&lang=en"
 
         try:
             response = await self.client.get(search_url)
@@ -93,7 +97,7 @@ class AnnasArchiveScraper:
                     author=author,
                     format=format_str,
                     size=size,
-                    url=f"{self.BASE_URL}/md5/{md5}",
+                    url=f"{self.base_url}/md5/{md5}",
                     cover_url=cover_url,
                     source="annas",
                     content_type="ebook",
@@ -107,7 +111,7 @@ class AnnasArchiveScraper:
 
     async def get_detail(self, md5: str) -> AudiobookDetail | None:
         """Get detail page for an Anna's Archive book and extract download links."""
-        detail_url = f"{self.BASE_URL}/md5/{md5}"
+        detail_url = f"{self.base_url}/md5/{md5}"
 
         try:
             response = await self.client.get(detail_url)
@@ -167,7 +171,7 @@ class AnnasArchiveScraper:
                 link_text = a_tag.get_text(strip=True).lower()
                 # Prefer direct download links from library mirrors
                 if "/fast_download/" in href or "/slow_download/" in href:
-                    download_url = href if href.startswith("http") else f"{self.BASE_URL}{href}"
+                    download_url = href if href.startswith("http") else f"{self.base_url}{href}"
                     break
                 if "libgen" in href or "library.lol" in href or "annas-archive.se" in href:
                     download_url = href
