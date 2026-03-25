@@ -153,6 +153,9 @@ class MAMScraper:
                 if format_str:
                     format_str += f" | S:{seeders} L:{leechers}"
 
+                # Detect content type from category
+                content_type = "ebook" if category.lower().startswith("ebook") else "audiobook"
+
                 result = AudiobookResult(
                     id=f"mam:{torrent_id}",
                     title=title,
@@ -163,6 +166,7 @@ class MAMScraper:
                     url=f"{self.BASE_URL}/t/{torrent_id}",
                     cover_url=None,
                     source="mam",
+                    content_type=content_type,
                 )
                 results.append(result)
             except Exception as e:
@@ -247,6 +251,8 @@ class MAMScraper:
         # Torrent download URL (will be downloaded server-side and sent to qBittorrent)
         torrent_url = f"{self.BASE_URL}/tor/download.php?tid={torrent_id}"
 
+        content_type = "ebook" if category.lower().startswith("ebook") else "audiobook"
+
         return AudiobookDetail(
             id=f"mam:{torrent_id}",
             title=title,
@@ -260,6 +266,7 @@ class MAMScraper:
             description=description,
             language=language,
             source="mam",
+            content_type=content_type,
         )
 
     async def download_torrent_file(self, torrent_id: str) -> bytes | None:

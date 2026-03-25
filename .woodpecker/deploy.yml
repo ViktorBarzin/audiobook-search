@@ -10,8 +10,8 @@ steps:
   - name: deploy
     image: bitnami/kubectl:latest
     commands:
-      - "kubectl set image deployment/audiobook-search audiobook-search=${IMAGE_NAME}:${IMAGE_TAG} -n servarr"
-      - "kubectl rollout status deployment/audiobook-search -n servarr --timeout=300s"
+      - "kubectl set image deployment/book-search book-search=${IMAGE_NAME}:${IMAGE_TAG} -n ebooks"
+      - "kubectl rollout status deployment/book-search -n ebooks --timeout=300s"
 
   - name: notify
     image: woodpeckerci/plugin-slack
