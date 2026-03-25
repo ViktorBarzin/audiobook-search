@@ -11,12 +11,13 @@ logger = logging.getLogger(__name__)
 
 # Anna's Archive changes domains frequently — configurable via env var
 ANNAS_DOMAIN = os.getenv("ANNAS_DOMAIN", "annas-archive.gs")
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr.servarr.svc.cluster.local")
 
 
 class AnnasArchiveScraper:
-    """Anna's Archive ebook search scraper."""
+    """Anna's Archive ebook search scraper. Uses FlareSolverr to bypass JS challenges."""
 
-    TIMEOUT = 20.0
+    TIMEOUT = 30.0
     USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     def __init__(self):
@@ -26,28 +27,81 @@ class AnnasArchiveScraper:
             headers={"User-Agent": self.USER_AGENT},
             follow_redirects=True,
         )
+        self._flaresolverr_available = None
 
     async def close(self):
         await self.client.aclose()
+
+    async def _check_flaresolverr(self) -> bool:
+        """Check if FlareSolverr is available."""
+        if self._flaresolverr_available is not None:
+            return self._flaresolverr_available
+        try:
+            r = await self.client.get(f"{FLARESOLVERR_URL}/health", timeout=3)
+            self._flaresolverr_available = r.status_code == 200
+        except Exception:
+            self._flaresolverr_available = False
+        if not self._flaresolverr_available:
+            logger.warning("FlareSolverr not available — Anna's Archive searches will fail (JS challenge)")
+        return self._flaresolverr_available
+
+    async def _fetch_via_flaresolverr(self, url: str) -> str | None:
+        """Fetch a URL through FlareSolverr to bypass JS challenges."""
+        try:
+            r = await self.client.post(
+                f"{FLARESOLVERR_URL}/v1",
+                json={
+                    "cmd": "request.get",
+                    "url": url,
+                    "maxTimeout": 60000,
+                },
+                timeout=65.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            solution = data.get("solution", {})
+            status = solution.get("status", 0)
+            if status == 200:
+                return solution.get("response", "")
+            logger.error(f"FlareSolverr returned status {status} for {url}")
+            return None
+        except Exception as e:
+            logger.error(f"FlareSolverr request failed: {e}")
+            return None
+
+    async def _fetch(self, url: str) -> str | None:
+        """Fetch a URL, using FlareSolverr if available, falling back to direct."""
+        if await self._check_flaresolverr():
+            return await self._fetch_via_flaresolverr(url)
+
+        # Direct fetch (will fail on JS-protected pages but works on some mirrors)
+        try:
+            r = await self.client.get(url)
+            r.raise_for_status()
+            # Check for JS challenge page
+            if len(r.text) < 500 and "Verifying" in r.text:
+                logger.warning(f"Anna's Archive returned JS challenge — FlareSolverr required")
+                return None
+            return r.text
+        except Exception as e:
+            logger.error(f"Anna's Archive fetch failed: {e}")
+            return None
 
     async def search(self, query: str) -> list[AudiobookResult]:
         """Search Anna's Archive for ebooks."""
         search_url = f"{self.base_url}/search?q={quote(query)}&content=book_nonfiction&content=book_fiction&ext=epub&ext=pdf&ext=mobi&sort=&lang=en"
 
-        try:
-            response = await self.client.get(search_url)
-            response.raise_for_status()
-        except Exception as e:
-            logger.error(f"Anna's Archive search failed: {e}")
+        html = await self._fetch(search_url)
+        if not html:
             return []
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         results = []
 
         # Find result entries - Anna's Archive uses <a> tags with href starting with /md5/
         links = soup.find_all("a", href=re.compile(r"^/md5/"))
 
-        for link in links[:25]:  # Limit to 25 results
+        for link in links[:25]:
             try:
                 md5_match = re.search(r"/md5/([a-f0-9]+)", link.get("href", ""))
                 if not md5_match:
@@ -65,9 +119,7 @@ class AnnasArchiveScraper:
                 format_str = None
                 size = None
 
-                # Parse metadata from the text content
                 full_text = link.get_text()
-                # Author is often after the title
                 for line in lines[1:]:
                     if any(ext in line.lower() for ext in ["epub", "pdf", "mobi", "azw", "djvu", "cbr", "cbz"]):
                         format_str = line.strip()
@@ -76,7 +128,6 @@ class AnnasArchiveScraper:
                     elif not author and line and not line.startswith("["):
                         author = line.strip()
 
-                # Try to extract format and size from combined metadata
                 meta_match = re.search(r"(epub|pdf|mobi|azw3?|djvu|cbr|cbz)", full_text, re.IGNORECASE)
                 if meta_match and not format_str:
                     format_str = meta_match.group(1).upper()
@@ -85,7 +136,6 @@ class AnnasArchiveScraper:
                 if size_match and not size:
                     size = size_match.group(1)
 
-                # Extract cover image
                 cover_url = None
                 img = link.find("img")
                 if img:
@@ -113,27 +163,21 @@ class AnnasArchiveScraper:
         """Get detail page for an Anna's Archive book and extract download links."""
         detail_url = f"{self.base_url}/md5/{md5}"
 
-        try:
-            response = await self.client.get(detail_url)
-            response.raise_for_status()
-        except Exception as e:
-            logger.error(f"Anna's Archive detail fetch failed: {e}")
+        html = await self._fetch(detail_url)
+        if not html:
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
 
         try:
-            # Extract title
             title_elem = soup.find("div", class_="text-3xl") or soup.find("h1")
             title = title_elem.get_text(strip=True) if title_elem else "Unknown"
 
-            # Extract author
             author = None
             author_elem = soup.find("div", class_="italic")
             if author_elem:
                 author = author_elem.get_text(strip=True)
 
-            # Extract metadata
             format_str = None
             size = None
             language = None
@@ -153,32 +197,26 @@ class AnnasArchiveScraper:
             if lang_match:
                 language = lang_match.group(1)
 
-            # Extract description
             desc_elem = soup.find("div", class_="js-md5-top-box-description")
             if desc_elem:
                 description = desc_elem.get_text(strip=True)[:500]
 
-            # Cover image
             cover_url = None
             img = soup.find("img", src=re.compile(r"covers|book"))
             if img:
                 cover_url = img.get("src")
 
-            # Find download links - look for fast download partner links
             download_url = None
             for a_tag in soup.find_all("a", href=True):
                 href = a_tag.get("href", "")
-                link_text = a_tag.get_text(strip=True).lower()
-                # Prefer direct download links from library mirrors
                 if "/fast_download/" in href or "/slow_download/" in href:
                     download_url = href if href.startswith("http") else f"{self.base_url}{href}"
                     break
-                if "libgen" in href or "library.lol" in href or "annas-archive.se" in href:
+                if "libgen" in href or "library.lol" in href:
                     download_url = href
                     break
 
             if not download_url:
-                # Use the detail page URL as fallback - user can download from there
                 download_url = detail_url
 
             return AudiobookDetail(
@@ -189,7 +227,7 @@ class AnnasArchiveScraper:
                 size=size,
                 url=detail_url,
                 cover_url=cover_url,
-                magnet_url=download_url,  # Direct download URL for ebooks
+                magnet_url=download_url,
                 description=description,
                 language=language,
                 source="annas",
@@ -206,7 +244,6 @@ class AnnasArchiveScraper:
             response = await self.client.get(download_url, follow_redirects=True)
             response.raise_for_status()
 
-            # Try to get filename from Content-Disposition header
             filename = None
             cd = response.headers.get("content-disposition", "")
             fname_match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
@@ -214,7 +251,6 @@ class AnnasArchiveScraper:
                 filename = fname_match.group(1).strip()
 
             if not filename:
-                # Derive from URL
                 path = response.url.path
                 filename = path.split("/")[-1] if "/" in path else "book.epub"
 
