@@ -9,13 +9,17 @@ from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
 
-# MAM session cookie from browser — set via MAM_ID env var
-# To get this: log into MAM in a browser, copy the "lid" cookie value
-MAM_SESSION_ID = os.getenv("MAM_ID", "")
+# MAM API session cookie — NOT the browser lid cookie.
+# Generate at MAM → Preferences → Security → create an ASN/IP-locked session
+# with "allow dynamic seedbox IP" enabled. Copy the mam_id value.
+MAM_ID = os.getenv("MAM_ID", "")
+
+# MAM dynamic seedbox endpoint (t. subdomain, not www.)
+SEEDBOX_URL = "https://t.myanonamouse.net/json/dynamicSeedbox.php"
 
 
 class MAMScraper:
-    """MyAnonamouse private tracker search."""
+    """MyAnonamouse private tracker search using mam_id API session."""
 
     BASE_URL = "https://www.myanonamouse.net"
     SEARCH_URL = f"{BASE_URL}/tor/js/loadSearchJSONbasic.php"
@@ -26,6 +30,7 @@ class MAMScraper:
         self.email = email
         self.password = password
         self._logged_in = False
+        self._seedbox_activated = False
         self.client = httpx.AsyncClient(
             timeout=self.TIMEOUT,
             headers={"User-Agent": self.USER_AGENT},
@@ -33,82 +38,65 @@ class MAMScraper:
         )
 
     async def _login(self):
-        """Login to MAM. Tries: (1) MAM_ID lid cookie, (2) dynamic seedbox IP whitelist, (3) email/password."""
+        """Authenticate with MAM using mam_id API session cookie."""
         if self._logged_in:
             return True
 
-        # Method 1: Use lid session cookie
-        if MAM_SESSION_ID:
-            self.client.cookies.set("lid", MAM_SESSION_ID, domain=".myanonamouse.net")
+        if not MAM_ID:
+            logger.error(
+                "MAM_ID env var not set. Generate an API session at "
+                "MAM → Preferences → Security (ASN/IP-locked, allow dynamic seedbox)."
+            )
+            return False
+
+        # Set the mam_id cookie
+        self.client.cookies.set("mam_id", MAM_ID, domain=".myanonamouse.net")
+
+        # Step 1: Activate dynamic seedbox (register our IP)
+        if not self._seedbox_activated:
             try:
-                r = await self.client.get(f"{self.BASE_URL}/jsonLoad.php")
-                if r.status_code == 200 and "error" not in r.text.lower():
-                    self._logged_in = True
-                    logger.info("MAM login via lid cookie successful")
-                    return True
+                r = await self.client.get(SEEDBOX_URL)
+                data = r.json()
+                if data.get("Success"):
+                    logger.info(f"MAM dynamic seedbox: {data.get('msg')} (IP: {data.get('ip')})")
+                    self._seedbox_activated = True
                 else:
-                    logger.warning("MAM lid cookie invalid or expired")
-                    self.client.cookies.delete("lid", domain=".myanonamouse.net")
+                    msg = data.get("msg", "Unknown error")
+                    logger.error(f"MAM dynamic seedbox failed: {msg}")
+                    if "non-API session" in msg or "not allowed" in msg:
+                        logger.error(
+                            "The mam_id is a browser session, not an API session. "
+                            "Create a new session at MAM → Preferences → Security "
+                            "with 'allow dynamic seedbox IP' enabled."
+                        )
+                    return False
             except Exception as e:
-                logger.warning(f"MAM cookie check failed: {e}")
+                logger.error(f"MAM dynamic seedbox call failed: {e}")
+                return False
 
-        # Method 2: Check if IP is whitelisted via dynamic seedbox
+        # Step 2: Verify search works
         try:
-            r = await self.client.get(f"{self.BASE_URL}/tor/js/loadSearchJSONbasic.php",
-                                      params={"tor[text]": "test", "perpage": "1"})
+            r = await self.client.get(
+                self.SEARCH_URL,
+                params={"tor[text]": "test", "perpage": "1"},
+            )
             if r.status_code == 200:
-                try:
-                    r.json()  # Valid JSON = authenticated
-                    self._logged_in = True
-                    logger.info("MAM access via dynamic seedbox IP whitelist")
-                    return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Method 3: Email/password login (may fail — MAM requires JS validation)
-        try:
-            r = await self.client.get(f"{self.BASE_URL}/login.php")
-            t_match = _re.search(r'name="t" value="([^"]+)"', r.text)
-            a_match = _re.search(r'name="a" value="([^"]+)"', r.text)
-            if not t_match or not a_match:
-                logger.error("MAM login: could not find CSRF tokens")
+                r.json()  # Will throw if not valid JSON
+                self._logged_in = True
+                logger.info("MAM API session authenticated successfully")
+                return True
+            else:
+                logger.error(f"MAM search returned {r.status_code}: {r.text[:200]}")
                 return False
-
-            t_val = t_match.group(1)
-            a_val = a_match.group(1)
-
-            data = {
-                "email": self.email,
-                "password": self.password,
-                "t": t_val,
-                "a": a_val,
-                "j": str(len(t_val)),
-                "rememberMe": "yes",
-            }
-            r2 = await self.client.post(f"{self.BASE_URL}/takelogin.php", data=data)
-
-            if not self.client.cookies.get("lid"):
-                logger.error(
-                    "MAM login failed. To fix: log into MAM in your browser, "
-                    "then visit https://www.myanonamouse.net/json/dynamicSeedbox.php "
-                    "to whitelist this server's IP for 24h."
-                )
-                return False
-
-            self._logged_in = True
-            logger.info("MAM login via email/password successful")
-            return True
         except Exception as e:
-            logger.error(f"MAM login failed: {e}")
+            logger.error(f"MAM search verification failed: {e}")
             return False
 
     async def close(self):
         await self.client.aclose()
 
     async def search(self, query: str) -> list[AudiobookResult]:
-        """Search MAM for audiobooks."""
+        """Search MAM for audiobooks and ebooks."""
         if not await self._login():
             return []
 

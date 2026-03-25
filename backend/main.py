@@ -46,9 +46,10 @@ async def lifespan(app: FastAPI):
     global scraper, mam_scraper, annas_scraper
     scraper = AudioBookBayScraper()
     annas_scraper = AnnasArchiveScraper()
-    if MAM_EMAIL and MAM_PASSWORD:
+    from backend.mam import MAM_ID
+    if MAM_ID or (MAM_EMAIL and MAM_PASSWORD):
         mam_scraper = MAMScraper(MAM_EMAIL, MAM_PASSWORD)
-        logger.info("MAM scraper initialized")
+        logger.info(f"MAM scraper initialized (mam_id={'set' if MAM_ID else 'not set'})")
     sync_task = asyncio.create_task(_periodic_sync())
     yield
     sync_task.cancel()
@@ -75,46 +76,26 @@ async def health():
 
 @app.get("/mam-status")
 async def mam_status():
-    """Check MAM authentication status and show setup instructions."""
-    result = {"mam_configured": bool(MAM_EMAIL), "authenticated": False, "ip": None}
+    """Check MAM authentication status."""
+    from backend.mam import MAM_ID, SEEDBOX_URL
+    result = {"mam_id_configured": bool(MAM_ID), "authenticated": False, "ip": None}
+    if not MAM_ID:
+        result["instructions"] = (
+            "MAM_ID env var not set. Go to MAM → Preferences → Security → "
+            "create an ASN-locked session with 'allow dynamic seedbox IP' enabled. "
+            "Store the mam_id value in Vault at secret/servarr key 'mam_id'."
+        )
+        return result
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get("https://www.myanonamouse.net/json/dynamicSeedbox.php")
+            r = await client.get(SEEDBOX_URL, cookies={"mam_id": MAM_ID})
             data = r.json()
             result["ip"] = data.get("ip")
             result["authenticated"] = data.get("Success", False)
-            if not result["authenticated"]:
-                result["setup_url"] = "/mam-activate"
-                result["instructions"] = (
-                    f"Server IP: {data.get('ip')}. "
-                    "Visit /mam-activate while logged into MAM to whitelist this IP."
-                )
+            result["msg"] = data.get("msg", "")
     except Exception as e:
         result["error"] = str(e)
     return result
-
-
-@app.post("/mam-activate")
-async def mam_activate(request: Request):
-    """Activate MAM dynamic seedbox. User provides their lid cookie, server proxies
-    the call to MAM from the server's IP with the user's session."""
-    body = await request.json()
-    lid = body.get("lid", "").strip()
-    if not lid:
-        return {"Success": False, "msg": "No lid cookie provided"}
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                "https://www.myanonamouse.net/json/dynamicSeedbox.php",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                },
-                cookies={"lid": lid},
-            )
-            return r.json()
-    except Exception as e:
-        return {"Success": False, "msg": str(e)}
 
 
 async def _enrich_covers(results: list[AudiobookResult], query: str):
@@ -1658,38 +1639,24 @@ async def web_ui():
     function showMamSetup() {
         const overlay = document.getElementById('mamSetupModal');
         overlay.style.display = 'block';
+        const result = document.getElementById('mamResult');
+        result.textContent = 'Checking...';
         fetch('/mam-status').then(r => r.json()).then(data => {
             document.getElementById('mamIp').textContent = data.ip || 'unknown';
-            document.getElementById('mamAuth').textContent = data.authenticated ? 'Active' : 'Not connected';
-            document.getElementById('mamAuth').style.color = data.authenticated ? 'var(--accent-green)' : 'var(--accent-red)';
-        });
-    }
-
-    async function activateMam() {
-        const lid = document.getElementById('mamLidInput').value.trim();
-        if (!lid) { alert('Paste your MAM lid cookie'); return; }
-        const el = document.getElementById('mamResult');
-        el.textContent = 'Activating...';
-        el.style.color = 'var(--accent-amber)';
-        try {
-            const r = await fetch('/mam-activate', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({lid}),
-            });
-            const data = await r.json();
-            if (data.Success) {
-                el.textContent = 'Success! IP whitelisted for 24h.';
-                el.style.color = 'var(--accent-green)';
-                checkMamStatus();
+            if (data.authenticated) {
+                document.getElementById('mamAuth').textContent = 'Active';
+                document.getElementById('mamAuth').style.color = 'var(--accent-green)';
+                result.innerHTML = 'MAM is connected and working. Dynamic seedbox IP is whitelisted.';
             } else {
-                el.textContent = 'Failed: ' + (data.msg || 'Unknown error');
-                el.style.color = 'var(--accent-red)';
+                document.getElementById('mamAuth').textContent = 'Not connected';
+                document.getElementById('mamAuth').style.color = 'var(--accent-red)';
+                if (!data.mam_id_configured) {
+                    result.innerHTML = '<strong>Setup needed:</strong><br>1. Go to <a href="https://www.myanonamouse.net/preferences/index.php?view=security" target="_blank" style="color:var(--accent-amber)">MAM Security Preferences</a><br>2. Create a new session: ASN-locked (or IP-locked)<br>3. Enable <em>"Allow dynamic seedbox IP"</em><br>4. Copy the <code style="background:var(--bg-input);padding:2px 4px;border-radius:3px;">mam_id</code> value<br>5. Store in Vault: <code style="background:var(--bg-input);padding:2px 4px;border-radius:3px;">vault kv patch secret/servarr mam_id=YOUR_VALUE</code>';
+                } else {
+                    result.innerHTML = 'mam_id is configured but: <strong>' + esc(data.msg || 'unknown error') + '</strong>';
+                }
             }
-        } catch(e) {
-            el.textContent = 'Error: ' + e.message;
-            el.style.color = 'var(--accent-red)';
-        }
+        });
     }
 
     checkMamStatus();
@@ -1702,21 +1669,9 @@ async def web_ui():
             Server IP: <strong id="mamIp">...</strong> &middot;
             Status: <strong id="mamAuth">...</strong>
         </div>
-        <div style="font-size:13px;line-height:1.7;margin-bottom:16px;">
-            <strong>Steps:</strong><br>
-            1. Log into <a href="https://www.myanonamouse.net" target="_blank" style="color:var(--accent-amber)">MAM</a><br>
-            2. Open DevTools (F12) &rarr; Application &rarr; Cookies &rarr; myanonamouse.net<br>
-            3. Copy the <code style="background:var(--bg-input);padding:2px 4px;border-radius:3px;">lid</code> cookie value<br>
-            4. Paste below and click Activate
-        </div>
-        <div class="modal-field">
-            <label for="mamLidInput">lid cookie value</label>
-            <input type="text" id="mamLidInput" placeholder="Paste lid cookie here...">
-        </div>
-        <div id="mamResult" style="font-size:13px;min-height:20px;margin:8px 0;"></div>
+        <div id="mamResult" style="font-size:13px;line-height:1.7;margin-bottom:16px;"></div>
         <div class="modal-actions">
             <button class="btn-cancel" onclick="document.getElementById('mamSetupModal').style.display='none'">Close</button>
-            <button class="btn-confirm" onclick="activateMam()">Activate</button>
         </div>
     </div>
 </div>
