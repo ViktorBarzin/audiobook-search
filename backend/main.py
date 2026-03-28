@@ -147,13 +147,32 @@ async def health_deep():
 
 
 @app.post("/api/download-url")
-async def download_url(req: DownloadURLRequest, request: Request):
+async def download_url(request: Request):
     """iOS Shortcut endpoint - accept an AA URL, download ebook to Calibre."""
     _verify_api_key(request)
 
-    md5_match = _re.search(r"/md5/([a-f0-9]+)", req.url, _re.IGNORECASE)
+    # Parse body flexibly — iOS Shortcuts may send plain text or JSON
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    url = None
+
+    if "json" in content_type:
+        try:
+            data = await request.json()
+            url = data.get("url", "") if isinstance(data, dict) else str(data)
+        except Exception:
+            url = body.decode("utf-8", errors="replace").strip()
+    else:
+        url = body.decode("utf-8", errors="replace").strip()
+
+    logger.info(f"download-url received: content-type={content_type}, url={url!r}")
+
+    if not url:
+        raise HTTPException(status_code=400, detail="No URL provided")
+
+    md5_match = _re.search(r"/md5/([a-f0-9]+)", url, _re.IGNORECASE)
     if not md5_match:
-        raise HTTPException(status_code=400, detail="URL must be an Anna's Archive book page (/md5/...)")
+        raise HTTPException(status_code=400, detail=f"URL must be an Anna's Archive book page (/md5/...). Got: {url[:200]}")
     md5 = md5_match.group(1)
 
     if not annas_scraper:
