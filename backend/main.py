@@ -1044,8 +1044,51 @@ async def web_ui():
         .status.error { background: rgba(160,64,64,0.1); border-color: var(--accent-red); color: #e0a0a0; }
         .status.info { background: var(--accent-amber-glow); border-color: var(--accent-amber-dim); color: var(--accent-amber); }
 
+        /* ── Source Groups ── */
+        .source-group {
+            margin-bottom: 24px;
+        }
+        .source-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            cursor: pointer;
+            user-select: none;
+            margin-bottom: 12px;
+            transition: background 0.2s;
+        }
+        .source-header:hover {
+            background: var(--bg-input);
+        }
+        .source-header .source-label {
+            font-weight: 600;
+            font-size: 1rem;
+            color: var(--text-primary);
+        }
+        .source-header .source-count {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+        .source-header .chevron {
+            margin-left: auto;
+            color: var(--text-muted);
+            transition: transform 0.2s;
+            font-size: 1.1rem;
+        }
+        .source-group.collapsed .chevron {
+            transform: rotate(-90deg);
+        }
+        .source-group.collapsed .source-grid {
+            display: none;
+        }
+
         /* ── Results Grid ── */
-        .results {
+        .results {}
+        .source-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
             gap: 16px;
@@ -1458,6 +1501,9 @@ async def web_ui():
                 <button class="filter-tab" data-filter="audiobook" onclick="setFilter(this)">Audiobooks</button>
                 <button class="filter-tab" data-filter="ebook" onclick="setFilter(this)">Ebooks</button>
             </div>
+            <div class="filter-tabs" id="sourceFilterTabs" style="display:none">
+                <button class="filter-tab active" data-source="all" onclick="setSourceFilter(this)">All Sources</button>
+            </div>
         </div>
 
         <div id="sourcesBar" class="sources-bar"></div>
@@ -1494,6 +1540,8 @@ async def web_ui():
     let currentContentType = 'audiobook';
     let currentSource = '';
     let activeFilter = 'all';
+    let activeSourceFilter = 'all';
+    let lastResults = [];
 
     function showStatus(message, type) {
         const el = document.getElementById('status');
@@ -1589,8 +1637,20 @@ async def web_ui():
             const resp = await fetch(url);
             if (!resp.ok) throw new Error('Search failed');
             const results = await resp.json();
+            lastResults = results;
+            activeSourceFilter = 'all';
+            buildSourceFilterTabs(results);
             displayResults(results);
-            showStatus(results.length === 0 ? 'No results found' : `Found ${results.length} results`, results.length ? 'success' : 'info');
+            if (results.length === 0) {
+                showStatus('No results found', 'info');
+                document.getElementById('sourceFilterTabs').style.display = 'none';
+            } else {
+                const counts = {};
+                results.forEach(b => counts[b.source] = (counts[b.source] || 0) + 1);
+                const shortNames = { mam: 'MAM', annas: "Anna's", libgen: 'LibGen', openlib: 'OpenLib', abb: 'ABB' };
+                const breakdown = Object.entries(counts).map(([s, c]) => `${shortNames[s] || s}: ${c}`).join(', ');
+                showStatus(`Found ${results.length} results — ${breakdown}`, 'success');
+            }
         } catch (e) {
             showStatus('Search failed: ' + e.message, 'error');
         } finally {
@@ -1604,44 +1664,108 @@ async def web_ui():
         return d.innerHTML;
     }
 
+    function sourceName(source) {
+        const names = {
+            mam: 'MyAnonamouse', annas: "Anna's Archive", libgen: 'Library Genesis',
+            openlib: 'Open Library', abb: 'AudioBookBay'
+        };
+        return names[source] || source;
+    }
+
+    function toggleSource(el) {
+        el.closest('.source-group').classList.toggle('collapsed');
+    }
+
+    function renderCard(b) {
+        const title = esc(b.title);
+        const author = esc(b.author || '');
+        const dest = b.source === 'openlib' ? 'Open Library' : (b.content_type === 'ebook' ? 'Calibre Library' : 'Audiobookshelf');
+
+        return `
+            <div class="card">
+                <div class="card-image-wrap">
+                    ${b.cover_url ? `<img src="${b.cover_url}" alt="" class="card-image" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="card-image-placeholder" style="display:none">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>` : `<div class="card-image-placeholder">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>`}
+                    <div class="card-badges">
+                        ${sourceBadge(b.source)}
+                        ${typeBadge(b.content_type)}
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="card-title">${title}</div>
+                    ${b.author ? `<div class="card-meta"><strong>Author:</strong> ${author}</div>` : ''}
+                    ${b.narrator ? `<div class="card-meta"><strong>Narrator:</strong> ${esc(b.narrator)}</div>` : ''}
+                    ${b.format ? `<div class="card-meta"><strong>Format:</strong> ${esc(b.format)}</div>` : ''}
+                    ${b.size ? `<div class="card-meta"><strong>Size:</strong> ${esc(b.size)}</div>` : ''}
+                    <div class="card-actions">
+                        <button class="btn-download"
+                            data-book-id="${esc(b.id)}"
+                            data-book-author="${author}"
+                            data-book-title="${title}"
+                            data-content-type="${b.content_type}"
+                            data-source="${b.source}"
+                            onclick="${b.source === 'openlib' ? `window.open('${esc(b.url)}', '_blank')` : 'prepareDownload(this)'}">
+                            ${b.source === 'openlib' ? 'Read on Open Library &nearr;' : `Download &rarr; ${dest}`}
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    function buildSourceFilterTabs(results) {
+        const sourceOrder = ['mam', 'annas', 'libgen', 'openlib', 'abb'];
+        const present = {};
+        results.forEach(b => present[b.source] = (present[b.source] || 0) + 1);
+        const sources = sourceOrder.filter(s => present[s]).concat(Object.keys(present).filter(s => !sourceOrder.includes(s)));
+
+        const container = document.getElementById('sourceFilterTabs');
+        if (!sources.length) { container.style.display = 'none'; return; }
+
+        const shortNames = { mam: 'MAM', annas: "Anna's", libgen: 'LibGen', openlib: 'OpenLib', abb: 'ABB' };
+        container.style.display = 'flex';
+        container.innerHTML = `<button class="filter-tab ${activeSourceFilter === 'all' ? 'active' : ''}" data-source="all" onclick="setSourceFilter(this)">All Sources</button>`
+            + sources.map(s => `<button class="filter-tab ${activeSourceFilter === s ? 'active' : ''}" data-source="${s}" onclick="setSourceFilter(this)">${shortNames[s] || s} (${present[s]})</button>`).join('');
+    }
+
+    function setSourceFilter(btn) {
+        document.querySelectorAll('#sourceFilterTabs .filter-tab').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        activeSourceFilter = btn.dataset.source;
+        renderResults();
+    }
+
+    function renderResults() {
+        const filtered = activeSourceFilter === 'all' ? lastResults : lastResults.filter(b => b.source === activeSourceFilter);
+        displayResults(filtered);
+    }
+
     function displayResults(results) {
         const el = document.getElementById('results');
         if (!results.length) { el.innerHTML = ''; return; }
 
-        el.innerHTML = results.map(b => {
-            const title = esc(b.title);
-            const author = esc(b.author || '');
-            const dest = b.source === 'openlib' ? 'Open Library' : (b.content_type === 'ebook' ? 'Calibre Library' : 'Audiobookshelf');
+        const sourceOrder = ['mam', 'annas', 'libgen', 'openlib', 'abb'];
+        const grouped = {};
+        results.forEach(b => {
+            (grouped[b.source] = grouped[b.source] || []).push(b);
+        });
 
-            return `
-                <div class="card">
-                    <div class="card-image-wrap">
-                        ${b.cover_url ? `<img src="${b.cover_url}" alt="" class="card-image" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="card-image-placeholder" style="display:none">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>` : `<div class="card-image-placeholder">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>`}
-                        <div class="card-badges">
-                            ${sourceBadge(b.source)}
-                            ${typeBadge(b.content_type)}
+        el.innerHTML = sourceOrder
+            .filter(s => grouped[s])
+            .concat(Object.keys(grouped).filter(s => !sourceOrder.includes(s)))
+            .map(source => {
+                const items = grouped[source];
+                return `
+                    <div class="source-group">
+                        <div class="source-header" onclick="toggleSource(this)">
+                            ${sourceBadge(source)}
+                            <span class="source-label">${sourceName(source)}</span>
+                            <span class="source-count">(${items.length} result${items.length !== 1 ? 's' : ''})</span>
+                            <span class="chevron">&#9662;</span>
                         </div>
-                    </div>
-                    <div class="card-body">
-                        <div class="card-title">${title}</div>
-                        ${b.author ? `<div class="card-meta"><strong>Author:</strong> ${author}</div>` : ''}
-                        ${b.narrator ? `<div class="card-meta"><strong>Narrator:</strong> ${esc(b.narrator)}</div>` : ''}
-                        ${b.format ? `<div class="card-meta"><strong>Format:</strong> ${esc(b.format)}</div>` : ''}
-                        ${b.size ? `<div class="card-meta"><strong>Size:</strong> ${esc(b.size)}</div>` : ''}
-                        <div class="card-actions">
-                            <button class="btn-download"
-                                data-book-id="${esc(b.id)}"
-                                data-book-author="${author}"
-                                data-book-title="${title}"
-                                data-content-type="${b.content_type}"
-                                data-source="${b.source}"
-                                onclick="${b.source === 'openlib' ? `window.open('${esc(b.url)}', '_blank')` : 'prepareDownload(this)'}">
-                                ${b.source === 'openlib' ? 'Read on Open Library &nearr;' : `Download &rarr; ${dest}`}
-                            </button>
+                        <div class="source-grid">
+                            ${items.map(renderCard).join('')}
                         </div>
-                    </div>
-                </div>`;
-        }).join('');
+                    </div>`;
+            }).join('');
     }
 
     async function prepareDownload(btn) {
