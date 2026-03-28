@@ -303,7 +303,14 @@ class AnnasArchiveScraper:
             if filename and not any(filename.lower().endswith(ext) for ext in valid_ext):
                 filename = None
 
-            return response.content, filename
+            content = response.content
+            # Validate content is an actual ebook file, not an HTML error/challenge page
+            if content[:1] == b'<' or content[:15].lower().startswith(b'<!doctype'):
+                ct = response.headers.get("content-type", "")
+                logger.warning(f"Download returned HTML instead of ebook file from {download_url} (content-type: {ct}, size: {len(content)})")
+                return None, None
+
+            return content, filename
         except Exception as e:
             logger.error(f"Anna's Archive file download failed: {e}")
             return None, None

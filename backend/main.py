@@ -32,11 +32,12 @@ SHORTCUT_ICLOUD_URL = os.getenv("SHORTCUT_ICLOUD_URL", "")
 
 
 def _chown_for_cwa(path: str):
-    """Set file ownership to CWA user so Calibre can manage (delete/move) it."""
+    """Set file ownership and permissions so CWA (abc user) can manage it."""
     try:
         os.chown(path, CWA_UID, CWA_GID)
+        os.chmod(path, 0o664)
     except OSError as e:
-        logger.warning(f"Failed to chown {path}: {e}")
+        logger.warning(f"Failed to set ownership on {path}: {e}")
 
 
 def _verify_api_key(request: Request):
@@ -182,31 +183,36 @@ async def download_url(request: Request):
     title = detail.title if detail else "Unknown"
     author = detail.author if detail else "Unknown Author"
 
-    # Try direct download first
-    if detail and detail.magnet_url:
-        try:
-            file_data, filename = await annas_scraper.download_file(detail.magnet_url)
-            if file_data:
-                if not filename:
-                    ext = ".epub"
-                    if file_data[:4] == b"%PDF":
-                        ext = ".pdf"
-                    filename = f"{author} - {title}{ext}"
-                save_path = os.path.join(CWA_INGEST_PATH, filename)
-                os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-                with open(save_path, "wb") as f:
-                    f.write(file_data)
-                _chown_for_cwa(save_path)
-                return {"status": "ok", "title": title, "author": author, "filename": filename}
-        except Exception as e:
-            logger.warning(f"Direct download failed for {md5}: {e}")
-
-    # Fallback: Stacks
+    # Try Stacks first — it handles AA download pages (CAPTCHA, challenges) properly
     stacks_result = await annas_scraper.download_via_stacks(md5)
     if stacks_result.get("success"):
-        return {"status": "ok", "title": title, "author": author, "message": "Queued via Stacks"}
+        return {"status": "ok", "title": title, "author": author,
+                "message": "Queued via Stacks — will appear in Calibre shortly"}
 
-    raise HTTPException(status_code=502, detail="Download failed - try again later")
+    # Fallback: direct download only for URLs that serve files directly (libgen/library.lol)
+    # AA /fast_download/ and /slow_download/ URLs require browser interaction and return HTML
+    if detail and detail.magnet_url:
+        download_url = detail.magnet_url
+        is_direct_mirror = any(host in download_url for host in ("libgen", "library.lol", "gen.lib"))
+        if is_direct_mirror:
+            try:
+                file_data, filename = await annas_scraper.download_file(download_url)
+                if file_data:
+                    if not filename:
+                        ext = ".epub"
+                        if file_data[:4] == b"%PDF":
+                            ext = ".pdf"
+                        filename = f"{author} - {title}{ext}"
+                    save_path = os.path.join(CWA_INGEST_PATH, filename)
+                    os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+                    with open(save_path, "wb") as f:
+                        f.write(file_data)
+                    _chown_for_cwa(save_path)
+                    return {"status": "ok", "title": title, "author": author, "filename": filename}
+            except Exception as e:
+                logger.warning(f"Direct download failed for {md5}: {e}")
+
+    raise HTTPException(status_code=502, detail="Download failed — try again later")
 
 
 @app.get("/shortcut")
