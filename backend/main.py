@@ -40,6 +40,22 @@ def _chown_for_cwa(path: str):
         logger.warning(f"Failed to set ownership on {path}: {e}")
 
 
+async def _periodic_fix_ingest_permissions():
+    """Fix permissions on files in CWA ingest dir (Stacks writes as root:1000 mode 644)."""
+    while True:
+        try:
+            if os.path.isdir(CWA_INGEST_PATH):
+                for entry in os.scandir(CWA_INGEST_PATH):
+                    if entry.is_file():
+                        st = entry.stat()
+                        if st.st_uid != CWA_UID or st.st_gid != CWA_GID or st.st_mode & 0o777 != 0o664:
+                            _chown_for_cwa(entry.path)
+                            logger.info(f"Fixed permissions on {entry.name}")
+        except Exception as e:
+            logger.warning(f"Permission fixer error: {e}")
+        await asyncio.sleep(5)
+
+
 def _verify_api_key(request: Request):
     key = request.headers.get("X-Api-Key", "")
     if not API_KEY or key != API_KEY:
@@ -80,8 +96,10 @@ async def lifespan(app: FastAPI):
         mam_scraper = MAMScraper(MAM_EMAIL, MAM_PASSWORD)
         logger.info(f"MAM scraper initialized (mam_id={'set' if MAM_ID else 'not set'})")
     sync_task = asyncio.create_task(_periodic_sync())
+    perm_task = asyncio.create_task(_periodic_fix_ingest_permissions())
     yield
     sync_task.cancel()
+    perm_task.cancel()
     if scraper:
         await scraper.close()
     if mam_scraper:

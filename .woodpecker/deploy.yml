@@ -14,7 +14,7 @@ steps:
       - "kubectl rollout status deployment/book-search -n ebooks --timeout=300s"
 
   - name: notify
-    image: woodpeckerci/plugin-slack
+    image: plugins/slack
     settings:
       webhook:
         from_secret: slack-webhook-url
