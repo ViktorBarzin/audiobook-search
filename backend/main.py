@@ -4,7 +4,7 @@ import logging
 import re as _re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 import httpx
 
@@ -27,6 +27,8 @@ MAM_PASSWORD = os.getenv("MAM_PASSWORD", "")
 CWA_INGEST_PATH = os.getenv("CWA_INGEST_PATH", "/cwa-book-ingest")
 CWA_UID = int(os.getenv("CWA_UID", "1000"))
 CWA_GID = int(os.getenv("CWA_GID", "1000"))
+API_KEY = os.getenv("API_KEY", "")
+SHORTCUT_ICLOUD_URL = os.getenv("SHORTCUT_ICLOUD_URL", "")
 
 
 def _chown_for_cwa(path: str):
@@ -35,6 +37,16 @@ def _chown_for_cwa(path: str):
         os.chown(path, CWA_UID, CWA_GID)
     except OSError as e:
         logger.warning(f"Failed to chown {path}: {e}")
+
+
+def _verify_api_key(request: Request):
+    key = request.headers.get("X-Api-Key", "")
+    if not API_KEY or key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+class DownloadURLRequest(BaseModel):
+    url: str
 
 
 class DownloadRequest(BaseModel):
@@ -132,6 +144,58 @@ async def health_deep():
         status_code=status_code,
         content={"status": "ok" if all_ok else "degraded", "checks": checks},
     )
+
+
+@app.post("/api/download-url")
+async def download_url(req: DownloadURLRequest, request: Request):
+    """iOS Shortcut endpoint - accept an AA URL, download ebook to Calibre."""
+    _verify_api_key(request)
+
+    md5_match = _re.search(r"/md5/([a-f0-9]+)", req.url, _re.IGNORECASE)
+    if not md5_match:
+        raise HTTPException(status_code=400, detail="URL must be an Anna's Archive book page (/md5/...)")
+    md5 = md5_match.group(1)
+
+    if not annas_scraper:
+        raise HTTPException(status_code=503, detail="Anna's Archive scraper not available")
+
+    detail = await annas_scraper.get_detail(md5)
+    title = detail.title if detail else "Unknown"
+    author = detail.author if detail else "Unknown Author"
+
+    # Try direct download first
+    if detail and detail.magnet_url:
+        try:
+            file_data, filename = await annas_scraper.download_file(detail.magnet_url)
+            if file_data:
+                if not filename:
+                    ext = ".epub"
+                    if file_data[:4] == b"%PDF":
+                        ext = ".pdf"
+                    filename = f"{author} - {title}{ext}"
+                save_path = os.path.join(CWA_INGEST_PATH, filename)
+                os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(file_data)
+                _chown_for_cwa(save_path)
+                return {"status": "ok", "title": title, "author": author, "filename": filename}
+        except Exception as e:
+            logger.warning(f"Direct download failed for {md5}: {e}")
+
+    # Fallback: Stacks
+    stacks_result = await annas_scraper.download_via_stacks(md5)
+    if stacks_result.get("success"):
+        return {"status": "ok", "title": title, "author": author, "message": "Queued via Stacks"}
+
+    raise HTTPException(status_code=502, detail="Download failed - try again later")
+
+
+@app.get("/shortcut")
+async def shortcut_redirect():
+    """Redirect to the iOS Shortcut iCloud install link."""
+    if not SHORTCUT_ICLOUD_URL:
+        raise HTTPException(status_code=404, detail="Shortcut not configured")
+    return RedirectResponse(url=SHORTCUT_ICLOUD_URL)
 
 
 @app.get("/cover-proxy")
