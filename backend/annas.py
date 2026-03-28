@@ -304,8 +304,10 @@ class AnnasArchiveScraper:
                 filename = None
 
             content = response.content
+            # Strip UTF-8 BOM if present before checking for HTML
+            check_content = content.lstrip(b'\xef\xbb\xbf')
             # Validate content is an actual ebook file, not an HTML error/challenge page
-            if content[:1] == b'<' or content[:15].lower().startswith(b'<!doctype'):
+            if check_content[:1] == b'<' or check_content[:15].lower().startswith(b'<!doctype'):
                 ct = response.headers.get("content-type", "")
                 logger.warning(f"Download returned HTML instead of ebook file from {download_url} (content-type: {ct}, size: {len(content)})")
                 return None, None
@@ -332,6 +334,9 @@ class AnnasArchiveScraper:
             if r.status_code == 200 and data.get("success"):
                 logger.info(f"Queued download via Stacks: {md5}")
                 return {"success": True, "message": f"Queued in Stacks — downloading to Calibre Library"}
+            elif r.status_code == 200 and "already downloaded" in data.get("message", "").lower():
+                logger.info(f"Stacks: already downloaded {md5}")
+                return {"success": True, "message": "Already downloaded via Stacks"}
             else:
                 error = data.get("error", f"HTTP {r.status_code}")
                 logger.error(f"Stacks queue/add failed: {error}")
