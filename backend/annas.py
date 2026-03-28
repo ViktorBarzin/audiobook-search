@@ -10,7 +10,7 @@ from backend.models import AudiobookResult, AudiobookDetail
 logger = logging.getLogger(__name__)
 
 # Anna's Archive changes domains frequently — configurable via env var
-ANNAS_DOMAIN = os.getenv("ANNAS_DOMAIN", "annas-archive.gs")
+ANNAS_DOMAIN = os.getenv("ANNAS_DOMAIN", "annas-archive.gl")
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr.servarr.svc.cluster.local")
 
 # Self-hosted Stacks instance (Anna's Archive download manager)
@@ -87,26 +87,27 @@ class AnnasArchiveScraper:
             return None
 
     async def _fetch_public(self, url: str) -> str | None:
-        """Fetch from public Anna's Archive, using FlareSolverr if needed."""
-        # Try FlareSolverr first
+        """Fetch from public Anna's Archive. Tries direct first, FlareSolverr as fallback."""
+        # Try direct fetch first (works on .gl domain without JS challenge)
+        try:
+            r = await self.client.get(url)
+            r.raise_for_status()
+            if len(r.text) < 500 and "Verifying" in r.text:
+                logger.warning("Anna's Archive returned JS challenge — trying FlareSolverr")
+            elif "/md5/" in r.text or len(r.text) > 5000:
+                return r.text
+        except Exception as e:
+            logger.warning(f"Anna's Archive direct fetch failed: {e}")
+
+        # FlareSolverr fallback for JS-challenged domains
         if await self._check_flaresolverr():
             html = await self._fetch_via_flaresolverr(url)
             if html and "/md5/" in html:
                 return html
             if html:
-                logger.warning("Anna's Archive results are client-side rendered — FlareSolverr can't extract them")
+                logger.warning("FlareSolverr couldn't extract results (client-side rendered)")
 
-        # Direct fetch fallback
-        try:
-            r = await self.client.get(url)
-            r.raise_for_status()
-            if len(r.text) < 500 and "Verifying" in r.text:
-                logger.warning("Anna's Archive returned JS challenge")
-                return None
-            return r.text
-        except Exception as e:
-            logger.error(f"Anna's Archive fetch failed: {e}")
-            return None
+        return None
 
     async def search(self, query: str) -> list[AudiobookResult]:
         """Search Anna's Archive for ebooks. Uses public site (Stacks is download-only)."""
