@@ -84,6 +84,46 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/health/deep")
+async def health_deep():
+    """Deep health check — verifies downstream dependencies are functional."""
+    checks = {}
+
+    # Check CWA ingest folder is writable
+    try:
+        test_path = os.path.join(CWA_INGEST_PATH, ".health-check")
+        os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+        with open(test_path, "w") as f:
+            f.write("ok")
+        os.remove(test_path)
+        checks["cwa_ingest"] = "ok"
+    except Exception as e:
+        checks["cwa_ingest"] = f"error: {e}"
+
+    # Check Stacks health (API reachable + DB not corrupted)
+    if annas_scraper:
+        try:
+            status = await annas_scraper.get_stacks_status()
+            if status.get("available"):
+                error = status.get("error")
+                if error and "malformed" in str(error):
+                    checks["stacks"] = "error: database corrupted"
+                else:
+                    checks["stacks"] = "ok"
+            else:
+                checks["stacks"] = "unavailable"
+        except Exception as e:
+            checks["stacks"] = f"error: {e}"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    status_code = 200 if all_ok else 503
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "ok" if all_ok else "degraded", "checks": checks},
+    )
+
+
 @app.get("/cover-proxy")
 async def cover_proxy(url: str = Query(..., description="Cover image URL to proxy")):
     """Proxy cover images to avoid CORS and detect placeholder images."""
@@ -396,36 +436,36 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
             if md5_match:
                 md5 = md5_match.group(1)
 
-        # Try Stacks first (downloads directly to CWA ingest folder)
+        # Try direct download first (faster, more reliable than Stacks)
+        if req.source == "annas" and annas_scraper:
+            try:
+                file_data, filename = await annas_scraper.download_file(req.magnet_url)
+                if file_data:
+                    if not filename:
+                        ext = ".epub"
+                        if file_data[:4] == b"%PDF":
+                            ext = ".pdf"
+                        filename = f"{author} - {title}{ext}"
+                    save_path = os.path.join(CWA_INGEST_PATH, filename)
+                    os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+                    with open(save_path, "wb") as f:
+                        f.write(file_data)
+                    logger.info(f"Ebook saved to CWA ingest: {save_path}")
+                    return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
+            except Exception as e:
+                logger.warning(f"Direct download failed: {e}")
+
+        # Fallback: try Stacks (async queue, file lands in shared NFS)
         if md5 and annas_scraper:
             stacks_result = await annas_scraper.download_via_stacks(md5)
             if stacks_result.get("success"):
                 return {"status": "ok", "message": stacks_result["message"]}
-            logger.warning(f"Stacks download failed: {stacks_result.get('error')} — falling back to direct download")
+            logger.warning(f"Stacks download also failed: {stacks_result.get('error')}")
 
-        # Fallback: direct HTTP download to CWA ingest
-        if req.source == "annas" and annas_scraper:
-            file_data, filename = await annas_scraper.download_file(req.magnet_url)
-            if not file_data:
-                raise HTTPException(status_code=502, detail="Failed to download ebook from Anna's Archive")
+        if req.source == "annas":
+            raise HTTPException(status_code=502, detail="All download methods failed for Anna's Archive")
 
-            if not filename:
-                # Detect extension from magic bytes
-                ext = ".epub"
-                if file_data[:4] == b"%PDF":
-                    ext = ".pdf"
-                filename = f"{author} - {title}{ext}"
-            save_path = os.path.join(CWA_INGEST_PATH, filename)
-            try:
-                os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-                with open(save_path, "wb") as f:
-                    f.write(file_data)
-                logger.info(f"Ebook saved to CWA ingest: {save_path}")
-                return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to save ebook: {e}")
-
-        elif req.source == "libgen":
+        if req.source == "libgen":
             # LibGen: download from library.lol mirror
             try:
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
@@ -1836,8 +1876,8 @@ async def web_ui():
             currentContentType = detail.content_type || currentContentType;
             currentSource = detail.source || currentSource;
 
-            document.getElementById('authorInput').value = detail.author || btn.dataset.bookAuthor || '';
-            document.getElementById('titleInput').value = detail.title || btn.dataset.bookTitle || '';
+            document.getElementById('authorInput').value = btn.dataset.bookAuthor || detail.author || '';
+            document.getElementById('titleInput').value = btn.dataset.bookTitle || detail.title || '';
 
             const dest = currentContentType === 'ebook' ? 'Calibre Library' : 'Audiobookshelf';
             const via = currentContentType === 'ebook'

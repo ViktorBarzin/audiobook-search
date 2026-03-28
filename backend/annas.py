@@ -32,13 +32,16 @@ class AnnasArchiveScraper:
         )
         self._flaresolverr_available = None
         self._stacks_available = None
+        self._stacks_checked_at = 0.0
 
     async def close(self):
         await self.client.aclose()
 
     async def _check_stacks(self) -> bool:
-        """Check if self-hosted Stacks instance is available."""
-        if self._stacks_available is not None:
+        """Check if self-hosted Stacks instance is available. Re-checks every 5 minutes."""
+        import time
+        now = time.monotonic()
+        if self._stacks_available is not None and (now - self._stacks_checked_at) < 300:
             return self._stacks_available
         try:
             r = await self.client.get(f"{STACKS_URL}/api/version", timeout=5)
@@ -47,6 +50,7 @@ class AnnasArchiveScraper:
                 logger.info(f"Stacks available at {STACKS_URL}")
         except Exception:
             self._stacks_available = False
+        self._stacks_checked_at = now
         return self._stacks_available
 
     async def _check_flaresolverr(self) -> bool:
@@ -196,7 +200,21 @@ class AnnasArchiveScraper:
 
         try:
             title_elem = soup.find("div", class_="text-3xl") or soup.find("h1")
-            title = title_elem.get_text(strip=True) if title_elem else "Unknown"
+            title = title_elem.get_text(strip=True) if title_elem else None
+            # Fallback: try og:title or <title> tag (more stable than CSS selectors)
+            if not title or title.lower() in ("anna's archive", "unknown"):
+                og = soup.find("meta", property="og:title")
+                if og:
+                    title = og.get("content", "").strip()
+            if not title or title.lower() in ("anna's archive", "unknown"):
+                title_tag = soup.find("title")
+                if title_tag:
+                    t = title_tag.get_text(strip=True)
+                    t = re.sub(r"\s*[-–—]\s*Anna'?s?\s*Archive\s*$", "", t, flags=re.IGNORECASE)
+                    if t:
+                        title = t
+            if not title:
+                title = "Unknown"
 
             author = None
             author_elem = soup.find("div", class_="italic")
@@ -316,13 +334,17 @@ class AnnasArchiveScraper:
             return {"success": False, "error": str(e)}
 
     async def get_stacks_status(self) -> dict:
-        """Get Stacks download queue status."""
+        """Get Stacks download queue status. Detects DB corruption."""
         if not await self._check_stacks():
             return {"available": False}
         try:
             r = await self.client.get(f"{STACKS_URL}/api/status", timeout=5)
             if r.status_code == 200:
                 return {"available": True, **r.json()}
+            # 500 errors often indicate DB corruption
+            body = r.text
+            if "malformed" in body or "database disk image" in body:
+                return {"available": True, "error": "database corrupted", "status": "error"}
             return {"available": True, "status": "unknown"}
-        except Exception:
-            return {"available": True, "status": "error"}
+        except Exception as e:
+            return {"available": True, "status": "error", "error": str(e)}
