@@ -165,7 +165,7 @@ async def download_url(request: Request):
     else:
         url = body.decode("utf-8", errors="replace").strip()
 
-    logger.info(f"download-url received: content-type={content_type}, url={url!r}")
+    print(f"download-url received: content-type={content_type}, body={body[:500]!r}, parsed_url={url!r}", flush=True)
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
