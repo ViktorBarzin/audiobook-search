@@ -410,7 +410,11 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                 raise HTTPException(status_code=502, detail="Failed to download ebook from Anna's Archive")
 
             if not filename:
-                filename = f"{author} - {title}.epub"
+                # Detect extension from magic bytes
+                ext = ".epub"
+                if file_data[:4] == b"%PDF":
+                    ext = ".pdf"
+                filename = f"{author} - {title}{ext}"
             save_path = os.path.join(CWA_INGEST_PATH, filename)
             try:
                 os.makedirs(CWA_INGEST_PATH, exist_ok=True)
@@ -443,8 +447,15 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                         fname_match = _re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
                         if fname_match:
                             filename = fname_match.group(1).strip()
+                            # Validate extension
+                            valid_ext = (".epub", ".pdf", ".mobi", ".azw3", ".djvu", ".cbz", ".cbr", ".fb2")
+                            if not any(filename.lower().endswith(ext) for ext in valid_ext):
+                                filename = None
                         if not filename:
-                            filename = f"{author} - {title}.epub"
+                            ext = ".epub"
+                            if file_resp.content[:4] == b"%PDF":
+                                ext = ".pdf"
+                            filename = f"{author} - {title}{ext}"
 
                         save_path = os.path.join(CWA_INGEST_PATH, filename)
                         os.makedirs(CWA_INGEST_PATH, exist_ok=True)

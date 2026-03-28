@@ -277,7 +277,13 @@ class AnnasArchiveScraper:
 
             if not filename:
                 path = response.url.path
-                filename = path.split("/")[-1] if "/" in path else "book.epub"
+                filename = path.split("/")[-1] if "/" in path else None
+
+            # If filename lacks a valid ebook extension, discard it so the caller
+            # generates a proper name from author/title
+            valid_ext = (".epub", ".pdf", ".mobi", ".azw3", ".djvu", ".cbz", ".cbr", ".fb2")
+            if filename and not any(filename.lower().endswith(ext) for ext in valid_ext):
+                filename = None
 
             return response.content, filename
         except Exception as e:
