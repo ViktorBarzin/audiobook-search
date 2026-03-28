@@ -278,8 +278,8 @@ async def search_books(
     # Deduplicate by title similarity (prefer sources with more metadata)
     results = _deduplicate_results(results)
 
-    # Source priority: MAM > Anna's > LibGen > Open Library > ABB
-    source_order = {"mam": 0, "annas": 1, "libgen": 2, "openlib": 3, "abb": 4}
+    # Source priority: Anna's > MAM > LibGen > Open Library > ABB
+    source_order = {"annas": 0, "mam": 1, "libgen": 2, "openlib": 3, "abb": 4}
     results.sort(key=lambda x: source_order.get(x.source, 5))
 
     # Enrich missing covers from Open Library (non-blocking, best-effort)
@@ -295,7 +295,7 @@ def _deduplicate_results(results: list[AudiobookResult]) -> list[AudiobookResult
     """Remove duplicate results across sources by normalizing titles."""
     seen: dict[str, AudiobookResult] = {}
     # Source priority for dedup (keep the one from the better source)
-    source_priority = {"mam": 0, "annas": 1, "libgen": 2, "openlib": 3, "abb": 4}
+    source_priority = {"annas": 0, "mam": 1, "libgen": 2, "openlib": 3, "abb": 4}
 
     for r in results:
         # Normalize title for comparison
@@ -1753,7 +1753,7 @@ async def web_ui():
     }
 
     function buildSourceFilterTabs(results) {
-        const sourceOrder = ['mam', 'annas', 'libgen', 'openlib', 'abb'];
+        const sourceOrder = ['annas', 'mam', 'libgen', 'openlib', 'abb'];
         const present = {};
         results.forEach(b => present[b.source] = (present[b.source] || 0) + 1);
         const sources = sourceOrder.filter(s => present[s]).concat(Object.keys(present).filter(s => !sourceOrder.includes(s)));
@@ -1783,7 +1783,7 @@ async def web_ui():
         const el = document.getElementById('results');
         if (!results.length) { el.innerHTML = ''; return; }
 
-        const sourceOrder = ['mam', 'annas', 'libgen', 'openlib', 'abb'];
+        const sourceOrder = ['annas', 'mam', 'libgen', 'openlib', 'abb'];
         const grouped = {};
         results.forEach(b => {
             (grouped[b.source] = grouped[b.source] || []).push(b);
