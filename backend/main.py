@@ -11,6 +11,8 @@ import httpx
 from backend.scraper import AudioBookBayScraper
 from backend.mam import MAMScraper
 from backend.annas import AnnasArchiveScraper
+from backend.libgen import LibGenScraper
+from backend.openlib import OpenLibraryScraper
 from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
@@ -38,14 +40,18 @@ class DownloadRequest(BaseModel):
 scraper: AudioBookBayScraper | None = None
 mam_scraper: MAMScraper | None = None
 annas_scraper: AnnasArchiveScraper | None = None
+libgen_scraper: LibGenScraper | None = None
+openlib_scraper: OpenLibraryScraper | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup scrapers."""
-    global scraper, mam_scraper, annas_scraper
+    global scraper, mam_scraper, annas_scraper, libgen_scraper, openlib_scraper
     scraper = AudioBookBayScraper()
     annas_scraper = AnnasArchiveScraper()
+    libgen_scraper = LibGenScraper()
+    openlib_scraper = OpenLibraryScraper()
     from backend.mam import MAM_ID
     if MAM_ID or (MAM_EMAIL and MAM_PASSWORD):
         mam_scraper = MAMScraper(MAM_EMAIL, MAM_PASSWORD)
@@ -59,6 +65,10 @@ async def lifespan(app: FastAPI):
         await mam_scraper.close()
     if annas_scraper:
         await annas_scraper.close()
+    if libgen_scraper:
+        await libgen_scraper.close()
+    if openlib_scraper:
+        await openlib_scraper.close()
 
 
 app = FastAPI(
@@ -96,6 +106,31 @@ async def mam_status():
     except Exception as e:
         result["error"] = str(e)
     return result
+
+
+@app.get("/stacks-status")
+async def stacks_status():
+    """Check Stacks download manager status."""
+    if not annas_scraper:
+        return {"available": False}
+    return await annas_scraper.get_stacks_status()
+
+
+@app.get("/sources")
+async def get_sources():
+    """Get status of all configured search sources."""
+    from backend.mam import MAM_ID
+    sources = {
+        "abb": {"name": "AudioBookBay", "type": "audiobook", "available": scraper is not None},
+        "mam": {"name": "MyAnonamouse", "type": "both", "available": mam_scraper is not None and bool(MAM_ID)},
+        "annas": {"name": "Anna's Archive", "type": "ebook", "available": annas_scraper is not None},
+        "libgen": {"name": "Library Genesis", "type": "ebook", "available": libgen_scraper is not None},
+        "openlib": {"name": "Open Library", "type": "ebook", "available": openlib_scraper is not None},
+    }
+    # Check Stacks
+    stacks = await annas_scraper.get_stacks_status() if annas_scraper else {"available": False}
+    sources["stacks"] = {"name": "Stacks (Download Manager)", "type": "download", "available": stacks.get("available", False)}
+    return sources
 
 
 async def _enrich_covers(results: list[AudiobookResult], query: str):
@@ -153,26 +188,45 @@ async def search_books(
 
     # Audiobook sources
     if content_type in ("all", "audiobook"):
-        tasks.append(scraper.search(q))
+        tasks.append(("abb", scraper.search(q)))
         if mam_scraper:
-            tasks.append(mam_scraper.search(q))
+            tasks.append(("mam", mam_scraper.search(q)))
 
     # Ebook sources
     if content_type in ("all", "ebook"):
         if annas_scraper:
-            tasks.append(annas_scraper.search(q))
+            tasks.append(("annas", annas_scraper.search(q)))
+        if libgen_scraper:
+            tasks.append(("libgen", libgen_scraper.search(q)))
+        if openlib_scraper:
+            tasks.append(("openlib", openlib_scraper.search(q)))
         # MAM also has ebooks — if searching "all" it's already included above
         if content_type == "ebook" and mam_scraper:
-            tasks.append(mam_scraper.search(q))
+            tasks.append(("mam", mam_scraper.search(q)))
 
-    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Run all searches in parallel
+    coros = [t[1] for t in tasks]
+    labels = [t[0] for t in tasks]
+    all_results = await asyncio.gather(*coros, return_exceptions=True)
 
     results = []
-    for r in all_results:
+    annas_failed = False
+    for label, r in zip(labels, all_results):
         if isinstance(r, list):
             results.extend(r)
         elif isinstance(r, Exception):
-            logger.warning(f"Search source failed: {r}")
+            logger.warning(f"Search source {label} failed: {r}")
+            if label == "annas":
+                annas_failed = True
+
+    # If Anna's Archive failed and LibGen returned no results, retry LibGen
+    if annas_failed and not any(r.source == "libgen" for r in results) and libgen_scraper:
+        logger.info("Anna's Archive failed — falling back to LibGen")
+        try:
+            libgen_results = await libgen_scraper.search(q)
+            results.extend(libgen_results)
+        except Exception as e:
+            logger.warning(f"LibGen fallback also failed: {e}")
 
     # Filter by content_type if specified
     if content_type == "audiobook":
@@ -180,9 +234,12 @@ async def search_books(
     elif content_type == "ebook":
         results = [r for r in results if r.content_type == "ebook"]
 
-    # MAM first, then Annas, then ABB
-    source_order = {"mam": 0, "annas": 1, "abb": 2}
-    results.sort(key=lambda x: source_order.get(x.source, 3))
+    # Deduplicate by title similarity (prefer sources with more metadata)
+    results = _deduplicate_results(results)
+
+    # Source priority: MAM > Anna's > LibGen > Open Library > ABB
+    source_order = {"mam": 0, "annas": 1, "libgen": 2, "openlib": 3, "abb": 4}
+    results.sort(key=lambda x: source_order.get(x.source, 5))
 
     # Enrich missing covers from Open Library (non-blocking, best-effort)
     try:
@@ -191,6 +248,37 @@ async def search_books(
         logger.warning(f"Cover enrichment failed: {e}")
 
     return results
+
+
+def _deduplicate_results(results: list[AudiobookResult]) -> list[AudiobookResult]:
+    """Remove duplicate results across sources by normalizing titles."""
+    seen: dict[str, AudiobookResult] = {}
+    # Source priority for dedup (keep the one from the better source)
+    source_priority = {"mam": 0, "annas": 1, "libgen": 2, "openlib": 3, "abb": 4}
+
+    for r in results:
+        # Normalize title for comparison
+        norm = r.title.lower().strip()
+        # Remove common suffixes
+        for suffix in [" (epub)", " (pdf)", " (mobi)"]:
+            norm = norm.replace(suffix, "")
+        norm = _re.sub(r"[^a-z0-9\s]", "", norm).strip()
+
+        if norm in seen:
+            existing = seen[norm]
+            # Keep the one from the higher-priority source
+            if source_priority.get(r.source, 5) < source_priority.get(existing.source, 5):
+                seen[norm] = r
+            # Or keep the one with more metadata
+            elif source_priority.get(r.source, 5) == source_priority.get(existing.source, 5):
+                r_score = sum([bool(r.author), bool(r.cover_url), bool(r.size), bool(r.format)])
+                e_score = sum([bool(existing.author), bool(existing.cover_url), bool(existing.size), bool(existing.format)])
+                if r_score > e_score:
+                    seen[norm] = r
+        else:
+            seen[norm] = r
+
+    return list(seen.values())
 
 
 @app.get("/audiobook/{book_id:path}", response_model=AudiobookDetail)
@@ -206,6 +294,16 @@ async def get_book_detail(book_id: str):
             raise HTTPException(status_code=500, detail="Anna's Archive scraper not configured")
         md5 = book_id[6:]
         detail = await annas_scraper.get_detail(md5)
+    elif book_id.startswith("libgen:"):
+        if not libgen_scraper:
+            raise HTTPException(status_code=500, detail="LibGen scraper not configured")
+        md5 = book_id[7:]
+        detail = await libgen_scraper.get_detail(md5)
+    elif book_id.startswith("openlib:"):
+        if not openlib_scraper:
+            raise HTTPException(status_code=500, detail="Open Library scraper not configured")
+        work_id = book_id[8:]
+        detail = await openlib_scraper.get_detail(work_id)
     else:
         if not scraper:
             raise HTTPException(status_code=500, detail="Scraper not initialized")
@@ -238,32 +336,87 @@ async def download_book(request: Request):
 
 
 async def _download_ebook(req: DownloadRequest, author: str, title: str):
-    """Handle ebook downloads — route to CWA ingest folder."""
+    """Handle ebook downloads — route to CWA ingest folder via Stacks or direct download."""
     # Check CWA for duplicates (unless force)
     if not req.force:
         await _check_cwa_duplicate(title, author)
 
-    if req.source == "annas":
-        # Anna's Archive: direct HTTP download to CWA ingest
-        if not annas_scraper:
-            raise HTTPException(status_code=500, detail="Anna's Archive scraper not configured")
+    if req.source in ("annas", "libgen"):
+        # Extract MD5 for Stacks download
+        md5 = None
+        if req.source == "annas":
+            md5_match = _re.search(r"/md5/([a-f0-9]+)", req.magnet_url, _re.IGNORECASE)
+            if md5_match:
+                md5 = md5_match.group(1)
+        elif req.source == "libgen":
+            md5_match = _re.search(r"md5=([a-f0-9]+)", req.magnet_url, _re.IGNORECASE)
+            if not md5_match:
+                md5_match = _re.search(r"/main/([a-f0-9]+)", req.magnet_url, _re.IGNORECASE)
+            if md5_match:
+                md5 = md5_match.group(1)
 
-        file_data, filename = await annas_scraper.download_file(req.magnet_url)
-        if not file_data:
-            raise HTTPException(status_code=502, detail="Failed to download ebook from Anna's Archive")
+        # Try Stacks first (downloads directly to CWA ingest folder)
+        if md5 and annas_scraper:
+            stacks_result = await annas_scraper.download_via_stacks(md5)
+            if stacks_result.get("success"):
+                return {"status": "ok", "message": stacks_result["message"]}
+            logger.warning(f"Stacks download failed: {stacks_result.get('error')} — falling back to direct download")
 
-        # Save to CWA ingest folder
-        if not filename:
-            filename = f"{author} - {title}.epub"
-        save_path = os.path.join(CWA_INGEST_PATH, filename)
-        try:
-            os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-            with open(save_path, "wb") as f:
-                f.write(file_data)
-            logger.info(f"Ebook saved to CWA ingest: {save_path}")
-            return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save ebook: {e}")
+        # Fallback: direct HTTP download to CWA ingest
+        if req.source == "annas" and annas_scraper:
+            file_data, filename = await annas_scraper.download_file(req.magnet_url)
+            if not file_data:
+                raise HTTPException(status_code=502, detail="Failed to download ebook from Anna's Archive")
+
+            if not filename:
+                filename = f"{author} - {title}.epub"
+            save_path = os.path.join(CWA_INGEST_PATH, filename)
+            try:
+                os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(file_data)
+                logger.info(f"Ebook saved to CWA ingest: {save_path}")
+                return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to save ebook: {e}")
+
+        elif req.source == "libgen":
+            # LibGen: download from library.lol mirror
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    # library.lol page has the actual download link
+                    r = await client.get(req.magnet_url)
+                    r.raise_for_status()
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    dl_link = soup.find("a", href=_re.compile(r"\.epub|\.pdf|\.mobi|cloudflare|get\.php", _re.IGNORECASE))
+                    if dl_link:
+                        dl_url = dl_link.get("href", "")
+                        if not dl_url.startswith("http"):
+                            dl_url = f"https://library.lol{dl_url}"
+                        file_resp = await client.get(dl_url)
+                        file_resp.raise_for_status()
+
+                        filename = None
+                        cd = file_resp.headers.get("content-disposition", "")
+                        fname_match = _re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
+                        if fname_match:
+                            filename = fname_match.group(1).strip()
+                        if not filename:
+                            filename = f"{author} - {title}.epub"
+
+                        save_path = os.path.join(CWA_INGEST_PATH, filename)
+                        os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+                        with open(save_path, "wb") as f:
+                            f.write(file_resp.content)
+                        logger.info(f"LibGen ebook saved to CWA ingest: {save_path}")
+                        return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
+                    else:
+                        raise HTTPException(status_code=502, detail="Could not find download link on LibGen mirror page")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"LibGen download failed: {e}")
 
     elif req.source == "mam":
         # MAM ebook: download .torrent → qBittorrent with CWA ingest path
@@ -296,6 +449,10 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                 raise HTTPException(status_code=502, detail=f"qBittorrent rejected torrent: {resp.text}")
 
         return {"status": "ok", "message": f"Ebook download started → Calibre Library"}
+
+    elif req.source == "openlib":
+        # Open Library: redirect to reading/borrowing page
+        return {"status": "ok", "message": f"Open Library book — open in browser to borrow/read", "redirect": req.magnet_url}
 
     raise HTTPException(status_code=400, detail=f"Unsupported ebook source: {req.source}")
 
@@ -656,6 +813,8 @@ async def web_ui():
             --badge-mam: #6a5acd;
             --badge-abb: #4a7a8a;
             --badge-annas: #8a6a3a;
+            --badge-libgen: #3a6a8a;
+            --badge-openlib: #5a7a5a;
             --badge-audiobook: #3a6a5a;
             --badge-ebook: #6a4a3a;
             --font-display: 'Playfair Display', Georgia, serif;
@@ -832,6 +991,45 @@ async def web_ui():
             font-weight: 600;
         }
 
+        /* ── Sources Bar ── */
+        .sources-bar {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+            align-items: center;
+        }
+
+        .source-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+        }
+
+        .source-chip.active {
+            border-color: var(--accent-amber-dim);
+            color: var(--text);
+        }
+
+        .source-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--accent-red);
+        }
+
+        .source-chip.active .source-dot {
+            background: var(--accent-green);
+        }
+
         /* ── Status ── */
         .status {
             padding: 12px 16px;
@@ -915,6 +1113,8 @@ async def web_ui():
         .badge-mam { background: var(--badge-mam); color: #fff; }
         .badge-abb { background: var(--badge-abb); color: #fff; }
         .badge-annas { background: var(--badge-annas); color: #fff; }
+        .badge-libgen { background: var(--badge-libgen); color: #fff; }
+        .badge-openlib { background: var(--badge-openlib); color: #fff; }
         .badge-audiobook { background: var(--badge-audiobook); color: #d0ffe0; }
         .badge-ebook { background: var(--badge-ebook); color: #ffe0d0; }
 
@@ -1260,6 +1460,7 @@ async def web_ui():
             </div>
         </div>
 
+        <div id="sourcesBar" class="sources-bar"></div>
         <div id="status" class="status"></div>
         <div id="results" class="results"></div>
 
@@ -1349,7 +1550,13 @@ async def web_ui():
     }
 
     function sourceBadge(source) {
-        const m = {mam: ['MAM', 'badge-mam'], abb: ['ABB', 'badge-abb'], annas: ['Annas', 'badge-annas']};
+        const m = {
+            mam: ['MAM', 'badge-mam'],
+            abb: ['ABB', 'badge-abb'],
+            annas: ["Anna's", 'badge-annas'],
+            libgen: ['LibGen', 'badge-libgen'],
+            openlib: ['OpenLib', 'badge-openlib'],
+        };
         const [label, cls] = m[source] || [source, 'badge-abb'];
         return `<span class="badge ${cls}">${label}</span>`;
     }
@@ -1404,7 +1611,7 @@ async def web_ui():
         el.innerHTML = results.map(b => {
             const title = esc(b.title);
             const author = esc(b.author || '');
-            const dest = b.content_type === 'ebook' ? 'Calibre Library' : 'Audiobookshelf';
+            const dest = b.source === 'openlib' ? 'Open Library' : (b.content_type === 'ebook' ? 'Calibre Library' : 'Audiobookshelf');
 
             return `
                 <div class="card">
@@ -1428,8 +1635,8 @@ async def web_ui():
                                 data-book-title="${title}"
                                 data-content-type="${b.content_type}"
                                 data-source="${b.source}"
-                                onclick="prepareDownload(this)">
-                                Download &rarr; ${dest}
+                                onclick="${b.source === 'openlib' ? `window.open('${esc(b.url)}', '_blank')` : 'prepareDownload(this)'}">
+                                ${b.source === 'openlib' ? 'Read on Open Library &nearr;' : `Download &rarr; ${dest}`}
                             </button>
                         </div>
                     </div>
@@ -1457,8 +1664,11 @@ async def web_ui():
             document.getElementById('titleInput').value = detail.title || btn.dataset.bookTitle || '';
 
             const dest = currentContentType === 'ebook' ? 'Calibre Library' : 'Audiobookshelf';
+            const via = currentContentType === 'ebook'
+                ? (currentSource === 'annas' || currentSource === 'libgen' ? 'via Stacks → CWA ingest' : 'CWA auto-ingest')
+                : 'qBittorrent';
             document.getElementById('modalDestination').innerHTML =
-                `&#8594; <strong>${dest}</strong> <span style="opacity:0.7">(${currentContentType === 'ebook' ? 'CWA auto-ingest' : 'qBittorrent'})</span>`;
+                `&#8594; <strong>${dest}</strong> <span style="opacity:0.7">(${via})</span>`;
 
             document.getElementById('downloadModal').style.display = 'block';
             document.getElementById('status').style.display = 'none';
@@ -1671,6 +1881,19 @@ async def web_ui():
         });
     }
 
+    async function loadSources() {
+        try {
+            const r = await fetch('/sources');
+            const sources = await r.json();
+            const bar = document.getElementById('sourcesBar');
+            bar.innerHTML = Object.entries(sources).map(([key, s]) => {
+                if (s.type === 'download') return '';
+                const active = s.available ? 'active' : '';
+                return `<span class="source-chip ${active}"><span class="source-dot"></span>${s.name}</span>`;
+            }).join('');
+        } catch(e) {}
+    }
+    loadSources();
     checkMamStatus();
 </script>
 

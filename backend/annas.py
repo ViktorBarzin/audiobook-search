@@ -13,9 +13,12 @@ logger = logging.getLogger(__name__)
 ANNAS_DOMAIN = os.getenv("ANNAS_DOMAIN", "annas-archive.gs")
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr.servarr.svc.cluster.local")
 
+# Self-hosted Stacks instance (Anna's Archive download manager)
+STACKS_URL = os.getenv("STACKS_URL", "http://annas-archive-stacks.ebooks.svc.cluster.local")
+
 
 class AnnasArchiveScraper:
-    """Anna's Archive ebook search scraper. Uses FlareSolverr to bypass JS challenges."""
+    """Anna's Archive ebook search. Prioritizes self-hosted Stacks, falls back to public site."""
 
     TIMEOUT = 30.0
     USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -28,9 +31,23 @@ class AnnasArchiveScraper:
             follow_redirects=True,
         )
         self._flaresolverr_available = None
+        self._stacks_available = None
 
     async def close(self):
         await self.client.aclose()
+
+    async def _check_stacks(self) -> bool:
+        """Check if self-hosted Stacks instance is available."""
+        if self._stacks_available is not None:
+            return self._stacks_available
+        try:
+            r = await self.client.get(f"{STACKS_URL}/api/version", timeout=5)
+            self._stacks_available = r.status_code == 200
+            if self._stacks_available:
+                logger.info(f"Stacks available at {STACKS_URL}")
+        except Exception:
+            self._stacks_available = False
+        return self._stacks_available
 
     async def _check_flaresolverr(self) -> bool:
         """Check if FlareSolverr is available."""
@@ -42,7 +59,7 @@ class AnnasArchiveScraper:
         except Exception:
             self._flaresolverr_available = False
         if not self._flaresolverr_available:
-            logger.warning("FlareSolverr not available — Anna's Archive searches will fail (JS challenge)")
+            logger.warning("FlareSolverr not available — Anna's Archive public search may fail")
         return self._flaresolverr_available
 
     async def _fetch_via_flaresolverr(self, url: str) -> str | None:
@@ -69,23 +86,22 @@ class AnnasArchiveScraper:
             logger.error(f"FlareSolverr request failed: {e}")
             return None
 
-    async def _fetch(self, url: str) -> str | None:
-        """Fetch a URL, using FlareSolverr if available, falling back to direct."""
+    async def _fetch_public(self, url: str) -> str | None:
+        """Fetch from public Anna's Archive, using FlareSolverr if needed."""
         # Try FlareSolverr first
         if await self._check_flaresolverr():
             html = await self._fetch_via_flaresolverr(url)
             if html and "/md5/" in html:
                 return html
-            # FlareSolverr got a page but no results (client-side rendering)
             if html:
-                logger.warning("Anna's Archive results are client-side rendered — FlareSolverr can't extract them. Use Stacks UI instead.")
+                logger.warning("Anna's Archive results are client-side rendered — FlareSolverr can't extract them")
 
         # Direct fetch fallback
         try:
             r = await self.client.get(url)
             r.raise_for_status()
             if len(r.text) < 500 and "Verifying" in r.text:
-                logger.warning("Anna's Archive returned JS challenge — use Stacks UI for ebook search")
+                logger.warning("Anna's Archive returned JS challenge")
                 return None
             return r.text
         except Exception as e:
@@ -93,17 +109,20 @@ class AnnasArchiveScraper:
             return None
 
     async def search(self, query: str) -> list[AudiobookResult]:
-        """Search Anna's Archive for ebooks."""
+        """Search Anna's Archive for ebooks. Uses public site (Stacks is download-only)."""
         search_url = f"{self.base_url}/search?q={quote(query)}&content=book_nonfiction&content=book_fiction&ext=epub&ext=pdf&ext=mobi&sort=&lang=en"
 
-        html = await self._fetch(search_url)
+        html = await self._fetch_public(search_url)
         if not html:
             return []
 
+        return self._parse_search_results(html)
+
+    def _parse_search_results(self, html: str) -> list[AudiobookResult]:
+        """Parse Anna's Archive search results."""
         soup = BeautifulSoup(html, "html.parser")
         results = []
 
-        # Find result entries - Anna's Archive uses <a> tags with href starting with /md5/
         links = soup.find_all("a", href=re.compile(r"^/md5/"))
 
         for link in links[:25]:
@@ -168,7 +187,7 @@ class AnnasArchiveScraper:
         """Get detail page for an Anna's Archive book and extract download links."""
         detail_url = f"{self.base_url}/md5/{md5}"
 
-        html = await self._fetch(detail_url)
+        html = await self._fetch_public(detail_url)
         if not html:
             return None
 
@@ -263,3 +282,40 @@ class AnnasArchiveScraper:
         except Exception as e:
             logger.error(f"Anna's Archive file download failed: {e}")
             return None, None
+
+    async def download_via_stacks(self, md5: str) -> dict:
+        """Queue a download via the self-hosted Stacks instance.
+        Returns status dict with success/error info."""
+        if not await self._check_stacks():
+            return {"success": False, "error": "Stacks instance not available"}
+
+        try:
+            r = await self.client.post(
+                f"{STACKS_URL}/api/queue/add",
+                json={"md5": md5, "source": "book-search"},
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            data = r.json()
+            if r.status_code == 200 and data.get("success"):
+                logger.info(f"Queued download via Stacks: {md5}")
+                return {"success": True, "message": f"Queued in Stacks — downloading to Calibre Library"}
+            else:
+                error = data.get("error", f"HTTP {r.status_code}")
+                logger.error(f"Stacks queue/add failed: {error}")
+                return {"success": False, "error": error}
+        except Exception as e:
+            logger.error(f"Stacks download request failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def get_stacks_status(self) -> dict:
+        """Get Stacks download queue status."""
+        if not await self._check_stacks():
+            return {"available": False}
+        try:
+            r = await self.client.get(f"{STACKS_URL}/api/status", timeout=5)
+            if r.status_code == 200:
+                return {"available": True, **r.json()}
+            return {"available": True, "status": "unknown"}
+        except Exception:
+            return {"available": True, "status": "error"}
