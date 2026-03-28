@@ -84,6 +84,29 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/cover-proxy")
+async def cover_proxy(url: str = Query(..., description="Cover image URL to proxy")):
+    """Proxy cover images to avoid CORS and detect placeholder images."""
+    if not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                raise HTTPException(status_code=404, detail="Cover not found")
+            ct = resp.headers.get("content-type", "")
+            if "image" not in ct:
+                raise HTTPException(status_code=404, detail="Not an image")
+            # Skip tiny placeholder images (< 1KB)
+            if len(resp.content) < 1000:
+                raise HTTPException(status_code=404, detail="Placeholder image")
+            from fastapi.responses import Response
+            return Response(content=resp.content, media_type=ct,
+                           headers={"Cache-Control": "public, max-age=86400"})
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Failed to fetch cover")
+
+
 @app.get("/mam-status")
 async def mam_status():
     """Check MAM authentication status."""
@@ -134,45 +157,63 @@ async def get_sources():
 
 
 async def _enrich_covers(results: list[AudiobookResult], query: str):
-    """Fetch covers from Open Library for results that don't have them."""
+    """Fetch covers from Google Books and Open Library for results missing them."""
     needs_cover = [r for r in results if not r.cover_url]
     if not needs_cover:
         return
 
+    cover_lookup: dict[str, str] = {}  # normalized title → cover URL
+
     async with httpx.AsyncClient(timeout=5.0) as client:
-        # Search Open Library for the query to get OLIDs
+        # Google Books API — fast, great coverage, no key needed
+        try:
+            resp = await client.get(
+                "https://www.googleapis.com/books/v1/volumes",
+                params={"q": query, "maxResults": 20, "fields": "items(volumeInfo(title,imageLinks))"},
+            )
+            if resp.status_code == 200:
+                for item in resp.json().get("items", []):
+                    vi = item.get("volumeInfo", {})
+                    title = vi.get("title", "").lower().strip()
+                    imgs = vi.get("imageLinks", {})
+                    # Prefer thumbnail, upgrade to medium if available
+                    url = imgs.get("thumbnail") or imgs.get("smallThumbnail")
+                    if title and url:
+                        # Google returns http URLs — upgrade to https and remove edge= param for bigger images
+                        url = url.replace("http://", "https://").replace("&edge=curl", "")
+                        cover_lookup[title] = url
+        except Exception:
+            pass
+
+        # Open Library fallback
         try:
             resp = await client.get(
                 "https://openlibrary.org/search.json",
-                params={"q": query, "limit": 20, "fields": "key,title,author_name,cover_i"},
+                params={"q": query, "limit": 20, "fields": "key,title,cover_i"},
             )
-            if resp.status_code != 200:
-                return
-            ol_results = resp.json().get("docs", [])
+            if resp.status_code == 200:
+                for doc in resp.json().get("docs", []):
+                    cover_id = doc.get("cover_i")
+                    if not cover_id:
+                        continue
+                    title = doc.get("title", "").lower().strip()
+                    if title not in cover_lookup:  # Don't overwrite Google Books
+                        cover_lookup[title] = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
         except Exception:
-            return
+            pass
 
-        # Build a lookup of normalized title → cover_id
-        cover_lookup: dict[str, int] = {}
-        for doc in ol_results:
-            cover_id = doc.get("cover_i")
-            if not cover_id:
-                continue
-            title = doc.get("title", "").lower().strip()
-            cover_lookup[title] = cover_id
-
-        # Match results by title similarity
-        for r in needs_cover:
-            r_title = r.title.lower().strip()
-            # Exact match
-            if r_title in cover_lookup:
-                r.cover_url = f"https://covers.openlibrary.org/b/id/{cover_lookup[r_title]}-M.jpg"
-                continue
-            # Substring match
-            for ol_title, cover_id in cover_lookup.items():
-                if ol_title in r_title or r_title in ol_title:
-                    r.cover_url = f"https://covers.openlibrary.org/b/id/{cover_lookup[ol_title]}-M.jpg"
-                    break
+    # Match results by title similarity
+    for r in needs_cover:
+        r_title = r.title.lower().strip()
+        # Exact match
+        if r_title in cover_lookup:
+            r.cover_url = cover_lookup[r_title]
+            continue
+        # Substring match
+        for ol_title, url in cover_lookup.items():
+            if ol_title in r_title or r_title in ol_title:
+                r.cover_url = url
+                break
 
 
 @app.get("/search", response_model=list[AudiobookResult])
@@ -1684,7 +1725,7 @@ async def web_ui():
         return `
             <div class="card">
                 <div class="card-image-wrap">
-                    ${b.cover_url ? `<img src="${b.cover_url}" alt="" class="card-image" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="card-image-placeholder" style="display:none">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>` : `<div class="card-image-placeholder">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>`}
+                    ${b.cover_url ? `<img src="/cover-proxy?url=${encodeURIComponent(b.cover_url)}" alt="" class="card-image" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="card-image-placeholder" style="display:none">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>` : `<div class="card-image-placeholder">${b.content_type === 'ebook' ? '&#128214;' : '&#127911;'}</div>`}
                     <div class="card-badges">
                         ${sourceBadge(b.source)}
                         ${typeBadge(b.content_type)}
