@@ -25,6 +25,16 @@ AUDIOBOOKSHELF_TOKEN = os.getenv("AUDIOBOOKSHELF_TOKEN", "")
 MAM_EMAIL = os.getenv("MAM_EMAIL", "")
 MAM_PASSWORD = os.getenv("MAM_PASSWORD", "")
 CWA_INGEST_PATH = os.getenv("CWA_INGEST_PATH", "/cwa-book-ingest")
+CWA_UID = int(os.getenv("CWA_UID", "1000"))
+CWA_GID = int(os.getenv("CWA_GID", "1000"))
+
+
+def _chown_for_cwa(path: str):
+    """Set file ownership to CWA user so Calibre can manage (delete/move) it."""
+    try:
+        os.chown(path, CWA_UID, CWA_GID)
+    except OSError as e:
+        logger.warning(f"Failed to chown {path}: {e}")
 
 
 class DownloadRequest(BaseModel):
@@ -450,6 +460,7 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                     os.makedirs(CWA_INGEST_PATH, exist_ok=True)
                     with open(save_path, "wb") as f:
                         f.write(file_data)
+                    _chown_for_cwa(save_path)
                     logger.info(f"Ebook saved to CWA ingest: {save_path}")
                     return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
             except Exception as e:
@@ -501,6 +512,7 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                         os.makedirs(CWA_INGEST_PATH, exist_ok=True)
                         with open(save_path, "wb") as f:
                             f.write(file_resp.content)
+                        _chown_for_cwa(save_path)
                         logger.info(f"LibGen ebook saved to CWA ingest: {save_path}")
                         return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
                     else:
