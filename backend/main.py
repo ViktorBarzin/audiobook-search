@@ -261,9 +261,21 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                 job["message"] = "Stacks failed and no download URL available"
                 return
         else:
-            logger.info(f"[{job_id}] Stacks accepted {md5}")
-            # Wait for file to appear in ingest dir
+            already_downloaded = "already downloaded" in stacks_result.get("message", "").lower()
+            logger.info(f"[{job_id}] Stacks accepted {md5} (already_downloaded={already_downloaded})")
             job["status"] = "downloaded"
+
+            if already_downloaded:
+                # File was downloaded before — quick check if it's in Calibre already
+                job["status"] = "importing"
+                in_calibre = await _wait_for_calibre(title, timeout=15)
+                if in_calibre:
+                    job["status"] = "done"
+                    job["message"] = "Added to Calibre"
+                else:
+                    job["status"] = "done"
+                    job["message"] = "Previously downloaded — check Calibre"
+                return
 
         # Stage: importing (wait for CWA to pick up the file)
         job["status"] = "importing"
