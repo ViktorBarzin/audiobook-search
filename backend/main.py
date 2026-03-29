@@ -285,6 +285,37 @@ async def health_deep():
     )
 
 
+async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail) -> bool:
+    """Attempt direct download from libgen mirrors. Returns True if file was saved to ingest dir."""
+    if not detail or not detail.magnet_url:
+        return False
+    dl_url = detail.magnet_url
+    is_direct = any(h in dl_url for h in ("libgen", "library.lol", "gen.lib"))
+    if not is_direct:
+        return False
+    try:
+        job["stage_detail"] = "Recovering via direct download..."
+        file_data, filename = await annas_scraper.download_file(dl_url)
+        if not file_data:
+            return False
+        if not filename:
+            ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
+            filename = f"{author} - {title}{ext}"
+        save_path = os.path.join(CWA_INGEST_PATH, filename)
+        os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(file_data)
+        _chown_for_cwa(save_path)
+        job["status"] = "downloaded"
+        job["stage_detail"] = "File ready, waiting for Calibre..."
+        job["filename"] = filename
+        logger.info(f"[{job_id}] Direct download recovery saved {filename}")
+        return True
+    except Exception as e:
+        logger.warning(f"[{job_id}] Direct download recovery failed for {md5}: {e}")
+        return False
+
+
 async def _process_download(job_id: str, md5: str, title: str, author: str, detail):
     """Background task that downloads a book and tracks progress through stages."""
     job = _download_jobs[job_id]
@@ -297,45 +328,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
 
         if not stacks_ok:
             # Fallback: direct download for libgen mirrors
-            if detail and detail.magnet_url:
-                dl_url = detail.magnet_url
-                is_direct = any(h in dl_url for h in ("libgen", "library.lol", "gen.lib"))
-                if is_direct:
-                    try:
-                        job["stage_detail"] = "Downloading from mirror..."
-                        file_data, filename = await annas_scraper.download_file(dl_url)
-                        if file_data:
-                            if not filename:
-                                ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
-                                filename = f"{author} - {title}{ext}"
-                            save_path = os.path.join(CWA_INGEST_PATH, filename)
-                            os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-                            with open(save_path, "wb") as f:
-                                f.write(file_data)
-                            _chown_for_cwa(save_path)
-                            job["status"] = "downloaded"
-                            job["stage_detail"] = "File ready, waiting for Calibre..."
-                            job["filename"] = filename
-                            logger.info(f"[{job_id}] Direct download saved {filename}")
-                        else:
-                            job["status"] = "failed"
-                            job["message"] = "Direct download returned no data"
-                            job["stage_detail"] = job["message"]
-                            return
-                    except Exception as e:
-                        job["status"] = "failed"
-                        job["message"] = f"Direct download failed: {e}"
-                        job["stage_detail"] = job["message"]
-                        logger.warning(f"[{job_id}] Direct download failed for {md5}: {e}")
-                        return
-                else:
-                    job["status"] = "failed"
-                    job["message"] = "Stacks failed and no direct mirror available"
-                    job["stage_detail"] = job["message"]
-                    return
-            else:
+            if not await _try_direct_download(job_id, job, md5, title, author, detail):
                 job["status"] = "failed"
-                job["message"] = "Stacks failed and no download URL available"
+                job["message"] = stacks_result.get("error", "Stacks failed and no direct mirror available")
                 job["stage_detail"] = job["message"]
                 return
         else:
@@ -369,27 +364,34 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                     job["status"] = "done"
                     job["message"] = "Added to Calibre"
                     job["stage_detail"] = "Added to Calibre"
-                else:
-                    job["status"] = "done"
-                    job["message"] = "Previously downloaded — not found in Calibre"
-                    job["stage_detail"] = job["message"]
-                return
+                    return
 
-            # Fresh Stacks download — wait for file to appear in ingest dir
-            job["status"] = "downloading"
-            job["stage_detail"] = "Waiting for Stacks download..."
-            appeared = await _wait_for_file_in_ingest(timeout=90)
-            if appeared:
-                job["status"] = "downloaded"
-                job["stage_detail"] = "File ready, waiting for Calibre..."
-                job["filename"] = appeared
-                logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
-                _fix_ingest_permissions()
+                # Book is gone — CWA consumed it but failed to import.
+                # Try direct download as recovery.
+                logger.warning(f"[{job_id}] Stacks 'already downloaded' but book missing from Calibre and ingest dir — attempting direct download recovery")
+                recovered = await _try_direct_download(job_id, job, md5, title, author, detail)
+                if not recovered:
+                    job["status"] = "done"
+                    job["message"] = "Previously downloaded — not found in Calibre, direct download also failed"
+                    job["stage_detail"] = job["message"]
+                    return
+                # Recovery succeeded — file is in ingest dir, skip to importing
             else:
-                # File didn't appear but Stacks said OK — proceed to OPDS check anyway
-                logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
-                job["status"] = "downloaded"
-                job["stage_detail"] = "Download may be delayed, checking Calibre..."
+                # Fresh Stacks download — wait for file to appear in ingest dir
+                job["status"] = "downloading"
+                job["stage_detail"] = "Waiting for Stacks download..."
+                appeared = await _wait_for_file_in_ingest(timeout=90)
+                if appeared:
+                    job["status"] = "downloaded"
+                    job["stage_detail"] = "File ready, waiting for Calibre..."
+                    job["filename"] = appeared
+                    logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
+                    _fix_ingest_permissions()
+                else:
+                    # File didn't appear but Stacks said OK — proceed to OPDS check anyway
+                    logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
+                    job["status"] = "downloaded"
+                    job["stage_detail"] = "Download may be delayed, checking Calibre..."
 
         # Stage: importing (wait for CWA to pick up the file)
         job["status"] = "importing"
