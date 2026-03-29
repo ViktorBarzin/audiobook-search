@@ -33,6 +33,7 @@ CWA_UID = int(os.getenv("CWA_UID", "1000"))
 CWA_GID = int(os.getenv("CWA_GID", "1000"))
 API_KEY = os.getenv("API_KEY", "")
 SHORTCUT_ICLOUD_URL = os.getenv("SHORTCUT_ICLOUD_URL", "")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 # SMTP config for Send-to-Kindle
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.viktorbarzin.me")
@@ -40,6 +41,22 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "Calibre-Web <calibre-web@viktorbarzin.me>")
+
+
+async def _notify_slack(title: str, author: str, content_type: str, source: str = "", kindle: bool = False):
+    """Send download notification to Slack. Fire-and-forget, never fails the request."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        emoji = "\U0001f4d6" if content_type == "ebook" else "\U0001f3a7"
+        kindle_tag = " \u2192 Kindle" if kindle else ""
+        text = f"{emoji} *{title}*\nby {author}\n_{content_type}{kindle_tag}_"
+        if source:
+            text += f" | source: {source}"
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(SLACK_WEBHOOK_URL, json={"text": text})
+    except Exception as e:
+        logger.warning(f"Slack notification failed: {e}")
 
 
 def _chown_for_cwa(path: str):
@@ -709,6 +726,7 @@ async def download_url(request: Request):
     }
 
     asyncio.create_task(_process_download(job_id, md5, title, author, detail))
+    asyncio.create_task(_notify_slack(title, author, "ebook", "shortcut", kindle=bool(kindle_email)))
 
     return {"status": "ok", "job_id": job_id, "title": title, "author": author}
 
@@ -1046,6 +1064,8 @@ async def download_book(request: Request):
 
     author = req.author.strip() or "Unknown Author"
     title = req.title.strip() or "Unknown Title"
+
+    asyncio.create_task(_notify_slack(title, author, req.content_type, req.source))
 
     if req.content_type == "ebook":
         return await _download_ebook(req, author, title)
