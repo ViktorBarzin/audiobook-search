@@ -66,37 +66,108 @@ _download_jobs: dict[str, dict] = {}
 JOB_TTL_SECONDS = 600  # auto-cleanup after 10 minutes
 
 
-async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
-    """Poll Calibre-Web OPDS until the book appears or timeout."""
+def _build_search_terms(title: str) -> list[str]:
+    """Build a list of progressively simpler search terms from a title."""
+    base = title.split("—")[0].split("-")[0].strip()[:50]
+    terms = []
+    if base and base.replace("\u2019", "'") not in ("Unknown", "Anna's Archive", "Anna\u2019s Archive"):
+        terms.append(base)
+        # Try last significant word (often the actual book name)
+        words = [w for w in _re.split(r'\s+', base) if len(w) > 3 and w.upper() != w[:1].upper() + w[1:].lower() or len(w) > 4]
+        if words and words[-1].lower() != base.lower():
+            terms.append(words[-1])
+    return terms
+
+
+async def _opds_search(client: httpx.AsyncClient, term: str) -> bool:
+    """Single OPDS search attempt."""
     import xml.etree.ElementTree as ET
-    search_term = title.split("—")[0].split("-")[0].strip()[:50]
-    if not search_term or search_term.replace("\u2019", "'") in ("Unknown", "Anna's Archive", "Anna\u2019s Archive"):
-        # Can't search meaningfully, fall back to watching ingest dir drain
+    try:
+        r = await client.get(f"{CALIBRE_WEB_URL}/opds/search/{term}")
+        if r.status_code == 200:
+            ns = {'atom': 'http://www.w3.org/2005/Atom'}
+            entries = ET.fromstring(r.text).findall('.//atom:entry', ns)
+            if entries:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
+    """Poll Calibre-Web OPDS until the book appears or timeout.
+
+    Tries progressively simpler search terms to handle mismatched titles.
+    """
+    search_terms = _build_search_terms(title)
+    if not search_terms:
         return await _wait_for_ingest_drain(timeout)
 
     async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
-        for _ in range(timeout // 3):
-            try:
-                r = await client.get(f"{CALIBRE_WEB_URL}/opds/search/{search_term}")
-                if r.status_code == 200:
-                    ns = {'atom': 'http://www.w3.org/2005/Atom'}
-                    entries = ET.fromstring(r.text).findall('.//atom:entry', ns)
-                    if entries:
-                        return True
-            except Exception:
-                pass
+        elapsed = 0
+        # Try primary term for first 2/3 of timeout
+        primary_budget = min(timeout * 2 // 3, timeout - 6) if len(search_terms) > 1 else timeout
+        while elapsed < primary_budget:
+            if await _opds_search(client, search_terms[0]):
+                return True
             await asyncio.sleep(3)
+            elapsed += 3
+
+        # Try fallback terms for remaining time
+        for term in search_terms[1:]:
+            logger.info(f"OPDS: primary term failed, trying fallback '{term}'")
+            while elapsed < timeout:
+                if await _opds_search(client, term):
+                    return True
+                await asyncio.sleep(3)
+                elapsed += 3
     return False
+
+
+EBOOK_EXTENSIONS = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
+
+
+def _ingest_ebook_files() -> list[str]:
+    """List ebook files currently in the ingest directory."""
+    try:
+        return [f for f in os.listdir(CWA_INGEST_PATH)
+                if os.path.isfile(os.path.join(CWA_INGEST_PATH, f))
+                and any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS)]
+    except OSError:
+        return []
+
+
+def _fix_ingest_permissions():
+    """Fix permissions on all files in ingest dir right now."""
+    try:
+        if os.path.isdir(CWA_INGEST_PATH):
+            for entry in os.scandir(CWA_INGEST_PATH):
+                if entry.is_file():
+                    st = entry.stat()
+                    if st.st_uid != CWA_UID or st.st_gid != CWA_GID or st.st_mode & 0o777 != 0o664:
+                        _chown_for_cwa(entry.path)
+                        logger.info(f"Fixed permissions on {entry.name}")
+    except Exception as e:
+        logger.warning(f"Permission fix error: {e}")
+
+
+async def _wait_for_file_in_ingest(timeout: int = 90) -> str | None:
+    """Wait for an ebook file to appear in the ingest directory. Returns filename or None."""
+    for _ in range(timeout // 3):
+        files = _ingest_ebook_files()
+        if files:
+            return files[0]
+        await asyncio.sleep(3)
+    return None
 
 
 async def _wait_for_ingest_drain(timeout: int = 120) -> bool:
     """Wait until the ingest folder has no ebook files (CWA consumed them)."""
-    ebook_ext = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
     for _ in range(timeout // 3):
         try:
             files = [f for f in os.listdir(CWA_INGEST_PATH)
                      if os.path.isfile(os.path.join(CWA_INGEST_PATH, f))
-                     and any(f.lower().endswith(e) for e in ebook_ext)]
+                     and any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS)]
             if not files:
                 return True
         except OSError:
@@ -220,6 +291,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
     try:
         # Stage: downloading (try Stacks first)
         job["status"] = "downloading"
+        job["stage_detail"] = "Sending to Stacks..."
         stacks_result = await annas_scraper.download_via_stacks(md5)
         stacks_ok = stacks_result.get("success")
 
@@ -230,6 +302,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                 is_direct = any(h in dl_url for h in ("libgen", "library.lol", "gen.lib"))
                 if is_direct:
                     try:
+                        job["stage_detail"] = "Downloading from mirror..."
                         file_data, filename = await annas_scraper.download_file(dl_url)
                         if file_data:
                             if not filename:
@@ -241,57 +314,102 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                                 f.write(file_data)
                             _chown_for_cwa(save_path)
                             job["status"] = "downloaded"
+                            job["stage_detail"] = "File ready, waiting for Calibre..."
                             job["filename"] = filename
                             logger.info(f"[{job_id}] Direct download saved {filename}")
                         else:
                             job["status"] = "failed"
                             job["message"] = "Direct download returned no data"
+                            job["stage_detail"] = job["message"]
                             return
                     except Exception as e:
                         job["status"] = "failed"
                         job["message"] = f"Direct download failed: {e}"
+                        job["stage_detail"] = job["message"]
                         logger.warning(f"[{job_id}] Direct download failed for {md5}: {e}")
                         return
                 else:
                     job["status"] = "failed"
                     job["message"] = "Stacks failed and no direct mirror available"
+                    job["stage_detail"] = job["message"]
                     return
             else:
                 job["status"] = "failed"
                 job["message"] = "Stacks failed and no download URL available"
+                job["stage_detail"] = job["message"]
                 return
         else:
             already_downloaded = "already downloaded" in stacks_result.get("message", "").lower()
             logger.info(f"[{job_id}] Stacks accepted {md5} (already_downloaded={already_downloaded})")
-            job["status"] = "downloaded"
 
             if already_downloaded:
-                # File was downloaded before — quick check if it's in Calibre already
+                # Check if file is stuck in ingest dir with wrong permissions
+                stuck_files = _ingest_ebook_files()
+                if stuck_files:
+                    logger.info(f"[{job_id}] File stuck in ingest dir, fixing permissions: {stuck_files}")
+                    _fix_ingest_permissions()
+                    job["status"] = "importing"
+                    job["stage_detail"] = "Calibre is processing (fixed permissions)..."
+                    in_calibre = await _wait_for_calibre(title, timeout=120)
+                    if in_calibre:
+                        job["status"] = "done"
+                        job["message"] = "Added to Calibre"
+                        job["stage_detail"] = "Added to Calibre"
+                    else:
+                        job["status"] = "done"
+                        job["message"] = "Downloaded — Calibre import may still be processing"
+                        job["stage_detail"] = job["message"]
+                    return
+
+                # No file in ingest — quick OPDS check
                 job["status"] = "importing"
+                job["stage_detail"] = "Checking Calibre..."
                 in_calibre = await _wait_for_calibre(title, timeout=15)
                 if in_calibre:
                     job["status"] = "done"
                     job["message"] = "Added to Calibre"
+                    job["stage_detail"] = "Added to Calibre"
                 else:
                     job["status"] = "done"
-                    job["message"] = "Previously downloaded — check Calibre"
+                    job["message"] = "Previously downloaded — not found in Calibre"
+                    job["stage_detail"] = job["message"]
                 return
+
+            # Fresh Stacks download — wait for file to appear in ingest dir
+            job["status"] = "downloading"
+            job["stage_detail"] = "Waiting for Stacks download..."
+            appeared = await _wait_for_file_in_ingest(timeout=90)
+            if appeared:
+                job["status"] = "downloaded"
+                job["stage_detail"] = "File ready, waiting for Calibre..."
+                job["filename"] = appeared
+                logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
+                _fix_ingest_permissions()
+            else:
+                # File didn't appear but Stacks said OK — proceed to OPDS check anyway
+                logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
+                job["status"] = "downloaded"
+                job["stage_detail"] = "Download may be delayed, checking Calibre..."
 
         # Stage: importing (wait for CWA to pick up the file)
         job["status"] = "importing"
+        job["stage_detail"] = "Calibre is processing..."
 
         # Stage: done (poll Calibre OPDS)
         in_calibre = await _wait_for_calibre(title)
         if in_calibre:
             job["status"] = "done"
             job["message"] = "Added to Calibre"
+            job["stage_detail"] = "Added to Calibre"
         else:
             job["status"] = "done"
             job["message"] = "Downloaded — Calibre import may still be processing"
+            job["stage_detail"] = job["message"]
 
     except Exception as e:
         job["status"] = "failed"
         job["message"] = f"Unexpected error: {e}"
+        job["stage_detail"] = job["message"]
         logger.exception(f"[{job_id}] Download failed for {md5}")
     finally:
         # Auto-cleanup after TTL
@@ -328,6 +446,11 @@ async def download_url(request: Request):
         raise HTTPException(status_code=400, detail=f"URL must be an Anna's Archive book page (/md5/...). Got: {url[:200]}")
     md5 = md5_match.group(1)
 
+    # Deduplicate: if an active job exists for this MD5, return it
+    for jid, job in _download_jobs.items():
+        if job["md5"] == md5 and job["status"] not in ("done", "failed"):
+            return {"status": "ok", "job_id": jid, "title": job["title"], "author": job["author"]}
+
     if not annas_scraper:
         raise HTTPException(status_code=503, detail="Anna's Archive scraper not available")
 
@@ -338,10 +461,12 @@ async def download_url(request: Request):
     job_id = uuid.uuid4().hex[:12]
     _download_jobs[job_id] = {
         "status": "queued",
+        "stage_detail": "Starting download...",
         "title": title,
         "author": author,
         "md5": md5,
         "message": "",
+        "download_url": url,
         "created_at": time.time(),
     }
 
