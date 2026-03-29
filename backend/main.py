@@ -184,30 +184,11 @@ async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
     import re
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            # Step 1: GET /login → extract CSRF token
-            r = await client.get(f"{CALIBRE_WEB_URL}/login")
-            if r.status_code != 200:
-                logger.warning(f"CWA upload: /login returned {r.status_code}")
-                return None
-            m = re.search(r'name="csrf_token"\s+value="([^"]+)"', r.text)
-            if not m:
-                logger.warning("CWA upload: no CSRF token on /login")
-                return None
-            csrf = m.group(1)
-
-            # Step 2: POST /login with credentials
-            login_data = {
-                "username": CALIBRE_WEB_USER,
-                "password": CALIBRE_WEB_PASS,
-                "csrf_token": csrf,
-                "submit": "",
-            }
-            r = await client.post(f"{CALIBRE_WEB_URL}/login", data=login_data)
-            if r.status_code != 200:
-                logger.warning(f"CWA upload: login POST returned {r.status_code}")
+            if not await _cwa_login(client):
+                logger.warning("CWA upload: login failed")
                 return None
 
-            # Step 3: GET / → extract fresh CSRF token for upload
+            # GET / → extract fresh CSRF token for upload
             r = await client.get(f"{CALIBRE_WEB_URL}/")
             if r.status_code != 200:
                 logger.warning(f"CWA upload: GET / returned {r.status_code}")
@@ -218,7 +199,7 @@ async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
                 return None
             csrf = m.group(1)
 
-            # Step 4: POST /upload with multipart form
+            # POST /upload with multipart form
             files = {"btn-upload": (filename, file_data)}
             data = {"csrf_token": csrf}
             r = await client.post(f"{CALIBRE_WEB_URL}/upload", data=data, files=files)
@@ -447,14 +428,34 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
         return False
 
 
+async def _cwa_login(client: httpx.AsyncClient) -> bool:
+    """Log into CWA and establish session. Returns True on success."""
+    import re
+    r = await client.get(f"{CALIBRE_WEB_URL}/login")
+    if r.status_code != 200:
+        return False
+    m = re.search(r'name="csrf_token"\s+value="([^"]+)"', r.text)
+    if not m:
+        return False
+    login_data = {
+        "username": CALIBRE_WEB_USER,
+        "password": CALIBRE_WEB_PASS,
+        "csrf_token": m.group(1),
+        "submit": "",
+    }
+    r = await client.post(f"{CALIBRE_WEB_URL}/login", data=login_data)
+    return r.status_code == 200
+
+
 async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | None:
     """Send book epub to Kindle email. Returns None on success, error string on failure."""
     if not SMTP_USER or not SMTP_PASS:
         return "SMTP credentials not configured"
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            auth = (CALIBRE_WEB_USER, CALIBRE_WEB_PASS) if CALIBRE_WEB_PASS else None
-            r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/epub/", auth=auth)
+            if not await _cwa_login(client):
+                return "Failed to log into Calibre-Web"
+            r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/epub/")
             if r.status_code != 200:
                 return f"Failed to fetch epub from Calibre (HTTP {r.status_code})"
             epub_data = r.content
