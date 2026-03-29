@@ -478,10 +478,13 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | 
         attachment['Content-Disposition'] = f'attachment; filename="{safe_title}.{ext}"'
         msg.attach(attachment)
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
+        def _smtp_send(msg):
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+
+        await asyncio.get_event_loop().run_in_executor(None, _smtp_send, msg)
 
         logger.info(f"Sent '{title}' to Kindle ({kindle_email})")
         return None
