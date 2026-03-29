@@ -666,6 +666,10 @@ async def download_url(request: Request):
                 url = str(data)
         except Exception:
             url = body.decode("utf-8", errors="replace").strip()
+    elif "form" in content_type:
+        form = await request.form()
+        url = form.get("url", "")
+        kindle_email = form.get("kindle_email") or None
     else:
         url = body.decode("utf-8", errors="replace").strip()
 
