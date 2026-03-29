@@ -70,7 +70,7 @@ async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
     """Poll Calibre-Web OPDS until the book appears or timeout."""
     import xml.etree.ElementTree as ET
     search_term = title.split("—")[0].split("-")[0].strip()[:50]
-    if not search_term or search_term in ("Unknown", "Anna's Archive"):
+    if not search_term or search_term.replace("\u2019", "'") in ("Unknown", "Anna's Archive", "Anna\u2019s Archive"):
         # Can't search meaningfully, fall back to watching ingest dir drain
         return await _wait_for_ingest_drain(timeout)
 

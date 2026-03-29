@@ -202,11 +202,11 @@ class AnnasArchiveScraper:
             title_elem = soup.find("div", class_="text-3xl") or soup.find("h1")
             title = title_elem.get_text(strip=True) if title_elem else None
             # Fallback: try og:title or <title> tag (more stable than CSS selectors)
-            if not title or title.lower() in ("anna's archive", "unknown"):
+            if not title or title.lower().replace("\u2019", "'") in ("anna's archive", "unknown"):
                 og = soup.find("meta", property="og:title")
                 if og:
                     title = og.get("content", "").strip()
-            if not title or title.lower() in ("anna's archive", "unknown"):
+            if not title or title.lower().replace("\u2019", "'") in ("anna's archive", "unknown"):
                 title_tag = soup.find("title")
                 if title_tag:
                     t = title_tag.get_text(strip=True)
