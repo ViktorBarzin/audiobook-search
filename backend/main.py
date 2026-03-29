@@ -367,19 +367,26 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                     return
 
                 # Book is gone — CWA consumed it but failed to import.
-                # Try direct download as recovery.
-                logger.warning(f"[{job_id}] Stacks 'already downloaded' but book missing from Calibre and ingest dir — attempting direct download recovery")
-                recovered = await _try_direct_download(job_id, job, md5, title, author, detail)
-                if not recovered:
-                    job["status"] = "done"
-                    job["message"] = "Previously downloaded — not found in Calibre, direct download also failed"
-                    job["stage_detail"] = job["message"]
-                    return
-                # Recovery succeeded — file is in ingest dir, skip to importing
-            else:
-                # Fresh Stacks download — wait for file to appear in ingest dir
+                # Delete Stacks history and force re-download.
+                logger.warning(f"[{job_id}] Stacks 'already downloaded' but book missing from Calibre and ingest dir — forcing re-download")
+                job["stage_detail"] = "Re-downloading (previous import failed)..."
+                redownload_result = await annas_scraper.stacks_force_redownload(md5)
+                if not redownload_result.get("success"):
+                    # Stacks re-download failed — try direct download as last resort
+                    recovered = await _try_direct_download(job_id, job, md5, title, author, detail)
+                    if not recovered:
+                        job["status"] = "done"
+                        job["message"] = "Previously downloaded — not found in Calibre, re-download failed"
+                        job["stage_detail"] = job["message"]
+                        return
+                    # Direct download recovered — file is in ingest, skip to importing
+                else:
+                    pass  # Stacks re-download queued — fall through to wait for file
+
+            # Wait for file to appear in ingest dir (fresh download or re-download)
+            if job["status"] not in ("downloaded",):
                 job["status"] = "downloading"
-                job["stage_detail"] = "Waiting for Stacks download..."
+                job["stage_detail"] = "Waiting for download..."
                 appeared = await _wait_for_file_in_ingest(timeout=90)
                 if appeared:
                     job["status"] = "downloaded"

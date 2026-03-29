@@ -345,6 +345,50 @@ class AnnasArchiveScraper:
             logger.error(f"Stacks download request failed: {e}")
             return {"success": False, "error": str(e)}
 
+    async def stacks_force_redownload(self, md5: str) -> dict:
+        """Delete a completed entry from Stacks history and re-queue it.
+        Used when Stacks says 'already downloaded' but the file is missing."""
+        if not await self._check_stacks():
+            return {"success": False, "error": "Stacks instance not available"}
+
+        try:
+            # Get the download ID from status
+            r = await self.client.get(f"{STACKS_URL}/api/status", timeout=5)
+            if r.status_code != 200:
+                return {"success": False, "error": "Failed to get Stacks status"}
+
+            status = r.json()
+            download_id = None
+            for item in status.get("recent_history", []):
+                if item.get("md5") == md5:
+                    download_id = item.get("id")
+                    break
+
+            if download_id is None:
+                # Not in history — just try to queue normally
+                return await self.download_via_stacks(md5)
+
+            # Stacks has no delete API — delete directly from SQLite
+            import sqlite3
+            db_path = os.getenv("STACKS_DB_PATH", "/stacks-config/queue.db")
+            try:
+                conn = sqlite3.connect(db_path)
+                c = conn.cursor()
+                c.execute("DELETE FROM downloads WHERE md5 = ?", (md5,))
+                deleted = c.rowcount
+                conn.commit()
+                conn.close()
+                logger.info(f"Stacks: deleted {deleted} history entry for {md5} (id={download_id})")
+            except Exception as e:
+                logger.error(f"Stacks: failed to delete history entry for {md5}: {e}")
+                return {"success": False, "error": f"DB delete failed: {e}"}
+
+            # Re-queue
+            return await self.download_via_stacks(md5)
+        except Exception as e:
+            logger.error(f"Stacks force redownload failed: {e}")
+            return {"success": False, "error": str(e)}
+
     async def get_stacks_status(self) -> dict:
         """Get Stacks download queue status. Detects DB corruption."""
         if not await self._check_stacks():
