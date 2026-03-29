@@ -452,13 +452,17 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | 
     if not SMTP_USER or not SMTP_PASS:
         return "SMTP credentials not configured"
     try:
+        auth = (CALIBRE_WEB_USER, CALIBRE_WEB_PASS) if CALIBRE_WEB_PASS else None
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            if not await _cwa_login(client):
-                return "Failed to log into Calibre-Web"
-            r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/epub/")
-            if r.status_code != 200:
-                return f"Failed to fetch epub from Calibre (HTTP {r.status_code})"
-            epub_data = r.content
+            # Try epub first, then pdf
+            epub_data = None
+            for fmt in ("epub", "pdf"):
+                r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/{fmt}/", auth=auth)
+                if r.status_code == 200 and len(r.content) > 100:
+                    epub_data = r.content
+                    break
+            if not epub_data:
+                return f"No downloadable format found for book {book_id}"
 
         import smtplib
         from email.mime.multipart import MIMEMultipart
@@ -469,8 +473,9 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | 
         msg['To'] = kindle_email
         msg['Subject'] = title
         safe_title = _re.sub(r'[^\w\s-]', '', title).strip()[:100] or "book"
-        attachment = MIMEApplication(epub_data, Name=f"{safe_title}.epub")
-        attachment['Content-Disposition'] = f'attachment; filename="{safe_title}.epub"'
+        ext = "pdf" if fmt == "pdf" else "epub"
+        attachment = MIMEApplication(epub_data, Name=f"{safe_title}.{ext}")
+        attachment['Content-Disposition'] = f'attachment; filename="{safe_title}.{ext}"'
         msg.attach(attachment)
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
