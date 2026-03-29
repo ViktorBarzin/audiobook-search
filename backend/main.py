@@ -56,6 +56,48 @@ async def _periodic_fix_ingest_permissions():
         await asyncio.sleep(5)
 
 
+CALIBRE_WEB_URL = os.getenv("CALIBRE_WEB_URL", "http://calibre.ebooks.svc.cluster.local")
+
+
+async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
+    """Poll Calibre-Web OPDS until the book appears or timeout."""
+    import xml.etree.ElementTree as ET
+    search_term = title.split("—")[0].split("-")[0].strip()[:50]
+    if not search_term or search_term in ("Unknown", "Anna's Archive"):
+        # Can't search meaningfully, fall back to watching ingest dir drain
+        return await _wait_for_ingest_drain(timeout)
+
+    async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+        for _ in range(timeout // 3):
+            try:
+                r = await client.get(f"{CALIBRE_WEB_URL}/opds/search/{search_term}")
+                if r.status_code == 200:
+                    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+                    entries = ET.fromstring(r.text).findall('.//atom:entry', ns)
+                    if entries:
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+    return False
+
+
+async def _wait_for_ingest_drain(timeout: int = 120) -> bool:
+    """Wait until the ingest folder has no ebook files (CWA consumed them)."""
+    ebook_ext = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
+    for _ in range(timeout // 3):
+        try:
+            files = [f for f in os.listdir(CWA_INGEST_PATH)
+                     if os.path.isfile(os.path.join(CWA_INGEST_PATH, f))
+                     and any(f.lower().endswith(e) for e in ebook_ext)]
+            if not files:
+                return True
+        except OSError:
+            pass
+        await asyncio.sleep(3)
+    return False
+
+
 def _verify_api_key(request: Request):
     key = request.headers.get("X-Api-Key", "")
     if not API_KEY or key != API_KEY:
@@ -204,8 +246,11 @@ async def download_url(request: Request):
     # Try Stacks first — it handles AA download pages (CAPTCHA, challenges) properly
     stacks_result = await annas_scraper.download_via_stacks(md5)
     if stacks_result.get("success"):
+        logger.info(f"Stacks accepted {md5}, waiting for Calibre import...")
+        in_calibre = await _wait_for_calibre(title)
         return {"status": "ok", "title": title, "author": author,
-                "message": "Queued via Stacks — will appear in Calibre shortly"}
+                "in_calibre": in_calibre,
+                "message": "Added to Calibre" if in_calibre else "Downloaded — Calibre import pending"}
 
     # Fallback: direct download only for URLs that serve files directly (libgen/library.lol)
     # AA /fast_download/ and /slow_download/ URLs require browser interaction and return HTML
@@ -226,7 +271,11 @@ async def download_url(request: Request):
                     with open(save_path, "wb") as f:
                         f.write(file_data)
                     _chown_for_cwa(save_path)
-                    return {"status": "ok", "title": title, "author": author, "filename": filename}
+                    logger.info(f"Direct download saved {filename}, waiting for Calibre import...")
+                    in_calibre = await _wait_for_calibre(title)
+                    return {"status": "ok", "title": title, "author": author, "filename": filename,
+                            "in_calibre": in_calibre,
+                            "message": "Added to Calibre" if in_calibre else "Downloaded — Calibre import pending"}
             except Exception as e:
                 logger.warning(f"Direct download failed for {md5}: {e}")
 
