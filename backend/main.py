@@ -28,6 +28,7 @@ AUDIOBOOKSHELF_TOKEN = os.getenv("AUDIOBOOKSHELF_TOKEN", "")
 MAM_EMAIL = os.getenv("MAM_EMAIL", "")
 MAM_PASSWORD = os.getenv("MAM_PASSWORD", "")
 CWA_INGEST_PATH = os.getenv("CWA_INGEST_PATH", "/cwa-book-ingest")
+CWA_LIBRARY_PATH = os.getenv("CWA_LIBRARY_PATH", "/calibre-library")
 CWA_UID = int(os.getenv("CWA_UID", "1000"))
 CWA_GID = int(os.getenv("CWA_GID", "1000"))
 API_KEY = os.getenv("API_KEY", "")
@@ -57,6 +58,41 @@ async def _periodic_fix_ingest_permissions():
         except Exception as e:
             logger.warning(f"Permission fixer error: {e}")
         await asyncio.sleep(5)
+
+
+async def _periodic_fix_library_permissions():
+    """Fix permissions on recently modified files in Calibre library.
+
+    CWA's NETWORK_SHARE_MODE=true skips chown after import, leaving files
+    as root:abc 644. We fix ownership to abc:abc so CWA can manage them.
+    Only scans files modified in the last 10 minutes to avoid NFS thrash.
+    """
+    while True:
+        try:
+            if os.path.isdir(CWA_LIBRARY_PATH):
+                now = time.time()
+                cutoff = now - 600  # last 10 minutes
+                for dirpath, dirnames, filenames in os.walk(CWA_LIBRARY_PATH):
+                    try:
+                        dst = os.stat(dirpath)
+                        if dst.st_mtime < cutoff:
+                            dirnames.clear()  # skip old subtrees
+                            continue
+                        if dst.st_uid != CWA_UID:
+                            os.chown(dirpath, CWA_UID, CWA_GID)
+                            os.chmod(dirpath, 0o755)
+                        for fname in filenames:
+                            fpath = os.path.join(dirpath, fname)
+                            fst = os.stat(fpath)
+                            if fst.st_uid != CWA_UID:
+                                os.chown(fpath, CWA_UID, CWA_GID)
+                                os.chmod(fpath, 0o644)
+                                logger.info(f"Fixed library permissions on {fname}")
+                    except OSError:
+                        pass
+        except Exception as e:
+            logger.warning(f"Library permission fixer error: {e}")
+        await asyncio.sleep(30)
 
 
 CALIBRE_WEB_URL = os.getenv("CALIBRE_WEB_URL", "http://calibre.ebooks.svc.cluster.local")
@@ -217,9 +253,11 @@ async def lifespan(app: FastAPI):
         logger.info(f"MAM scraper initialized (mam_id={'set' if MAM_ID else 'not set'})")
     sync_task = asyncio.create_task(_periodic_sync())
     perm_task = asyncio.create_task(_periodic_fix_ingest_permissions())
+    lib_perm_task = asyncio.create_task(_periodic_fix_library_permissions())
     yield
     sync_task.cancel()
     perm_task.cancel()
+    lib_perm_task.cancel()
     if scraper:
         await scraper.close()
     if mam_scraper:
