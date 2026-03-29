@@ -17,6 +17,7 @@ from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
 from backend.models import AudiobookResult, AudiobookDetail
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 QBITTORRENT_URL = os.getenv("QBITTORRENT_URL", "http://qbittorrent.servarr.svc.cluster.local")
