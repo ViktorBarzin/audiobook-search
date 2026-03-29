@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 import re as _re
+import time
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
@@ -57,6 +59,10 @@ async def _periodic_fix_ingest_permissions():
 
 
 CALIBRE_WEB_URL = os.getenv("CALIBRE_WEB_URL", "http://calibre.ebooks.svc.cluster.local")
+
+# In-memory job store for async downloads (ephemeral — no persistence needed)
+_download_jobs: dict[str, dict] = {}
+JOB_TTL_SECONDS = 600  # auto-cleanup after 10 minutes
 
 
 async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
@@ -207,9 +213,82 @@ async def health_deep():
     )
 
 
+async def _process_download(job_id: str, md5: str, title: str, author: str, detail):
+    """Background task that downloads a book and tracks progress through stages."""
+    job = _download_jobs[job_id]
+    try:
+        # Stage: downloading (try Stacks first)
+        job["status"] = "downloading"
+        stacks_result = await annas_scraper.download_via_stacks(md5)
+        stacks_ok = stacks_result.get("success")
+
+        if not stacks_ok:
+            # Fallback: direct download for libgen mirrors
+            if detail and detail.magnet_url:
+                dl_url = detail.magnet_url
+                is_direct = any(h in dl_url for h in ("libgen", "library.lol", "gen.lib"))
+                if is_direct:
+                    try:
+                        file_data, filename = await annas_scraper.download_file(dl_url)
+                        if file_data:
+                            if not filename:
+                                ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
+                                filename = f"{author} - {title}{ext}"
+                            save_path = os.path.join(CWA_INGEST_PATH, filename)
+                            os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+                            with open(save_path, "wb") as f:
+                                f.write(file_data)
+                            _chown_for_cwa(save_path)
+                            job["status"] = "downloaded"
+                            job["filename"] = filename
+                            logger.info(f"[{job_id}] Direct download saved {filename}")
+                        else:
+                            job["status"] = "failed"
+                            job["message"] = "Direct download returned no data"
+                            return
+                    except Exception as e:
+                        job["status"] = "failed"
+                        job["message"] = f"Direct download failed: {e}"
+                        logger.warning(f"[{job_id}] Direct download failed for {md5}: {e}")
+                        return
+                else:
+                    job["status"] = "failed"
+                    job["message"] = "Stacks failed and no direct mirror available"
+                    return
+            else:
+                job["status"] = "failed"
+                job["message"] = "Stacks failed and no download URL available"
+                return
+        else:
+            logger.info(f"[{job_id}] Stacks accepted {md5}")
+            # Wait for file to appear in ingest dir
+            job["status"] = "downloaded"
+
+        # Stage: importing (wait for CWA to pick up the file)
+        job["status"] = "importing"
+
+        # Stage: done (poll Calibre OPDS)
+        in_calibre = await _wait_for_calibre(title)
+        if in_calibre:
+            job["status"] = "done"
+            job["message"] = "Added to Calibre"
+        else:
+            job["status"] = "done"
+            job["message"] = "Downloaded — Calibre import may still be processing"
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["message"] = f"Unexpected error: {e}"
+        logger.exception(f"[{job_id}] Download failed for {md5}")
+    finally:
+        # Auto-cleanup after TTL
+        await asyncio.sleep(JOB_TTL_SECONDS)
+        _download_jobs.pop(job_id, None)
+
+
 @app.post("/api/download-url")
 async def download_url(request: Request):
-    """iOS Shortcut endpoint - accept an AA URL, download ebook to Calibre."""
+    """iOS Shortcut endpoint - accept an AA URL, kick off async download, return job_id."""
     _verify_api_key(request)
 
     # Parse body flexibly — iOS Shortcuts may send plain text or JSON
@@ -243,43 +322,28 @@ async def download_url(request: Request):
     title = detail.title if detail else "Unknown"
     author = detail.author if detail else "Unknown Author"
 
-    # Try Stacks first — it handles AA download pages (CAPTCHA, challenges) properly
-    stacks_result = await annas_scraper.download_via_stacks(md5)
-    if stacks_result.get("success"):
-        logger.info(f"Stacks accepted {md5}, waiting for Calibre import...")
-        in_calibre = await _wait_for_calibre(title)
-        return {"status": "ok", "title": title, "author": author,
-                "in_calibre": in_calibre,
-                "message": "Added to Calibre" if in_calibre else "Downloaded — Calibre import pending"}
+    job_id = uuid.uuid4().hex[:12]
+    _download_jobs[job_id] = {
+        "status": "queued",
+        "title": title,
+        "author": author,
+        "md5": md5,
+        "message": "",
+        "created_at": time.time(),
+    }
 
-    # Fallback: direct download only for URLs that serve files directly (libgen/library.lol)
-    # AA /fast_download/ and /slow_download/ URLs require browser interaction and return HTML
-    if detail and detail.magnet_url:
-        download_url = detail.magnet_url
-        is_direct_mirror = any(host in download_url for host in ("libgen", "library.lol", "gen.lib"))
-        if is_direct_mirror:
-            try:
-                file_data, filename = await annas_scraper.download_file(download_url)
-                if file_data:
-                    if not filename:
-                        ext = ".epub"
-                        if file_data[:4] == b"%PDF":
-                            ext = ".pdf"
-                        filename = f"{author} - {title}{ext}"
-                    save_path = os.path.join(CWA_INGEST_PATH, filename)
-                    os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-                    with open(save_path, "wb") as f:
-                        f.write(file_data)
-                    _chown_for_cwa(save_path)
-                    logger.info(f"Direct download saved {filename}, waiting for Calibre import...")
-                    in_calibre = await _wait_for_calibre(title)
-                    return {"status": "ok", "title": title, "author": author, "filename": filename,
-                            "in_calibre": in_calibre,
-                            "message": "Added to Calibre" if in_calibre else "Downloaded — Calibre import pending"}
-            except Exception as e:
-                logger.warning(f"Direct download failed for {md5}: {e}")
+    asyncio.create_task(_process_download(job_id, md5, title, author, detail))
 
-    raise HTTPException(status_code=502, detail="Download failed — try again later")
+    return {"status": "ok", "job_id": job_id, "title": title, "author": author}
+
+
+@app.get("/api/download-status/{job_id}")
+async def download_status(job_id: str):
+    """Poll download progress. Returns current stage: queued/downloading/downloaded/importing/done/failed."""
+    job = _download_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.get("/shortcut")
