@@ -179,6 +179,82 @@ async def _wait_for_calibre(title: str, timeout: int = 120) -> int | None:
     return None
 
 
+async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
+    """Upload book to CWA via HTTP. Returns Calibre book ID or None on failure."""
+    import re
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            # Step 1: GET /login → extract CSRF token
+            r = await client.get(f"{CALIBRE_WEB_URL}/login")
+            if r.status_code != 200:
+                logger.warning(f"CWA upload: /login returned {r.status_code}")
+                return None
+            m = re.search(r'name="csrf_token"\s+value="([^"]+)"', r.text)
+            if not m:
+                logger.warning("CWA upload: no CSRF token on /login")
+                return None
+            csrf = m.group(1)
+
+            # Step 2: POST /login with credentials
+            login_data = {
+                "username": CALIBRE_WEB_USER,
+                "password": CALIBRE_WEB_PASS,
+                "csrf_token": csrf,
+                "submit": "",
+            }
+            r = await client.post(f"{CALIBRE_WEB_URL}/login", data=login_data)
+            if r.status_code != 200:
+                logger.warning(f"CWA upload: login POST returned {r.status_code}")
+                return None
+
+            # Step 3: GET / → extract fresh CSRF token for upload
+            r = await client.get(f"{CALIBRE_WEB_URL}/")
+            if r.status_code != 200:
+                logger.warning(f"CWA upload: GET / returned {r.status_code}")
+                return None
+            m = re.search(r'name="csrf_token"\s+value="([^"]+)"', r.text)
+            if not m:
+                logger.warning("CWA upload: no CSRF token on /")
+                return None
+            csrf = m.group(1)
+
+            # Step 4: POST /upload with multipart form
+            files = {"btn-upload": (filename, file_data)}
+            data = {"csrf_token": csrf}
+            r = await client.post(f"{CALIBRE_WEB_URL}/upload", data=data, files=files)
+            if r.status_code != 200:
+                logger.warning(f"CWA upload: /upload returned {r.status_code}")
+                return None
+
+            # Check for success response
+            try:
+                resp_json = r.json()
+                if resp_json.get("location") == "/tasks":
+                    logger.info(f"CWA upload: successfully uploaded {filename}")
+                else:
+                    logger.warning(f"CWA upload: unexpected response: {resp_json}")
+            except Exception:
+                logger.info(f"CWA upload: uploaded {filename} (non-JSON response)")
+
+    except Exception as e:
+        logger.exception(f"CWA upload failed for {filename}: {e}")
+        return None
+
+    # Poll OPDS to get the new book_id
+    search_terms = _build_search_terms(filename.rsplit('.', 1)[0])
+    if not search_terms:
+        search_terms = [filename.rsplit('.', 1)[0][:30]]
+    async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+        for attempt in range(20):  # ~60s
+            for term in search_terms:
+                book_id = await _opds_search(client, term)
+                if book_id is not None:
+                    return book_id
+            await asyncio.sleep(3)
+    logger.warning(f"CWA upload: OPDS polling timed out for {filename}")
+    return -1  # uploaded but couldn't find ID
+
+
 EBOOK_EXTENSIONS = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
 
 
@@ -343,7 +419,7 @@ async def health_deep():
 
 
 async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail) -> bool:
-    """Attempt direct download from libgen mirrors. Returns True if file was saved to ingest dir."""
+    """Attempt direct download from libgen mirrors. Returns True if uploaded to Calibre."""
     if not detail or not detail.magnet_url:
         return False
     dl_url = detail.magnet_url
@@ -358,15 +434,13 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
         if not filename:
             ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
             filename = f"{author} - {title}{ext}"
-        save_path = os.path.join(CWA_INGEST_PATH, filename)
-        os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(file_data)
-        _chown_for_cwa(save_path)
         job["status"] = "downloaded"
-        job["stage_detail"] = "File ready, waiting for Calibre..."
         job["filename"] = filename
-        logger.info(f"[{job_id}] Direct download recovery saved {filename}")
+        job["stage_detail"] = "Uploading to Calibre..."
+        logger.info(f"[{job_id}] Direct download got {filename}, uploading to CWA")
+        book_id = await _upload_to_calibre(file_data, filename)
+        if book_id is not None:
+            job["book_id"] = book_id
         return True
     except Exception as e:
         logger.warning(f"[{job_id}] Direct download recovery failed for {md5}: {e}")
@@ -414,6 +488,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
     """Background task that downloads a book and tracks progress through stages."""
     job = _download_jobs[job_id]
     try:
+        book_id = None
         # Stage: downloading (try Stacks first)
         job["status"] = "downloading"
         job["stage_detail"] = "Sending to Stacks..."
@@ -427,19 +502,23 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                 job["message"] = stacks_result.get("error", "Stacks failed and no direct mirror available")
                 job["stage_detail"] = job["message"]
                 return
+            # _try_direct_download already uploaded via HTTP and set book_id
         else:
             already_downloaded = "already downloaded" in stacks_result.get("message", "").lower()
             logger.info(f"[{job_id}] Stacks accepted {md5} (already_downloaded={already_downloaded})")
 
             if already_downloaded:
-                # Check if file is stuck in ingest dir with wrong permissions
+                # Check if file is stuck in ingest dir — pick it up and upload via HTTP
                 stuck_files = _ingest_ebook_files()
                 if stuck_files:
-                    logger.info(f"[{job_id}] File stuck in ingest dir, fixing permissions: {stuck_files}")
-                    _fix_ingest_permissions()
+                    logger.info(f"[{job_id}] File stuck in ingest dir, uploading via HTTP: {stuck_files}")
+                    file_path = os.path.join(CWA_INGEST_PATH, stuck_files[0])
+                    with open(file_path, "rb") as f:
+                        file_data = f.read()
+                    os.remove(file_path)
                     job["status"] = "importing"
-                    job["stage_detail"] = "Calibre is processing (fixed permissions)..."
-                    book_id = await _wait_for_calibre(title, timeout=120)
+                    job["stage_detail"] = "Uploading to Calibre..."
+                    book_id = await _upload_to_calibre(file_data, stuck_files[0])
                     if book_id is not None:
                         job["book_id"] = book_id
                         job["status"] = "done"
@@ -447,11 +526,11 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         job["stage_detail"] = "Added to Calibre"
                     else:
                         job["status"] = "done"
-                        job["message"] = "Downloaded — Calibre import may still be processing"
+                        job["message"] = "Uploaded — Calibre import may still be processing"
                         job["stage_detail"] = job["message"]
                     return
 
-                # No file in ingest — quick OPDS check
+                # No file in ingest — quick OPDS check (maybe already imported)
                 job["status"] = "importing"
                 job["stage_detail"] = "Checking Calibre..."
                 book_id = await _wait_for_calibre(title, timeout=15)
@@ -475,42 +554,62 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         job["message"] = "Previously downloaded — not found in Calibre, re-download failed"
                         job["stage_detail"] = job["message"]
                         return
-                    # Direct download recovered — file is in ingest, skip to importing
+                    # _try_direct_download already uploaded via HTTP
                 else:
                     pass  # Stacks re-download queued — fall through to wait for file
 
-            # Wait for file to appear in ingest dir (fresh download or re-download)
+            # Wait for file to appear in ingest dir (fresh Stacks download or re-download)
             if job["status"] not in ("downloaded",):
                 job["status"] = "downloading"
                 job["stage_detail"] = "Waiting for download..."
                 appeared = await _wait_for_file_in_ingest(timeout=90)
                 if appeared:
-                    job["status"] = "downloaded"
-                    job["stage_detail"] = "File ready, waiting for Calibre..."
                     job["filename"] = appeared
                     logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
-                    _fix_ingest_permissions()
                 else:
-                    # File didn't appear but Stacks said OK — proceed to OPDS check anyway
+                    # File didn't appear but Stacks said OK — check OPDS as last resort
                     logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
-                    job["status"] = "downloaded"
+                    job["status"] = "importing"
                     job["stage_detail"] = "Download may be delayed, checking Calibre..."
+                    book_id = await _wait_for_calibre(title, timeout=60)
+                    if book_id is not None:
+                        job["book_id"] = book_id
+                        job["status"] = "done"
+                        job["message"] = "Added to Calibre"
+                        job["stage_detail"] = "Added to Calibre"
+                    else:
+                        job["status"] = "done"
+                        job["message"] = "Download delayed — Calibre import may still be processing"
+                        job["stage_detail"] = job["message"]
+                    return
 
-        # Stage: importing (wait for CWA to pick up the file)
-        job["status"] = "importing"
-        job["stage_detail"] = "Calibre is processing..."
+            # File is in ingest dir — read it, upload via HTTP, clean up
+            file_path = os.path.join(CWA_INGEST_PATH, job.get("filename", ""))
+            if file_path and os.path.isfile(file_path):
+                with open(file_path, "rb") as f:
+                    file_data = f.read()
+                os.remove(file_path)
+                job["status"] = "importing"
+                job["stage_detail"] = "Uploading to Calibre..."
+                book_id = await _upload_to_calibre(file_data, job["filename"])
+            else:
+                # Fallback: file path lost, try OPDS
+                job["status"] = "importing"
+                job["stage_detail"] = "Checking Calibre..."
+                book_id = await _wait_for_calibre(title, timeout=60)
 
-        # Stage: done (poll Calibre OPDS)
-        book_id = await _wait_for_calibre(title)
-        if book_id is not None:
-            job["book_id"] = book_id
-            job["status"] = "done"
-            job["message"] = "Added to Calibre"
-            job["stage_detail"] = "Added to Calibre"
-        else:
-            job["status"] = "done"
-            job["message"] = "Downloaded — Calibre import may still be processing"
-            job["stage_detail"] = job["message"]
+        # Final status
+        if job["status"] != "done":
+            if job.get("book_id") or (book_id is not None):
+                if not job.get("book_id"):
+                    job["book_id"] = book_id
+                job["status"] = "done"
+                job["message"] = "Added to Calibre"
+                job["stage_detail"] = "Added to Calibre"
+            else:
+                job["status"] = "done"
+                job["message"] = "Uploaded — Calibre import may still be processing"
+                job["stage_detail"] = job["message"]
 
     except Exception as e:
         job["status"] = "failed"
