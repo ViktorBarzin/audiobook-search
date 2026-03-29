@@ -34,6 +34,13 @@ CWA_GID = int(os.getenv("CWA_GID", "1000"))
 API_KEY = os.getenv("API_KEY", "")
 SHORTCUT_ICLOUD_URL = os.getenv("SHORTCUT_ICLOUD_URL", "")
 
+# SMTP config for Send-to-Kindle
+SMTP_HOST = os.getenv("SMTP_HOST", "mail.viktorbarzin.me")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "Calibre-Web <calibre-web@viktorbarzin.me>")
+
 
 def _chown_for_cwa(path: str):
     """Set file ownership and permissions so CWA (abc user) can manage it."""
@@ -96,6 +103,8 @@ async def _periodic_fix_library_permissions():
 
 
 CALIBRE_WEB_URL = os.getenv("CALIBRE_WEB_URL", "http://calibre.ebooks.svc.cluster.local")
+CALIBRE_WEB_USER = os.getenv("CALIBRE_WEB_USER", "admin")
+CALIBRE_WEB_PASS = os.getenv("CALIBRE_WEB_PASS", "")
 
 # In-memory job store for async downloads (ephemeral — no persistence needed)
 _download_jobs: dict[str, dict] = {}
@@ -115,8 +124,8 @@ def _build_search_terms(title: str) -> list[str]:
     return terms
 
 
-async def _opds_search(client: httpx.AsyncClient, term: str) -> bool:
-    """Single OPDS search attempt."""
+async def _opds_search(client: httpx.AsyncClient, term: str) -> int | None:
+    """Single OPDS search attempt. Returns Calibre book ID or None."""
     import xml.etree.ElementTree as ET
     try:
         r = await client.get(f"{CALIBRE_WEB_URL}/opds/search/{term}")
@@ -124,28 +133,37 @@ async def _opds_search(client: httpx.AsyncClient, term: str) -> bool:
             ns = {'atom': 'http://www.w3.org/2005/Atom'}
             entries = ET.fromstring(r.text).findall('.//atom:entry', ns)
             if entries:
-                return True
+                # Extract book_id from OPDS download link: /opds/download/<id>/epub/
+                for link in entries[0].findall('atom:link', ns):
+                    href = link.get('href', '')
+                    m = _re.search(r'/opds/download/(\d+)/', href)
+                    if m:
+                        return int(m.group(1))
+                return -1  # found but couldn't extract ID
     except Exception:
         pass
-    return False
+    return None
 
 
-async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
+async def _wait_for_calibre(title: str, timeout: int = 120) -> int | None:
     """Poll Calibre-Web OPDS until the book appears or timeout.
 
+    Returns Calibre book ID on success, None on timeout.
     Tries progressively simpler search terms to handle mismatched titles.
     """
     search_terms = _build_search_terms(title)
     if not search_terms:
-        return await _wait_for_ingest_drain(timeout)
+        drained = await _wait_for_ingest_drain(timeout)
+        return -1 if drained else None
 
     async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
         elapsed = 0
         # Try primary term for first 2/3 of timeout
         primary_budget = min(timeout * 2 // 3, timeout - 6) if len(search_terms) > 1 else timeout
         while elapsed < primary_budget:
-            if await _opds_search(client, search_terms[0]):
-                return True
+            book_id = await _opds_search(client, search_terms[0])
+            if book_id is not None:
+                return book_id
             await asyncio.sleep(3)
             elapsed += 3
 
@@ -153,11 +171,12 @@ async def _wait_for_calibre(title: str, timeout: int = 120) -> bool:
         for term in search_terms[1:]:
             logger.info(f"OPDS: primary term failed, trying fallback '{term}'")
             while elapsed < timeout:
-                if await _opds_search(client, term):
-                    return True
+                book_id = await _opds_search(client, term)
+                if book_id is not None:
+                    return book_id
                 await asyncio.sleep(3)
                 elapsed += 3
-    return False
+    return None
 
 
 EBOOK_EXTENSIONS = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
@@ -354,6 +373,43 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
         return False
 
 
+async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | None:
+    """Send book epub to Kindle email. Returns None on success, error string on failure."""
+    if not SMTP_USER or not SMTP_PASS:
+        return "SMTP credentials not configured"
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            auth = (CALIBRE_WEB_USER, CALIBRE_WEB_PASS) if CALIBRE_WEB_PASS else None
+            r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/epub/", auth=auth)
+            if r.status_code != 200:
+                return f"Failed to fetch epub from Calibre (HTTP {r.status_code})"
+            epub_data = r.content
+
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.application import MIMEApplication
+
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_FROM
+        msg['To'] = kindle_email
+        msg['Subject'] = title
+        safe_title = _re.sub(r'[^\w\s-]', '', title).strip()[:100] or "book"
+        attachment = MIMEApplication(epub_data, Name=f"{safe_title}.epub")
+        attachment['Content-Disposition'] = f'attachment; filename="{safe_title}.epub"'
+        msg.attach(attachment)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+
+        logger.info(f"Sent '{title}' to Kindle ({kindle_email})")
+        return None
+    except Exception as e:
+        logger.exception(f"Failed to send '{title}' to Kindle ({kindle_email})")
+        return str(e)
+
+
 async def _process_download(job_id: str, md5: str, title: str, author: str, detail):
     """Background task that downloads a book and tracks progress through stages."""
     job = _download_jobs[job_id]
@@ -383,8 +439,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                     _fix_ingest_permissions()
                     job["status"] = "importing"
                     job["stage_detail"] = "Calibre is processing (fixed permissions)..."
-                    in_calibre = await _wait_for_calibre(title, timeout=120)
-                    if in_calibre:
+                    book_id = await _wait_for_calibre(title, timeout=120)
+                    if book_id is not None:
+                        job["book_id"] = book_id
                         job["status"] = "done"
                         job["message"] = "Added to Calibre"
                         job["stage_detail"] = "Added to Calibre"
@@ -397,8 +454,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                 # No file in ingest — quick OPDS check
                 job["status"] = "importing"
                 job["stage_detail"] = "Checking Calibre..."
-                in_calibre = await _wait_for_calibre(title, timeout=15)
-                if in_calibre:
+                book_id = await _wait_for_calibre(title, timeout=15)
+                if book_id is not None:
+                    job["book_id"] = book_id
                     job["status"] = "done"
                     job["message"] = "Added to Calibre"
                     job["stage_detail"] = "Added to Calibre"
@@ -443,8 +501,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         job["stage_detail"] = "Calibre is processing..."
 
         # Stage: done (poll Calibre OPDS)
-        in_calibre = await _wait_for_calibre(title)
-        if in_calibre:
+        book_id = await _wait_for_calibre(title)
+        if book_id is not None:
+            job["book_id"] = book_id
             job["status"] = "done"
             job["message"] = "Added to Calibre"
             job["stage_detail"] = "Added to Calibre"
@@ -458,10 +517,24 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         job["message"] = f"Unexpected error: {e}"
         job["stage_detail"] = job["message"]
         logger.exception(f"[{job_id}] Download failed for {md5}")
-    finally:
-        # Auto-cleanup after TTL
-        await asyncio.sleep(JOB_TTL_SECONDS)
-        _download_jobs.pop(job_id, None)
+
+    # Auto-send to Kindle if requested and book was added to Calibre
+    kindle_email = job.get("kindle_email")
+    if kindle_email and job.get("book_id") and job["status"] == "done":
+        bid = job["book_id"]
+        if bid > 0:
+            job["stage_detail"] = "Sending to Kindle..."
+            err = await _send_to_kindle(bid, title, kindle_email)
+            if err:
+                job["message"] += f" (Kindle send failed: {err})"
+                job["stage_detail"] = job["message"]
+            else:
+                job["message"] = f"Added to Calibre and sent to {kindle_email}"
+                job["stage_detail"] = job["message"]
+
+    # Auto-cleanup after TTL
+    await asyncio.sleep(JOB_TTL_SECONDS)
+    _download_jobs.pop(job_id, None)
 
 
 @app.post("/api/download-url")
@@ -474,16 +547,21 @@ async def download_url(request: Request):
     content_type = request.headers.get("content-type", "")
     url = None
 
+    kindle_email = None
     if "json" in content_type:
         try:
             data = await request.json()
-            url = data.get("url", "") if isinstance(data, dict) else str(data)
+            if isinstance(data, dict):
+                url = data.get("url", "")
+                kindle_email = data.get("kindle_email") or None
+            else:
+                url = str(data)
         except Exception:
             url = body.decode("utf-8", errors="replace").strip()
     else:
         url = body.decode("utf-8", errors="replace").strip()
 
-    logging.info(f"download-url: url={url!r}")
+    logging.info(f"download-url: url={url!r} kindle_email={kindle_email!r}")
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
@@ -514,6 +592,7 @@ async def download_url(request: Request):
         "md5": md5,
         "message": "",
         "download_url": url,
+        "kindle_email": kindle_email,
         "created_at": time.time(),
     }
 
@@ -529,6 +608,37 @@ async def download_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.post("/api/send-to-kindle")
+async def send_to_kindle(request: Request):
+    """Send a book from Calibre to a Kindle email address."""
+    _verify_api_key(request)
+    data = await request.json()
+    kindle_email = data.get("kindle_email")
+    if not kindle_email:
+        raise HTTPException(status_code=400, detail="kindle_email is required")
+
+    book_id = data.get("book_id")
+    title = data.get("title", "Book")
+    job_id = data.get("job_id")
+
+    if not book_id and job_id:
+        job = _download_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        book_id = job.get("book_id")
+        title = job.get("title", title)
+        if not book_id:
+            raise HTTPException(status_code=400, detail="Job has no book_id yet (download may still be in progress)")
+
+    if not book_id or book_id < 1:
+        raise HTTPException(status_code=400, detail="book_id is required (provide book_id or job_id of a completed download)")
+
+    err = await _send_to_kindle(book_id, title, kindle_email)
+    if err:
+        raise HTTPException(status_code=500, detail=f"Failed to send: {err}")
+    return {"status": "ok", "message": f"Sent to {kindle_email}"}
 
 
 @app.get("/shortcut")
