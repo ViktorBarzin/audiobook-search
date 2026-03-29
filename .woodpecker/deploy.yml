@@ -1,16 +1,16 @@
 when:
-  - event: [manual, push]
+  - event: manual
 
 steps:
   - name: check-vars
     image: alpine
     commands:
-      - "[ -n \"$IMAGE_TAG\" ] || (echo 'IMAGE_TAG not set, skipping deploy'; exit 78)"
+      - "[ -n \"$IMAGE_TAG\" ] || (echo 'IMAGE_TAG not set'; exit 1)"
 
   - name: deploy
     image: bitnami/kubectl:latest
     commands:
-      - "kubectl set image deployment/book-search book-search=${IMAGE_NAME}:${IMAGE_TAG} -n ebooks"
+      - "kubectl set image deployment/book-search book-search=\"${IMAGE_NAME}:${IMAGE_TAG}\" -n ebooks"
       - "kubectl rollout status deployment/book-search -n ebooks --timeout=300s"
 
   - name: notify
