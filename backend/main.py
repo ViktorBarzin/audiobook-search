@@ -660,7 +660,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             if job["status"] not in ("downloaded",):
                 job["status"] = "downloading"
                 job["stage_detail"] = "Waiting for download..."
-                appeared, stacks_failed = await _wait_for_file_in_ingest_or_stacks_fail(md5, timeout=90)
+                appeared, stacks_failed = await _wait_for_file_in_ingest_or_stacks_fail(md5, timeout=180)
                 if appeared:
                     job["filename"] = appeared
                     logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
@@ -676,27 +676,53 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         job["stage_detail"] = job["message"]
                     return
                 else:
-                    # Timeout (neither file appeared nor Stacks failed) — check OPDS as last resort
-                    logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
-                    job["status"] = "importing"
-                    job["stage_detail"] = "Download may be delayed, checking Calibre..."
-                    book_id = await _wait_for_calibre(title, timeout=60)
-                    if book_id is not None:
-                        job["book_id"] = book_id
-                        job["status"] = "done"
-                        job["message"] = "Added to Calibre"
-                        job["stage_detail"] = "Added to Calibre"
+                    # Timeout — but file may have arrived late. Check ingest dir one more time.
+                    late_files = _ingest_ebook_files()
+                    if late_files:
+                        logger.info(f"[{job_id}] File arrived late in ingest dir: {late_files[0]}")
+                        job["filename"] = late_files[0]
+                        # Fall through to the "file is in ingest dir" block below
                     else:
-                        # File never appeared AND not in Calibre — try direct download before giving up
-                        logger.warning(f"[{job_id}] Timeout waiting for file and not in Calibre — attempting direct download")
-                        if await _try_direct_download(job_id, job, md5, title, author, detail):
-                            # _try_direct_download already uploaded via HTTP and set book_id
-                            pass
+                        # File truly not there — check OPDS, then try direct download
+                        logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
+                        job["status"] = "importing"
+                        job["stage_detail"] = "Download may be delayed, checking Calibre..."
+                        book_id = await _wait_for_calibre(title, timeout=60)
+                        if book_id is not None:
+                            job["book_id"] = book_id
+                            job["status"] = "done"
+                            job["message"] = "Added to Calibre"
+                            job["stage_detail"] = "Added to Calibre"
                         else:
-                            job["status"] = "failed"
-                            job["message"] = "All download methods failed"
-                            job["stage_detail"] = job["message"]
-                    return
+                            # One final ingest dir check (Stacks download may have just completed)
+                            final_files = _ingest_ebook_files()
+                            if final_files:
+                                logger.info(f"[{job_id}] File appeared during Calibre wait: {final_files[0]}")
+                                file_path = os.path.join(CWA_INGEST_PATH, final_files[0])
+                                with open(file_path, "rb") as f:
+                                    file_data = f.read()
+                                os.remove(file_path)
+                                job["status"] = "importing"
+                                job["stage_detail"] = "Uploading to Calibre..."
+                                book_id = await _upload_to_calibre(file_data, final_files[0])
+                                if book_id is not None:
+                                    job["book_id"] = book_id
+                                    job["status"] = "done"
+                                    job["message"] = "Added to Calibre"
+                                    job["stage_detail"] = "Added to Calibre"
+                                else:
+                                    job["status"] = "done"
+                                    job["message"] = "Uploaded — Calibre import may still be processing"
+                                    job["stage_detail"] = job["message"]
+                            else:
+                                logger.warning(f"[{job_id}] Timeout waiting for file and not in Calibre — attempting direct download")
+                                if await _try_direct_download(job_id, job, md5, title, author, detail):
+                                    pass
+                                else:
+                                    job["status"] = "failed"
+                                    job["message"] = "All download methods failed"
+                                    job["stage_detail"] = job["message"]
+                        return
 
             # File is in ingest dir — read it, upload via HTTP, clean up
             file_path = os.path.join(CWA_INGEST_PATH, job.get("filename", ""))
