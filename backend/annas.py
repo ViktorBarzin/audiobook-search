@@ -329,42 +329,84 @@ class AnnasArchiveScraper:
             logger.error(f"Failed to parse Anna's Archive detail: {e}")
             return None
 
+    def _parse_download_response(self, response) -> tuple[bytes | None, str | None]:
+        """Parse a download response, extracting filename and validating content."""
+        filename = None
+        cd = response.headers.get("content-disposition", "")
+        fname_match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
+        if fname_match:
+            filename = fname_match.group(1).strip()
+
+        if not filename:
+            path = str(response.url) if hasattr(response, 'url') else ""
+            if "/" in path:
+                filename = path.split("/")[-1].split("?")[0]
+
+        valid_ext = (".epub", ".pdf", ".mobi", ".azw3", ".djvu", ".cbz", ".cbr", ".fb2")
+        if filename and not any(filename.lower().endswith(ext) for ext in valid_ext):
+            filename = None
+
+        content = response.content
+        check_content = content.lstrip(b'\xef\xbb\xbf')
+        if check_content[:1] == b'<' or check_content[:15].lower().startswith(b'<!doctype'):
+            return None, None
+
+        return content, filename
+
     async def download_file(self, download_url: str) -> tuple[bytes | None, str | None]:
-        """Download an ebook file from Anna's Archive mirror.
+        """Download an ebook file. Tries direct HTTP first, then FlareSolverr for CAPTCHA pages.
         Returns (file_bytes, filename) or (None, None) on failure."""
+        # Direct download attempt
         try:
             response = await self.client.get(download_url, follow_redirects=True)
             response.raise_for_status()
-
-            filename = None
-            cd = response.headers.get("content-disposition", "")
-            fname_match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
-            if fname_match:
-                filename = fname_match.group(1).strip()
-
-            if not filename:
-                path = response.url.path
-                filename = path.split("/")[-1] if "/" in path else None
-
-            # If filename lacks a valid ebook extension, discard it so the caller
-            # generates a proper name from author/title
-            valid_ext = (".epub", ".pdf", ".mobi", ".azw3", ".djvu", ".cbz", ".cbr", ".fb2")
-            if filename and not any(filename.lower().endswith(ext) for ext in valid_ext):
-                filename = None
-
-            content = response.content
-            # Strip UTF-8 BOM if present before checking for HTML
-            check_content = content.lstrip(b'\xef\xbb\xbf')
-            # Validate content is an actual ebook file, not an HTML error/challenge page
-            if check_content[:1] == b'<' or check_content[:15].lower().startswith(b'<!doctype'):
-                ct = response.headers.get("content-type", "")
-                logger.warning(f"Download returned HTML instead of ebook file from {download_url} (content-type: {ct}, size: {len(content)})")
-                return None, None
-
-            return content, filename
+            content, filename = self._parse_download_response(response)
+            if content:
+                return content, filename
+            ct = response.headers.get("content-type", "")
+            logger.warning(f"Download returned HTML instead of ebook file from {download_url} (content-type: {ct}, size: {len(response.content)})")
         except Exception as e:
-            logger.error(f"Anna's Archive file download failed: {e}")
-            return None, None
+            logger.warning(f"Direct download failed for {download_url}: {e}")
+
+        # FlareSolverr fallback for CAPTCHA/JS-challenged pages (e.g., AA slow_download)
+        is_aa_download = any(p in download_url for p in ("/slow_download/", "/fast_download/", "annas-archive"))
+        if is_aa_download and await self._check_flaresolverr():
+            logger.info(f"Trying FlareSolverr for download: {download_url}")
+            try:
+                r = await self.client.post(
+                    f"{FLARESOLVERR_URL}/v1",
+                    json={
+                        "cmd": "request.get",
+                        "url": download_url,
+                        "maxTimeout": 120000,
+                    },
+                    timeout=130.0,
+                )
+                r.raise_for_status()
+                data = r.json()
+                solution = data.get("solution", {})
+                # FlareSolverr returns the final URL after redirects — if it redirected
+                # to a file download, the response body might be the file content
+                response_text = solution.get("response", "")
+                final_url = solution.get("url", "")
+
+                # Check if FlareSolverr followed through to a direct file URL
+                if final_url and final_url != download_url:
+                    logger.info(f"FlareSolverr redirected to: {final_url}")
+                    # Try downloading from the final URL directly
+                    try:
+                        response = await self.client.get(final_url, follow_redirects=True)
+                        response.raise_for_status()
+                        content, filename = self._parse_download_response(response)
+                        if content:
+                            logger.info(f"FlareSolverr redirect download successful: {filename}")
+                            return content, filename
+                    except Exception as e:
+                        logger.warning(f"FlareSolverr redirect download failed: {e}")
+            except Exception as e:
+                logger.warning(f"FlareSolverr download attempt failed for {download_url}: {e}")
+
+        return None, None
 
     async def download_from_libgen_md5(self, md5: str) -> tuple[bytes | None, str | None]:
         """Try multiple LibGen endpoints to download by MD5.
