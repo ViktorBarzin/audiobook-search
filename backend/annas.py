@@ -230,12 +230,13 @@ class AnnasArchiveScraper:
                     if author_match:
                         author = author_match.group(1).strip()
 
-            # Fallback 2: Check meta description
+            # Fallback 2: Check meta description for "by Author Name" pattern
             if not author:
                 og_desc = soup.find("meta", property="og:description")
                 if og_desc:
                     desc_text = og_desc.get("content", "")
-                    author_match = re.search(r'\bby\s+([^,\n]+)', desc_text, re.IGNORECASE)
+                    # Match "by FirstName LastName" — require capitalized words to avoid "by famine"
+                    author_match = re.search(r'\bby\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', desc_text)
                     if author_match:
                         author = author_match.group(1).strip()
 
@@ -246,11 +247,23 @@ class AnnasArchiveScraper:
 
             page_text = soup.get_text()
 
-            # Fallback 3: Look for "Author:" label in page text
+            # Fallback 3: Look for "author FirstName LastName" in description text
             if not author:
-                author_match = re.search(r'\bAuthor[:\s]+([^\n,]+)', page_text, re.IGNORECASE)
+                desc_elem = soup.find("div", class_="js-md5-top-box-description")
+                desc_text = desc_elem.get_text() if desc_elem else page_text[:2000]
+                author_match = re.search(r'\bauthor\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', desc_text)
                 if author_match:
                     author = author_match.group(1).strip()
+
+            # Fallback 4: Look for structured "Author: Name" label in page text
+            if not author:
+                # Require colon after "Author" to avoid matching "Debut author Shen Tao introduces..."
+                author_match = re.search(r'\bAuthor\s*:\s*([^\n,;]+)', page_text)
+                if author_match:
+                    candidate = author_match.group(1).strip()[:80]
+                    # Reject if it looks like description text (contains common verbs)
+                    if not re.search(r'\b(introduces|presents|brings|writes|explores|takes)\b', candidate, re.IGNORECASE):
+                        author = candidate
 
             format_match = re.search(r"\b(epub|pdf|mobi|azw3?|djvu|cbr|cbz)\b", page_text, re.IGNORECASE)
             if format_match:
@@ -293,8 +306,9 @@ class AnnasArchiveScraper:
             if not download_url:
                 download_url = detail_url
 
-            # Add LibGen direct MD5 lookup URL as fallback
-            mirror_urls.append(f"https://libgen.li/ads.php?md5={md5}")
+            # Add LibGen direct download URLs as fallback
+            mirror_urls.append(f"https://libgen.li/get.php?md5={md5}")
+            mirror_urls.append(f"https://libgen.is/get.php?md5={md5}")
 
             return AudiobookDetail(
                 id=f"annas:{md5}",
@@ -353,36 +367,48 @@ class AnnasArchiveScraper:
             return None, None
 
     async def download_from_libgen_md5(self, md5: str) -> tuple[bytes | None, str | None]:
-        """Download from LibGen by constructing MD5 lookup URL and parsing the download link.
+        """Try multiple LibGen endpoints to download by MD5.
         Returns (file_bytes, filename) or (None, None) on failure."""
-        try:
-            # Fetch the LibGen ads page
-            ads_url = f"https://libgen.li/ads.php?md5={md5}"
-            logger.info(f"Attempting LibGen MD5 download from {ads_url}")
-            response = await self.client.get(ads_url)
-            response.raise_for_status()
+        # Try direct get.php endpoints first (these return the file directly)
+        direct_urls = [
+            f"https://libgen.li/get.php?md5={md5}",
+            f"https://libgen.is/get.php?md5={md5}",
+        ]
+        for url in direct_urls:
+            try:
+                logger.info(f"Trying LibGen direct download: {url}")
+                result = await self.download_file(url)
+                if result[0]:
+                    return result
+            except Exception as e:
+                logger.warning(f"LibGen direct download failed from {url}: {e}")
 
-            # Parse the page to find the actual download link
-            soup = BeautifulSoup(response.text, "html.parser")
-            download_link = None
+        # Try library.lol (requires parsing the page for the actual download link)
+        for path in ("main", "fiction"):
+            try:
+                lol_url = f"https://library.lol/{path}/{md5}"
+                logger.info(f"Trying library.lol: {lol_url}")
+                # library.lol sometimes has self-signed certs
+                client = httpx.AsyncClient(timeout=15, follow_redirects=True, verify=False)
+                try:
+                    r = await client.get(lol_url)
+                    if r.status_code == 200 and len(r.text) > 500:
+                        soup = BeautifulSoup(r.text, "html.parser")
+                        for a_tag in soup.find_all("a", href=True):
+                            href = a_tag.get("href", "")
+                            text = a_tag.get_text(strip=True).lower()
+                            if "get" in text or "cloudflare" in text:
+                                logger.info(f"Found download link on library.lol: {href}")
+                                result = await self.download_file(href)
+                                if result[0]:
+                                    return result
+                finally:
+                    await client.aclose()
+            except Exception as e:
+                logger.warning(f"library.lol download failed for {path}/{md5}: {e}")
 
-            # LibGen ads page typically has a link with "GET" or "Cloudflare" text
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag.get("href", "")
-                text = a_tag.get_text(strip=True).lower()
-                if ("get" in text or "download" in text or "cloudflare" in text) and ("libgen" in href or "cloudflare" in href or href.startswith("http")):
-                    download_link = href
-                    break
-
-            if not download_link:
-                logger.warning(f"No download link found on LibGen ads page for {md5}")
-                return None, None
-
-            # Download the actual file
-            return await self.download_file(download_link)
-        except Exception as e:
-            logger.error(f"LibGen MD5 download failed for {md5}: {e}")
-            return None, None
+        logger.warning(f"All LibGen download methods failed for {md5}")
+        return None, None
 
     async def download_via_stacks(self, md5: str) -> dict:
         """Queue a download via the self-hosted Stacks instance.
