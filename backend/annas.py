@@ -210,7 +210,7 @@ class AnnasArchiveScraper:
                 title_tag = soup.find("title")
                 if title_tag:
                     t = title_tag.get_text(strip=True)
-                    t = re.sub(r"\s*[-–—]\s*Anna'?s?\s*Archive\s*$", "", t, flags=re.IGNORECASE)
+                    t = re.sub(r"\s*[-–—]\s*Anna['\u2019]?s?\s*Archive\s*$", "", t, flags=re.IGNORECASE)
                     if t:
                         title = t
             if not title:
@@ -221,12 +221,36 @@ class AnnasArchiveScraper:
             if author_elem:
                 author = author_elem.get_text(strip=True)
 
+            # Fallback 1: Try to extract author from title tag (often "Title by Author - Anna's Archive")
+            if not author:
+                title_tag = soup.find("title")
+                if title_tag:
+                    title_text = title_tag.get_text(strip=True)
+                    author_match = re.search(r'\bby\s+([^-]+?)(?:\s*[-–—]\s*Anna|$)', title_text, re.IGNORECASE)
+                    if author_match:
+                        author = author_match.group(1).strip()
+
+            # Fallback 2: Check meta description
+            if not author:
+                og_desc = soup.find("meta", property="og:description")
+                if og_desc:
+                    desc_text = og_desc.get("content", "")
+                    author_match = re.search(r'\bby\s+([^,\n]+)', desc_text, re.IGNORECASE)
+                    if author_match:
+                        author = author_match.group(1).strip()
+
             format_str = None
             size = None
             language = None
             description = None
 
             page_text = soup.get_text()
+
+            # Fallback 3: Look for "Author:" label in page text
+            if not author:
+                author_match = re.search(r'\bAuthor[:\s]+([^\n,]+)', page_text, re.IGNORECASE)
+                if author_match:
+                    author = author_match.group(1).strip()
 
             format_match = re.search(r"\b(epub|pdf|mobi|azw3?|djvu|cbr|cbz)\b", page_text, re.IGNORECASE)
             if format_match:
@@ -249,18 +273,28 @@ class AnnasArchiveScraper:
             if img:
                 cover_url = img.get("src")
 
+            # Extract ALL download/mirror URLs (for fallback download attempts)
             download_url = None
+            mirror_urls = []
             for a_tag in soup.find_all("a", href=True):
                 href = a_tag.get("href", "")
+                # Primary download link (first match)
                 if "/fast_download/" in href or "/slow_download/" in href:
-                    download_url = href if href.startswith("http") else f"{self.base_url}{href}"
-                    break
-                if "libgen" in href or "library.lol" in href:
-                    download_url = href
-                    break
+                    full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                    if not download_url:
+                        download_url = full_url
+                    mirror_urls.append(full_url)
+                # Libgen mirrors (direct download capable)
+                elif any(mirror in href for mirror in ("libgen.li", "library.lol", "libgen.is", "libgen.rs")):
+                    if not download_url:
+                        download_url = href
+                    mirror_urls.append(href)
 
             if not download_url:
                 download_url = detail_url
+
+            # Add LibGen direct MD5 lookup URL as fallback
+            mirror_urls.append(f"https://libgen.li/ads.php?md5={md5}")
 
             return AudiobookDetail(
                 id=f"annas:{md5}",
@@ -275,6 +309,7 @@ class AnnasArchiveScraper:
                 language=language,
                 source="annas",
                 content_type="ebook",
+                mirror_urls=mirror_urls,
             )
         except Exception as e:
             logger.error(f"Failed to parse Anna's Archive detail: {e}")
@@ -315,6 +350,38 @@ class AnnasArchiveScraper:
             return content, filename
         except Exception as e:
             logger.error(f"Anna's Archive file download failed: {e}")
+            return None, None
+
+    async def download_from_libgen_md5(self, md5: str) -> tuple[bytes | None, str | None]:
+        """Download from LibGen by constructing MD5 lookup URL and parsing the download link.
+        Returns (file_bytes, filename) or (None, None) on failure."""
+        try:
+            # Fetch the LibGen ads page
+            ads_url = f"https://libgen.li/ads.php?md5={md5}"
+            logger.info(f"Attempting LibGen MD5 download from {ads_url}")
+            response = await self.client.get(ads_url)
+            response.raise_for_status()
+
+            # Parse the page to find the actual download link
+            soup = BeautifulSoup(response.text, "html.parser")
+            download_link = None
+
+            # LibGen ads page typically has a link with "GET" or "Cloudflare" text
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag.get("href", "")
+                text = a_tag.get_text(strip=True).lower()
+                if ("get" in text or "download" in text or "cloudflare" in text) and ("libgen" in href or "cloudflare" in href or href.startswith("http")):
+                    download_link = href
+                    break
+
+            if not download_link:
+                logger.warning(f"No download link found on LibGen ads page for {md5}")
+                return None, None
+
+            # Download the actual file
+            return await self.download_file(download_link)
+        except Exception as e:
+            logger.error(f"LibGen MD5 download failed for {md5}: {e}")
             return None, None
 
     async def download_via_stacks(self, md5: str) -> dict:

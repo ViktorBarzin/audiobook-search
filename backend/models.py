@@ -18,3 +18,4 @@ class AudiobookDetail(AudiobookResult):
     magnet_url: str
     description: str | None = None
     language: str | None = None
+    mirror_urls: list[str] = []

@@ -290,6 +290,31 @@ async def _wait_for_file_in_ingest(timeout: int = 90) -> str | None:
     return None
 
 
+async def _wait_for_file_in_ingest_or_stacks_fail(md5: str, timeout: int = 90) -> tuple[str | None, bool]:
+    """Wait for an ebook file to appear in the ingest directory OR Stacks reports failure.
+    Returns (filename, stacks_failed). If stacks_failed=True, the download failed in Stacks.
+    If filename is None and stacks_failed=False, it timed out."""
+    for _ in range(timeout // 3):
+        # Check for file arrival
+        files = _ingest_ebook_files()
+        if files:
+            return files[0], False
+
+        # Check Stacks status for failure
+        try:
+            stacks_status = await annas_scraper.get_stacks_status()
+            if stacks_status.get("available"):
+                for item in stacks_status.get("recent_history", []):
+                    if item.get("md5") == md5 and item.get("status") == "failed":
+                        logger.warning(f"Stacks reported download failure for {md5}: {item.get('error', 'unknown')}")
+                        return None, True
+        except Exception as e:
+            logger.warning(f"Failed to check Stacks status during wait: {e}")
+
+        await asyncio.sleep(3)
+    return None, False
+
+
 async def _wait_for_ingest_drain(timeout: int = 120) -> bool:
     """Wait until the ingest folder has no ebook files (CWA consumed them)."""
     for _ in range(timeout // 3):
@@ -416,33 +441,80 @@ async def health_deep():
     )
 
 
-async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail) -> bool:
-    """Attempt direct download from libgen mirrors. Returns True if uploaded to Calibre."""
-    if not detail or not detail.magnet_url:
+async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail, mirror_urls: list[str] = None) -> bool:
+    """Attempt direct download from libgen mirrors or provided mirror URLs.
+    Returns True if uploaded to Calibre."""
+    if not detail:
         return False
-    dl_url = detail.magnet_url
-    is_direct = any(h in dl_url for h in ("libgen", "library.lol", "gen.lib"))
-    if not is_direct:
+
+    # Build list of URLs to try
+    urls_to_try = []
+
+    # Add explicitly provided mirror URLs first
+    if mirror_urls:
+        urls_to_try.extend(mirror_urls)
+
+    # Add detail.mirror_urls if available
+    if hasattr(detail, "mirror_urls") and detail.mirror_urls:
+        urls_to_try.extend([u for u in detail.mirror_urls if u not in urls_to_try])
+
+    # Add magnet_url as fallback
+    if detail.magnet_url and detail.magnet_url not in urls_to_try:
+        urls_to_try.append(detail.magnet_url)
+
+    # Filter to only direct-download-capable mirrors (or try all if none are direct)
+    direct_urls = [u for u in urls_to_try if any(h in u for h in ("libgen", "library.lol", "gen.lib"))]
+    if direct_urls:
+        urls_to_try = direct_urls
+
+    if not urls_to_try:
         return False
+
+    # Try each URL in sequence
+    for idx, dl_url in enumerate(urls_to_try):
+        try:
+            job["stage_detail"] = f"Recovering via direct download ({idx+1}/{len(urls_to_try)})..."
+            logger.info(f"[{job_id}] Trying direct download from {dl_url}")
+            file_data, filename = await annas_scraper.download_file(dl_url)
+            if not file_data:
+                logger.warning(f"[{job_id}] Direct download failed from {dl_url}")
+                continue
+            if not filename:
+                ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
+                filename = f"{author} - {title}{ext}"
+            job["status"] = "downloaded"
+            job["filename"] = filename
+            job["stage_detail"] = "Uploading to Calibre..."
+            logger.info(f"[{job_id}] Direct download got {filename} from {dl_url}, uploading to CWA")
+            book_id = await _upload_to_calibre(file_data, filename)
+            if book_id is not None:
+                job["book_id"] = book_id
+            return True
+        except Exception as e:
+            logger.warning(f"[{job_id}] Direct download attempt {idx+1}/{len(urls_to_try)} failed for {dl_url}: {e}")
+            continue
+
+    # All mirrors failed — try LibGen MD5 lookup as last resort
     try:
-        job["stage_detail"] = "Recovering via direct download..."
-        file_data, filename = await annas_scraper.download_file(dl_url)
-        if not file_data:
-            return False
-        if not filename:
-            ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
-            filename = f"{author} - {title}{ext}"
-        job["status"] = "downloaded"
-        job["filename"] = filename
-        job["stage_detail"] = "Uploading to Calibre..."
-        logger.info(f"[{job_id}] Direct download got {filename}, uploading to CWA")
-        book_id = await _upload_to_calibre(file_data, filename)
-        if book_id is not None:
-            job["book_id"] = book_id
-        return True
+        job["stage_detail"] = "Trying LibGen MD5 lookup..."
+        logger.info(f"[{job_id}] Trying LibGen MD5 lookup for {md5}")
+        file_data, filename = await annas_scraper.download_from_libgen_md5(md5)
+        if file_data:
+            if not filename:
+                ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
+                filename = f"{author} - {title}{ext}"
+            job["status"] = "downloaded"
+            job["filename"] = filename
+            job["stage_detail"] = "Uploading to Calibre..."
+            logger.info(f"[{job_id}] LibGen MD5 lookup got {filename}, uploading to CWA")
+            book_id = await _upload_to_calibre(file_data, filename)
+            if book_id is not None:
+                job["book_id"] = book_id
+            return True
     except Exception as e:
-        logger.warning(f"[{job_id}] Direct download recovery failed for {md5}: {e}")
-        return False
+        logger.warning(f"[{job_id}] LibGen MD5 lookup failed for {md5}: {e}")
+
+    return False
 
 
 async def _cwa_login(client: httpx.AsyncClient) -> bool:
@@ -588,12 +660,23 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             if job["status"] not in ("downloaded",):
                 job["status"] = "downloading"
                 job["stage_detail"] = "Waiting for download..."
-                appeared = await _wait_for_file_in_ingest(timeout=90)
+                appeared, stacks_failed = await _wait_for_file_in_ingest_or_stacks_fail(md5, timeout=90)
                 if appeared:
                     job["filename"] = appeared
                     logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
+                elif stacks_failed:
+                    # Stacks reported failure — try direct download
+                    logger.warning(f"[{job_id}] Stacks download failed, attempting direct download")
+                    if await _try_direct_download(job_id, job, md5, title, author, detail):
+                        # _try_direct_download already uploaded via HTTP and set book_id
+                        pass
+                    else:
+                        job["status"] = "failed"
+                        job["message"] = "All download methods failed"
+                        job["stage_detail"] = job["message"]
+                    return
                 else:
-                    # File didn't appear but Stacks said OK — check OPDS as last resort
+                    # Timeout (neither file appeared nor Stacks failed) — check OPDS as last resort
                     logger.warning(f"[{job_id}] File didn't appear in ingest dir after Stacks OK")
                     job["status"] = "importing"
                     job["stage_detail"] = "Download may be delayed, checking Calibre..."
@@ -604,9 +687,15 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         job["message"] = "Added to Calibre"
                         job["stage_detail"] = "Added to Calibre"
                     else:
-                        job["status"] = "done"
-                        job["message"] = "Download delayed — Calibre import may still be processing"
-                        job["stage_detail"] = job["message"]
+                        # File never appeared AND not in Calibre — try direct download before giving up
+                        logger.warning(f"[{job_id}] Timeout waiting for file and not in Calibre — attempting direct download")
+                        if await _try_direct_download(job_id, job, md5, title, author, detail):
+                            # _try_direct_download already uploaded via HTTP and set book_id
+                            pass
+                        else:
+                            job["status"] = "failed"
+                            job["message"] = "All download methods failed"
+                            job["stage_detail"] = job["message"]
                     return
 
             # File is in ingest dir — read it, upload via HTTP, clean up
