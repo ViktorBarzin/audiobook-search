@@ -31,6 +31,11 @@ CWA_INGEST_PATH = os.getenv("CWA_INGEST_PATH", "/cwa-book-ingest")
 CWA_LIBRARY_PATH = os.getenv("CWA_LIBRARY_PATH", "/calibre-library")
 CWA_UID = int(os.getenv("CWA_UID", "1000"))
 CWA_GID = int(os.getenv("CWA_GID", "1000"))
+# Ingest hygiene. Stacks tags integrity-failed downloads with a `.MISMATCH`
+# infix and (as of 2026-05) leaves them on disk; AA's per-IP rate-limit reply
+# is a ~150-byte HTML page. Both must be filtered out so they never get
+# uploaded to Calibre or emailed to a Kindle as a new job's payload.
+MIN_EBOOK_SIZE_BYTES = int(os.getenv("MIN_EBOOK_SIZE_BYTES", "5000"))
 API_KEY = os.getenv("API_KEY", "")
 SHORTCUT_ICLOUD_URL = os.getenv("SHORTCUT_ICLOUD_URL", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -256,14 +261,74 @@ async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
 EBOOK_EXTENSIONS = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
 
 
-def _ingest_ebook_files() -> list[str]:
-    """List ebook files currently in the ingest directory."""
+def _invalid_ingest_reason(filename: str, full_path: str) -> str | None:
+    """Return a human-readable reason if `filename` looks like a poisoned ingest
+    file (Stacks integrity-mismatch leftover, AA rate-limit stub, etc), or None
+    if it looks like a real ebook. Filename check is case-insensitive."""
+    if ".mismatch" in filename.lower():
+        return "MISMATCH suffix (Stacks integrity check failed)"
     try:
-        return [f for f in os.listdir(CWA_INGEST_PATH)
-                if os.path.isfile(os.path.join(CWA_INGEST_PATH, f))
-                and any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS)]
+        size = os.path.getsize(full_path)
+    except OSError as e:
+        return f"unreadable ({e})"
+    if size < MIN_EBOOK_SIZE_BYTES:
+        return f"size {size}B below minimum {MIN_EBOOK_SIZE_BYTES}B"
+    return None
+
+
+def _ingest_ebook_files(exclude: set[str] | None = None) -> list[str]:
+    """List valid ebook files in the ingest directory.
+
+    Skips: non-ebook extensions, files in `exclude` (callers snapshot this set
+    before queueing so orphans from prior jobs are ignored), and files
+    rejected by `_invalid_ingest_reason` (MISMATCH, too small).
+    """
+    exclude = exclude or set()
+    try:
+        names = os.listdir(CWA_INGEST_PATH)
     except OSError:
         return []
+    out = []
+    for f in names:
+        if f in exclude:
+            continue
+        full = os.path.join(CWA_INGEST_PATH, f)
+        if not os.path.isfile(full):
+            continue
+        if not any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS):
+            continue
+        if _invalid_ingest_reason(f, full):
+            continue
+        out.append(f)
+    return out
+
+
+def _sweep_ingest_orphans() -> list[str]:
+    """Delete invalid ebook files (MISMATCH leftovers, tiny stubs) from the ingest
+    directory. Returns the list of filenames removed. Callers should invoke this
+    at the start of each download job so a leaked file from a prior failure
+    cannot be picked up as the current job's payload."""
+    try:
+        names = os.listdir(CWA_INGEST_PATH)
+    except OSError:
+        return []
+    removed = []
+    for f in names:
+        full = os.path.join(CWA_INGEST_PATH, f)
+        if not os.path.isfile(full):
+            continue
+        if not any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS):
+            continue
+        reason = _invalid_ingest_reason(f, full)
+        if not reason:
+            continue
+        try:
+            os.remove(full)
+            removed.append(f)
+            logger.warning(f"Swept orphan ingest file {f}: {reason}")
+        except OSError as e:
+            logger.warning(f"Failed to sweep orphan {f}: {e}")
+    return removed
 
 
 def _fix_ingest_permissions():
@@ -280,27 +345,41 @@ def _fix_ingest_permissions():
         logger.warning(f"Permission fix error: {e}")
 
 
-async def _wait_for_file_in_ingest(timeout: int = 90) -> str | None:
-    """Wait for an ebook file to appear in the ingest directory. Returns filename or None."""
-    for _ in range(timeout // 3):
-        files = _ingest_ebook_files()
+async def _wait_for_file_in_ingest(
+    timeout: int = 90,
+    exclude: set[str] | None = None,
+    poll_interval: float = 3,
+) -> str | None:
+    """Wait for a NEW ebook file to appear in the ingest directory.
+
+    Pass `exclude` (set of filenames present *before* queueing) so files from
+    prior jobs aren't returned. `poll_interval` is overridable for tests.
+    """
+    iters = max(1, int(timeout / poll_interval))
+    for _ in range(iters):
+        files = _ingest_ebook_files(exclude=exclude)
         if files:
             return files[0]
-        await asyncio.sleep(3)
+        await asyncio.sleep(poll_interval)
     return None
 
 
-async def _wait_for_file_in_ingest_or_stacks_fail(md5: str, timeout: int = 90) -> tuple[str | None, bool]:
-    """Wait for an ebook file to appear in the ingest directory OR Stacks reports failure.
-    Returns (filename, stacks_failed). If stacks_failed=True, the download failed in Stacks.
-    If filename is None and stacks_failed=False, it timed out."""
-    for _ in range(timeout // 3):
-        # Check for file arrival
-        files = _ingest_ebook_files()
+async def _wait_for_file_in_ingest_or_stacks_fail(
+    md5: str,
+    timeout: int = 90,
+    exclude: set[str] | None = None,
+    poll_interval: float = 3,
+) -> tuple[str | None, bool]:
+    """Wait for a NEW ebook file to appear in the ingest directory OR Stacks
+    reports failure. Returns (filename, stacks_failed). `exclude` filters out
+    pre-existing files (orphans) so they aren't mistaken for the new download.
+    """
+    iters = max(1, int(timeout / poll_interval))
+    for _ in range(iters):
+        files = _ingest_ebook_files(exclude=exclude)
         if files:
             return files[0], False
 
-        # Check Stacks status for failure
         try:
             stacks_status = await annas_scraper.get_stacks_status()
             if stacks_status.get("available"):
@@ -311,7 +390,7 @@ async def _wait_for_file_in_ingest_or_stacks_fail(md5: str, timeout: int = 90) -
         except Exception as e:
             logger.warning(f"Failed to check Stacks status during wait: {e}")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(poll_interval)
     return None, False
 
 
@@ -587,6 +666,20 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
     job = _download_jobs[job_id]
     try:
         book_id = None
+        # Sweep orphans (.MISMATCH leftovers, sub-5KB stubs from AA rate-limit
+        # error pages) before queueing — otherwise the wait below could pick
+        # one up and we'd email garbage to a Kindle. See _invalid_ingest_reason.
+        swept = _sweep_ingest_orphans()
+        if swept:
+            logger.warning(f"[{job_id}] Swept {len(swept)} orphan ingest file(s) before queueing: {swept}")
+        # Snapshot pre-existing valid files. Anything matching this set when the
+        # wait functions poll is a leftover from another in-flight job, not
+        # this download's payload — exclude it.
+        try:
+            pre_existing = set(os.listdir(CWA_INGEST_PATH))
+        except OSError:
+            pre_existing = set()
+        job["pre_existing"] = pre_existing
         # Stage: downloading (try Stacks first)
         job["status"] = "downloading"
         job["stage_detail"] = "Sending to Stacks..."
@@ -606,7 +699,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             logger.info(f"[{job_id}] Stacks accepted {md5} (already_downloaded={already_downloaded})")
 
             if already_downloaded:
-                # Check if file is stuck in ingest dir — pick it up and upload via HTTP
+                # Check if file is stuck in ingest dir — pick it up and upload via HTTP.
+                # Don't exclude pre_existing here: "already_downloaded" means this very
+                # md5 was completed previously, so the stuck file *is* the snapshot.
                 stuck_files = _ingest_ebook_files()
                 if stuck_files:
                     logger.info(f"[{job_id}] File stuck in ingest dir, uploading via HTTP: {stuck_files}")
@@ -660,7 +755,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             if job["status"] not in ("downloaded",):
                 job["status"] = "downloading"
                 job["stage_detail"] = "Waiting for download..."
-                appeared, stacks_failed = await _wait_for_file_in_ingest_or_stacks_fail(md5, timeout=180)
+                appeared, stacks_failed = await _wait_for_file_in_ingest_or_stacks_fail(
+                    md5, timeout=180, exclude=pre_existing,
+                )
                 if appeared:
                     job["filename"] = appeared
                     logger.info(f"[{job_id}] File appeared in ingest: {appeared}")
@@ -677,7 +774,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                     return
                 else:
                     # Timeout — but file may have arrived late. Check ingest dir one more time.
-                    late_files = _ingest_ebook_files()
+                    late_files = _ingest_ebook_files(exclude=pre_existing)
                     if late_files:
                         logger.info(f"[{job_id}] File arrived late in ingest dir: {late_files[0]}")
                         job["filename"] = late_files[0]
@@ -695,7 +792,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                             job["stage_detail"] = "Added to Calibre"
                         else:
                             # One final ingest dir check (Stacks download may have just completed)
-                            final_files = _ingest_ebook_files()
+                            final_files = _ingest_ebook_files(exclude=pre_existing)
                             if final_files:
                                 logger.info(f"[{job_id}] File appeared during Calibre wait: {final_files[0]}")
                                 file_path = os.path.join(CWA_INGEST_PATH, final_files[0])
