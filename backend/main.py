@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 import re as _re
+import smtplib
+import socket
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -46,6 +48,20 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "Calibre-Web <calibre-web@viktorbarzin.me>")
+SMTP_MAX_ATTEMPTS = int(os.getenv("SMTP_MAX_ATTEMPTS", "3"))
+SMTP_RETRY_BACKOFF = float(os.getenv("SMTP_RETRY_BACKOFF", "2"))
+SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "60"))
+# Retriable: transient network/server failures (mail.viktorbarzin.me has been
+# observed to accept TCP then close before replying with the SMTP banner).
+# Non-retriable failures (auth, malformed message) propagate immediately.
+_SMTP_RETRIABLE_EXC = (
+    smtplib.SMTPServerDisconnected,
+    smtplib.SMTPConnectError,
+    smtplib.SMTPHeloError,
+    socket.timeout,
+    ConnectionError,
+    TimeoutError,
+)
 
 
 async def _notify_slack(title: str, author: str, content_type: str, source: str = "", kindle: bool = False):
@@ -301,6 +317,32 @@ def _ingest_ebook_files(exclude: set[str] | None = None) -> list[str]:
             continue
         out.append(f)
     return out
+
+
+def _cleanup_unconsumed_ingest_files(job_id: str, pre_existing: set[str]) -> list[str]:
+    """At end-of-job, sweep any ebook files that arrived in the ingest dir during
+    the job but weren't consumed (uploaded + os.removed) by it. Avoids leaking
+    partial downloads or extra files (e.g. when Stacks delivers a duplicate)
+    that would poison subsequent jobs. Files present *before* the job started
+    (`pre_existing`) are left alone — they belong to a different job."""
+    try:
+        cur = set(os.listdir(CWA_INGEST_PATH))
+    except OSError:
+        return []
+    removed = []
+    for f in cur - pre_existing:
+        full = os.path.join(CWA_INGEST_PATH, f)
+        if not os.path.isfile(full):
+            continue
+        if not any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS):
+            continue
+        try:
+            os.remove(full)
+            removed.append(f)
+            logger.warning(f"[{job_id}] Cleaned up unconsumed ingest file: {f}")
+        except OSError as e:
+            logger.warning(f"[{job_id}] Failed to clean unconsumed file {f}: {e}")
+    return removed
 
 
 def _sweep_ingest_orphans() -> list[str]:
@@ -615,24 +657,57 @@ async def _cwa_login(client: httpx.AsyncClient) -> bool:
     return r.status_code == 200
 
 
+def _smtp_send_with_retry(msg, max_attempts: int = SMTP_MAX_ATTEMPTS) -> None:
+    """Send `msg` via SMTP with exponential-backoff retry on transient errors.
+
+    Retries on the errors in `_SMTP_RETRIABLE_EXC` (server disconnects, banner
+    timeouts, ConnectionError). Non-retriable errors (auth failure, malformed
+    message) propagate after the first failure. Raises the last retriable
+    exception if all attempts fail.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+            return
+        except _SMTP_RETRIABLE_EXC as e:
+            last_exc = e
+            logger.warning(
+                f"SMTP attempt {attempt}/{max_attempts} failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            if attempt < max_attempts:
+                time.sleep(SMTP_RETRY_BACKOFF * (2 ** (attempt - 1)))
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | None:
-    """Send book epub to Kindle email. Returns None on success, error string on failure."""
+    """Send book to Kindle email. Returns None on success, error string on failure.
+
+    SMTP send retries up to SMTP_MAX_ATTEMPTS times with exponential backoff —
+    mail.viktorbarzin.me has been observed to drop the connection before banner
+    on intermittent days, so a single 500 should not surface to the user.
+    """
     if not SMTP_USER or not SMTP_PASS:
         return "SMTP credentials not configured"
     try:
         auth = (CALIBRE_WEB_USER, CALIBRE_WEB_PASS) if CALIBRE_WEB_PASS else None
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            # Try epub first, then pdf
-            epub_data = None
-            for fmt in ("epub", "pdf"):
-                r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/{fmt}/", auth=auth)
+            book_data = None
+            fmt = None
+            for try_fmt in ("epub", "pdf"):
+                r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/{try_fmt}/", auth=auth)
                 if r.status_code == 200 and len(r.content) > 100:
-                    epub_data = r.content
+                    book_data = r.content
+                    fmt = try_fmt
                     break
-            if not epub_data:
+            if not book_data:
                 return f"No downloadable format found for book {book_id}"
 
-        import smtplib
         from email.mime.multipart import MIMEMultipart
         from email.mime.application import MIMEApplication
 
@@ -641,18 +716,11 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | 
         msg['To'] = kindle_email
         msg['Subject'] = title
         safe_title = _re.sub(r'[^\w\s-]', '', title).strip()[:100] or "book"
-        ext = "pdf" if fmt == "pdf" else "epub"
-        attachment = MIMEApplication(epub_data, Name=f"{safe_title}.{ext}")
-        attachment['Content-Disposition'] = f'attachment; filename="{safe_title}.{ext}"'
+        attachment = MIMEApplication(book_data, Name=f"{safe_title}.{fmt}")
+        attachment['Content-Disposition'] = f'attachment; filename="{safe_title}.{fmt}"'
         msg.attach(attachment)
 
-        def _smtp_send(msg):
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.send_message(msg)
-
-        await asyncio.get_event_loop().run_in_executor(None, _smtp_send, msg)
+        await asyncio.get_event_loop().run_in_executor(None, _smtp_send_with_retry, msg)
 
         logger.info(f"Sent '{title}' to Kindle ({kindle_email})")
         return None
@@ -664,6 +732,8 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | 
 async def _process_download(job_id: str, md5: str, title: str, author: str, detail):
     """Background task that downloads a book and tracks progress through stages."""
     job = _download_jobs[job_id]
+    # Initialize before the try so the finally clause can always reference it.
+    pre_existing: set[str] = set()
     try:
         book_id = None
         # Sweep orphans (.MISMATCH leftovers, sub-5KB stubs from AA rate-limit
@@ -678,7 +748,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         try:
             pre_existing = set(os.listdir(CWA_INGEST_PATH))
         except OSError:
-            pre_existing = set()
+            pass
         job["pre_existing"] = pre_existing
         # Stage: downloading (try Stacks first)
         job["status"] = "downloading"
@@ -854,22 +924,54 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         job["message"] = f"Unexpected error: {e}"
         job["stage_detail"] = job["message"]
         logger.exception(f"[{job_id}] Download failed for {md5}")
+    finally:
+        # Always sweep stragglers — the upload path os.removes the file it consumed,
+        # so anything still here under our pre_existing diff is a duplicate Stacks
+        # delivery, a partial download, or an unrelated arrival. Leaving it would
+        # poison the next job (this is exactly how the wrong-book-emailed bug
+        # manifested before the snapshot was added).
+        _cleanup_unconsumed_ingest_files(job_id, pre_existing)
+        # Kindle send always runs after download finishes (success OR failure):
+        # the early `return` paths above set status before exiting, so this is
+        # the single point where Kindle delivery happens. Marking the job
+        # `failed` if SMTP exhausts retries makes the iOS Shortcut surface the
+        # error instead of declaring success on a Calibre-only outcome.
+        await _maybe_send_to_kindle(job_id, title)
+        # Schedule TTL cleanup as a fire-and-forget so it survives early returns
+        # too (the previous awaitsleep at function-tail was skipped on early
+        # return paths and leaked job state for ~10 minutes).
+        asyncio.create_task(_ttl_cleanup_job(job_id))
 
-    # Auto-send to Kindle if requested and book was added to Calibre
+
+async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
+    """If the job carried a kindle_email and successfully imported a book, send
+    the file via SMTP (with retry). On exhausted retries, mark the job failed
+    so the caller (iOS Shortcut, integrations) sees a real error instead of a
+    misleading 'Added to Calibre' success."""
+    job = _download_jobs.get(job_id)
+    if not job:
+        return
     kindle_email = job.get("kindle_email")
-    if kindle_email and job.get("book_id") and job["status"] == "done":
-        bid = job["book_id"]
-        if bid > 0:
-            job["stage_detail"] = "Sending to Kindle..."
-            err = await _send_to_kindle(bid, title, kindle_email)
-            if err:
-                job["message"] += f" (Kindle send failed: {err})"
-                job["stage_detail"] = job["message"]
-            else:
-                job["message"] = f"Added to Calibre and sent to {kindle_email}"
-                job["stage_detail"] = job["message"]
+    if not (kindle_email and job.get("book_id") and job.get("status") == "done"):
+        return
+    bid = job["book_id"]
+    if bid <= 0:
+        return
+    job["stage_detail"] = "Sending to Kindle..."
+    err = await _send_to_kindle(bid, title, kindle_email)
+    if err:
+        job["status"] = "failed"
+        job["kindle_error"] = err
+        job["message"] = f"Added to Calibre but failed to send to Kindle after retries: {err}"
+        job["stage_detail"] = job["message"]
+    else:
+        job["message"] = f"Added to Calibre and sent to {kindle_email}"
+        job["stage_detail"] = job["message"]
 
-    # Auto-cleanup after TTL
+
+async def _ttl_cleanup_job(job_id: str) -> None:
+    """Drop the job from the in-memory state after JOB_TTL_SECONDS so /api/download-status
+    eventually 404s and the dict doesn't grow without bound."""
     await asyncio.sleep(JOB_TTL_SECONDS)
     _download_jobs.pop(job_id, None)
 
