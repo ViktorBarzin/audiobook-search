@@ -113,6 +113,21 @@ def _publish_ingest_file(file_data: bytes, filename: str) -> str:
             os.unlink(temp_path)
 
 
+def _prepare_audiobook_save_path(save_path: str) -> None:
+    """Create qBittorrent's destination before a magnet enters the queue.
+
+    The orphan sweeper treats a missing destination as abandoned. Magnet links
+    can spend time fetching metadata before qBittorrent creates that directory,
+    so creating it here closes the race and gives the media user write access.
+    """
+    os.makedirs(save_path, exist_ok=True)
+    try:
+        os.chown(save_path, CWA_UID, CWA_GID)
+        os.chmod(save_path, 0o775)
+    except OSError as e:
+        logger.warning(f"Failed to set audiobook destination permissions on {save_path}: {e}")
+
+
 async def _periodic_fix_ingest_permissions():
     """Fix permissions on files in CWA ingest dir (Stacks writes as root:1000 mode 644)."""
     while True:
@@ -1573,6 +1588,7 @@ async def _download_audiobook(req: DownloadRequest, author: str, title: str):
             logger.warning(f"Audiobookshelf duplicate check failed (proceeding anyway): {e}")
 
     is_mam_torrent = req.magnet_url.startswith("https://www.myanonamouse.net/")
+    _prepare_audiobook_save_path(save_path)
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:

@@ -155,3 +155,12 @@ def test_publish_ingest_file_uses_atomic_rename(ingest, monkeypatch):
     assert destination == str(ingest / "book.epub")
     assert (ingest / "book.epub").read_bytes() == b"complete ebook"
     assert not os.path.exists(observed["source"])
+
+
+def test_prepare_audiobook_save_path_creates_writable_destination(tmp_path):
+    destination = tmp_path / "Ray Dalio" / "How Countries Go Broke"
+
+    bs_main._prepare_audiobook_save_path(str(destination))
+
+    assert destination.is_dir()
+    assert destination.stat().st_mode & 0o700 == 0o700
