@@ -89,6 +89,30 @@ def _chown_for_cwa(path: str):
         logger.warning(f"Failed to set ownership on {path}: {e}")
 
 
+def _publish_ingest_file(file_data: bytes, filename: str) -> str:
+    """Write a complete ebook into the ingest directory atomically.
+
+    CWA watches the NFS directory and may open a recognized ebook extension as
+    soon as it appears. Keep the download under a non-ebook `.part` name, then
+    rename it after the write and permission changes are complete.
+    """
+    os.makedirs(CWA_INGEST_PATH, exist_ok=True)
+    filename = os.path.basename(filename)
+    save_path = os.path.join(CWA_INGEST_PATH, filename)
+    temp_path = os.path.join(CWA_INGEST_PATH, f".{filename}.{uuid.uuid4().hex}.part")
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(file_data)
+            f.flush()
+            os.fsync(f.fileno())
+        _chown_for_cwa(temp_path)
+        os.replace(temp_path, save_path)
+        return save_path
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 async def _periodic_fix_ingest_permissions():
     """Fix permissions on files in CWA ingest dir (Stacks writes as root:1000 mode 644)."""
     while True:
@@ -1417,11 +1441,7 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                         if file_data[:4] == b"%PDF":
                             ext = ".pdf"
                         filename = f"{author} - {title}{ext}"
-                    save_path = os.path.join(CWA_INGEST_PATH, filename)
-                    os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-                    with open(save_path, "wb") as f:
-                        f.write(file_data)
-                    _chown_for_cwa(save_path)
+                    save_path = _publish_ingest_file(file_data, filename)
                     logger.info(f"Ebook saved to CWA ingest: {save_path}")
                     return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
             except Exception as e:
@@ -1469,11 +1489,7 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
                                 ext = ".pdf"
                             filename = f"{author} - {title}{ext}"
 
-                        save_path = os.path.join(CWA_INGEST_PATH, filename)
-                        os.makedirs(CWA_INGEST_PATH, exist_ok=True)
-                        with open(save_path, "wb") as f:
-                            f.write(file_resp.content)
-                        _chown_for_cwa(save_path)
+                        save_path = _publish_ingest_file(file_resp.content, filename)
                         logger.info(f"LibGen ebook saved to CWA ingest: {save_path}")
                         return {"status": "ok", "message": f"Ebook saved → Calibre Library ({filename})"}
                     else:

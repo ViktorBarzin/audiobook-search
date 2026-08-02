@@ -133,3 +133,25 @@ def test_invalid_reason_passes_valid_file(tmp_path):
     p = tmp_path / "x.epub"
     p.write_bytes(b"x" * 100_000)
     assert bs_main._invalid_ingest_reason(p.name, str(p)) is None
+
+
+def test_publish_ingest_file_uses_atomic_rename(ingest, monkeypatch):
+    observed = {}
+    real_replace = os.replace
+
+    def inspect_replace(source, destination):
+        observed["source"] = source
+        observed["destination"] = destination
+        observed["destination_existed"] = os.path.exists(destination)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", inspect_replace)
+
+    destination = bs_main._publish_ingest_file(b"complete ebook", "book.epub")
+
+    assert observed["source"].endswith(".part")
+    assert observed["destination"] == str(ingest / "book.epub")
+    assert observed["destination_existed"] is False
+    assert destination == str(ingest / "book.epub")
+    assert (ingest / "book.epub").read_bytes() == b"complete ebook"
+    assert not os.path.exists(observed["source"])
