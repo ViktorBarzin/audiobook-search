@@ -525,10 +525,11 @@ async def lifespan(app: FastAPI):
     annas_scraper = AnnasArchiveScraper()
     libgen_scraper = LibGenScraper()
     openlib_scraper = OpenLibraryScraper()
-    from backend.mam import MAM_ID
-    if MAM_ID or (MAM_EMAIL and MAM_PASSWORD):
+    from backend.mam import current_mam_id
+    mam_id = current_mam_id()
+    if mam_id or (MAM_EMAIL and MAM_PASSWORD):
         mam_scraper = MAMScraper(MAM_EMAIL, MAM_PASSWORD)
-        logger.info(f"MAM scraper initialized (mam_id={'set' if MAM_ID else 'not set'})")
+        logger.info(f"MAM scraper initialized (mam_id={'set' if mam_id else 'not set'})")
     sync_task = asyncio.create_task(_periodic_sync())
     perm_task = asyncio.create_task(_periodic_fix_ingest_permissions())
     lib_perm_task = asyncio.create_task(_periodic_fix_library_permissions())
@@ -1158,9 +1159,10 @@ async def cover_proxy(url: str = Query(..., description="Cover image URL to prox
 @app.get("/mam-status")
 async def mam_status():
     """Check MAM authentication status."""
-    from backend.mam import MAM_ID, SEEDBOX_URL
-    result = {"mam_id_configured": bool(MAM_ID), "authenticated": False, "ip": None}
-    if not MAM_ID:
+    from backend.mam import current_mam_id, SEEDBOX_URL
+    mam_id = current_mam_id()
+    result = {"mam_id_configured": bool(mam_id), "authenticated": False, "ip": None}
+    if not mam_id:
         result["instructions"] = (
             "MAM_ID env var not set. Go to MAM → Preferences → Security → "
             "create an ASN-locked session with 'allow dynamic seedbox IP' enabled. "
@@ -1169,7 +1171,7 @@ async def mam_status():
         return result
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(SEEDBOX_URL, cookies={"mam_id": MAM_ID})
+            r = await client.get(SEEDBOX_URL, cookies={"mam_id": mam_id})
             data = r.json()
             result["ip"] = data.get("ip")
             result["authenticated"] = data.get("Success", False)
@@ -1190,10 +1192,10 @@ async def stacks_status():
 @app.get("/sources")
 async def get_sources():
     """Get status of all configured search sources."""
-    from backend.mam import MAM_ID
+    from backend.mam import current_mam_id
     sources = {
         "abb": {"name": "AudioBookBay", "type": "audiobook", "available": scraper is not None},
-        "mam": {"name": "MyAnonamouse", "type": "both", "available": mam_scraper is not None and bool(MAM_ID)},
+        "mam": {"name": "MyAnonamouse", "type": "both", "available": mam_scraper is not None and bool(current_mam_id())},
         "annas": {"name": "Anna's Archive", "type": "ebook", "available": annas_scraper is not None},
         "libgen": {"name": "Library Genesis", "type": "ebook", "available": libgen_scraper is not None},
         "openlib": {"name": "Open Library", "type": "ebook", "available": openlib_scraper is not None},

@@ -13,9 +13,23 @@ logger = logging.getLogger(__name__)
 # Generate at MAM → Preferences → Security → create an ASN/IP-locked session
 # with "allow dynamic seedbox IP" enabled. Copy the mam_id value.
 MAM_ID = os.getenv("MAM_ID", "")
+MAM_ID_FILE = os.getenv("MAM_ID_FILE", "")
 
 # MAM dynamic seedbox endpoint (t. subdomain, not www.)
 SEEDBOX_URL = "https://t.myanonamouse.net/json/dynamicSeedbox.php"
+
+
+def current_mam_id() -> str:
+    """Return the farmer's live API cookie, falling back to the Vault value."""
+    if MAM_ID_FILE:
+        try:
+            with open(MAM_ID_FILE) as cookie_file:
+                cookie = cookie_file.read().strip()
+            if cookie:
+                return cookie
+        except OSError as e:
+            logger.warning(f"Could not read MAM_ID_FILE {MAM_ID_FILE}: {e}")
+    return MAM_ID
 
 
 class MAMScraper:
@@ -31,6 +45,7 @@ class MAMScraper:
         self.password = password
         self._logged_in = False
         self._seedbox_activated = False
+        self._active_mam_id = ""
         self.client = httpx.AsyncClient(
             timeout=self.TIMEOUT,
             headers={"User-Agent": self.USER_AGENT},
@@ -39,18 +54,23 @@ class MAMScraper:
 
     async def _login(self):
         """Authenticate with MAM using mam_id API session cookie."""
-        if self._logged_in:
-            return True
-
-        if not MAM_ID:
+        mam_id = current_mam_id()
+        if not mam_id:
             logger.error(
                 "MAM_ID env var not set. Generate an API session at "
                 "MAM → Preferences → Security (ASN/IP-locked, allow dynamic seedbox)."
             )
             return False
 
+        if self._logged_in and mam_id == self._active_mam_id:
+            return True
+        if mam_id != self._active_mam_id:
+            self._logged_in = False
+            self._seedbox_activated = False
+
         # Set the mam_id cookie
-        self.client.cookies.set("mam_id", MAM_ID, domain=".myanonamouse.net")
+        self.client.cookies.set("mam_id", mam_id, domain=".myanonamouse.net")
+        self._active_mam_id = mam_id
 
         # Step 1: Activate dynamic seedbox (register our IP)
         if not self._seedbox_activated:

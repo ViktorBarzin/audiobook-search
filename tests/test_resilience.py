@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from backend import main as bs_main
+from backend import mam as mam_backend
 
 
 def _write(path, content=b"x" * 100_000):
@@ -25,6 +26,22 @@ def _write(path, content=b"x" * 100_000):
 def ingest(tmp_path, monkeypatch):
     monkeypatch.setattr(bs_main, "CWA_INGEST_PATH", str(tmp_path))
     return tmp_path
+
+
+def test_current_mam_id_prefers_rotating_cookie_file(tmp_path, monkeypatch):
+    cookie_file = tmp_path / "mam_id"
+    cookie_file.write_text(" fresh-cookie\n")
+    monkeypatch.setattr(mam_backend, "MAM_ID", "stale-vault-cookie")
+    monkeypatch.setattr(mam_backend, "MAM_ID_FILE", str(cookie_file))
+
+    assert mam_backend.current_mam_id() == "fresh-cookie"
+
+
+def test_current_mam_id_falls_back_to_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr(mam_backend, "MAM_ID", "vault-cookie")
+    monkeypatch.setattr(mam_backend, "MAM_ID_FILE", str(tmp_path / "missing"))
+
+    assert mam_backend.current_mam_id() == "vault-cookie"
 
 
 # ---- SMTP retry ----
