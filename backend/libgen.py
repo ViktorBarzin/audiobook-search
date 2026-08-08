@@ -61,6 +61,90 @@ class LibGenScraper:
         """Check if this is a libgen.li-style mirror (different URL/HTML format)."""
         return "libgen.li" in mirror or "libgen.vg" in mirror
 
+    # ------------------------------------------------------------------ #
+    # Direct download (ads.php -> get.php)                                #
+    # ------------------------------------------------------------------ #
+    # Anna's Archive is no longer usable as a *fetch* route: /slow_download/
+    # serves a challenge FlareSolverr times out on, and /fast_download/ is paid.
+    # libgen.li still serves the file free, but only via a two-step flow — the
+    # ads.php landing page carries a single-use keyed get.php link that must be
+    # fetched with ads.php as the Referer. A plain GET of ads.php yields HTML.
+
+    GET_LINK_RE = re.compile(r'href=["\'](get\.php\?[^"\']*key=[^"\']+)["\']', re.I)
+    FILENAME_RE = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.I)
+
+    @staticmethod
+    def _extract_get_link(html: str) -> str | None:
+        """Pull the keyed `get.php?md5=..&key=..` link out of an ads.php page."""
+        m = LibGenScraper.GET_LINK_RE.search(html or "")
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _filename_from_disposition(header: str | None) -> str | None:
+        """Read the filename out of a Content-Disposition header.
+
+        libgen.li emits a leading space inside the quotes, so strip aggressively.
+        """
+        if not header:
+            return None
+        m = LibGenScraper.FILENAME_RE.search(header)
+        if not m:
+            return None
+        return m.group(1).strip().strip('"').strip() or None
+
+    @staticmethod
+    def _looks_like_ebook(data: bytes | None) -> bool:
+        """Reject challenge/error pages served with a 200.
+
+        Magic-byte matching is not enough: a MOBI begins with the PalmDB name
+        field (arbitrary text), so only the negative check is reliable.
+        """
+        if not data or len(data) < 1024:
+            return False
+        head = data[:64].lstrip().lower()
+        return not (head.startswith(b"<!doctype") or head.startswith(b"<html"))
+
+    async def download_file(self, md5: str) -> tuple[bytes | None, str | None]:
+        """Fetch an ebook by md5 from libgen. Returns (bytes, filename)."""
+        mirror = self._working_mirror or await self._get_mirror()
+        if not mirror or not self._is_li_mirror(mirror):
+            mirror = "https://libgen.li"
+
+        ads_url = f"{mirror}/ads.php?md5={md5}"
+        try:
+            r = await self.client.get(ads_url, timeout=30)
+            r.raise_for_status()
+        except Exception as e:
+            logger.warning(f"LibGen ads page failed for {md5}: {e}")
+            return None, None
+
+        link = self._extract_get_link(r.text)
+        if not link:
+            logger.warning(f"LibGen: no keyed download link on ads page for {md5}")
+            return None, None
+
+        dl_url = f"{mirror}/{link.lstrip('/')}"
+        try:
+            # Referer is load-bearing — libgen.li rejects the keyed URL without it.
+            resp = await self.client.get(dl_url, headers={"Referer": ads_url}, timeout=120)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning(f"LibGen download failed for {md5}: {e}")
+            return None, None
+
+        data = resp.content
+        if not self._looks_like_ebook(data):
+            logger.warning(
+                f"LibGen returned {len(data)} bytes of non-ebook content for {md5}"
+            )
+            return None, None
+
+        filename = self._filename_from_disposition(
+            resp.headers.get("content-disposition")
+        ) or f"{md5}.epub"
+        logger.info(f"LibGen direct download OK: {filename} ({len(data)} bytes)")
+        return data, filename
+
     async def search(self, query: str) -> list[AudiobookResult]:
         """Search LibGen for ebooks."""
         mirror = await self._get_mirror()

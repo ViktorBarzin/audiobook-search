@@ -1464,6 +1464,22 @@ async def _download_ebook(req: DownloadRequest, author: str, title: str):
             except Exception as e:
                 logger.warning(f"Direct download failed: {e}")
 
+        # LibGen direct: AA's md5 IS libgen's md5, so an Anna's-Archive pick can be
+        # fetched from the libgen mirror AA itself links. Preferred over Stacks —
+        # AA's own /slow_download/ now serves a challenge FlareSolverr times out on
+        # and /fast_download/ is paid, so every Stacks attempt since 2026-05-01 has
+        # failed. This path needs no challenge solving.
+        if md5 and libgen_scraper:
+            try:
+                file_data, filename = await libgen_scraper.download_file(md5)
+                if file_data:
+                    save_path = _publish_ingest_file(file_data, filename)
+                    logger.info(f"Ebook saved to CWA ingest via libgen: {save_path}")
+                    return {"status": "ok",
+                            "message": f"Ebook saved → Calibre Library ({filename})"}
+            except Exception as e:
+                logger.warning(f"LibGen direct download failed: {e}")
+
         # Fallback: try Stacks (async queue, file lands in shared NFS)
         if md5 and annas_scraper:
             stacks_result = await annas_scraper.download_via_stacks(md5)
