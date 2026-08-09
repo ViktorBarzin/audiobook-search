@@ -100,6 +100,17 @@ def is_same_book(title_a: str | None, author_a: str | None,
     return False
 
 
+def find_duplicate(title: str, author: str, candidates):
+    """Return the first (title, author) pair naming the same book, or None.
+
+    Used for the Calibre library, whose rows are plain (title, author) tuples.
+    """
+    for cand_title, cand_author in candidates or []:
+        if is_same_book(title, author, cand_title, cand_author):
+            return (cand_title, cand_author)
+    return None
+
+
 def parse_save_path(save_path: str | None) -> tuple[str, str] | None:
     """Split book-search's own '/audiobooks/{author}/{title}' into its parts."""
     if not save_path:

@@ -4,6 +4,7 @@ import logging
 import re as _re
 import smtplib
 import socket
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ from backend.annas import AnnasArchiveScraper
 from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
 from backend.models import AudiobookResult, AudiobookDetail
-from backend.dedupe import find_inflight_duplicate, is_same_book
+from backend.dedupe import find_duplicate, find_inflight_duplicate, is_same_book
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1704,10 +1705,54 @@ async def _find_inflight_audiobook(title: str, author: str) -> dict | None:
         return None
 
 
+def _calibre_library_rows() -> list[tuple[str, str]]:
+    """Read (title, author) for every book in the Calibre library.
+
+    Opened read-only via a URI so a concurrent Calibre-Web write can never be
+    disturbed by this check.
+    """
+    db = os.path.join(CWA_LIBRARY_PATH, "metadata.db")
+    if not os.path.exists(db):
+        return []
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        return list(conn.execute(
+            "SELECT b.title, ("
+            "  SELECT group_concat(a.name, ' & ') FROM authors a"
+            "  JOIN books_authors_link l ON l.author = a.id WHERE l.book = b.id"
+            ") FROM books b"
+        ))
+    finally:
+        conn.close()
+
+
+async def _check_calibre_duplicate(title: str, author: str):
+    """409 if the Calibre library already holds this ebook.
+
+    The library itself was never consulted before — only the ingest folder was
+    scanned by filename substring, which misses whenever the downloaded file is
+    named differently from the requested title (libgen ships
+    "Ray Dalio - Principles - libgen.li.mobi" for "Principles: Life and Work").
+    Best-effort: an unreadable database must not block a download.
+    """
+    try:
+        rows = await asyncio.to_thread(_calibre_library_rows)
+    except Exception as e:
+        logger.warning(f"Calibre duplicate check failed (proceeding anyway): {e}")
+        return
+    hit = find_duplicate(title, author, rows)
+    if hit:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ebook already in Calibre library: '{hit[0]}' by {hit[1]}",
+        )
+
+
 async def _check_cwa_duplicate(title: str, author: str):
     """Check Calibre-Web for duplicate ebooks."""
-    # CWA doesn't have a reliable REST API for search, so we check the ingest folder
-    # for files with similar names
+    await _check_calibre_duplicate(title, author)
+    # Also catch a copy sitting in the ingest queue that Calibre has not
+    # imported yet — the library check above cannot see those.
     try:
         if os.path.exists(CWA_INGEST_PATH):
             for f in os.listdir(CWA_INGEST_PATH):

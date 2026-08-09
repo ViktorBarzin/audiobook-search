@@ -19,6 +19,7 @@ series entries ("Dune: Book One" vs "Dune: Book Two") apart.
 import pytest
 
 from backend.dedupe import (
+    find_duplicate,
     find_inflight_duplicate,
     is_same_book,
     normalize_author,
@@ -152,3 +153,49 @@ def test_inflight_ignores_torrents_without_a_usable_save_path():
 
 def test_inflight_handles_empty_list():
     assert find_inflight_duplicate("Principles", "Ray Dalio", []) is None
+
+
+# --- find_duplicate (Calibre library rows) --------------------------------
+# Ebook downloads previously only scanned the ingest FOLDER by filename
+# substring and never asked Calibre what it already held. libgen names its file
+# "Ray Dalio - Principles - libgen.li.mobi", which does not contain the string
+# "Principles: Life and Work", so the check missed and a second Calibre entry
+# was created (2026-08-08).
+
+CALIBRE_ROWS = [
+    ("Principles: Life and Work", "Ray Dalio"),
+    ("Principles for Success", "Ray Dalio"),
+    ("From Blood and Ash", "Jennifer L. Armentrout"),
+    ("Thinking, Fast and Slow", "Daniel Kahneman"),
+]
+
+
+def test_calibre_duplicate_found_for_bare_main_title():
+    """The exact miss that created the duplicate Calibre entry."""
+    assert find_duplicate("Principles", "Ray Dalio", CALIBRE_ROWS) == \
+        ("Principles: Life and Work", "Ray Dalio")
+
+
+def test_calibre_duplicate_found_despite_punctuation():
+    assert find_duplicate("Thinking Fast and Slow", "Daniel Kahneman",
+                          CALIBRE_ROWS) is not None
+
+
+def test_calibre_distinct_book_by_same_author_not_flagged():
+    assert find_duplicate("Principles for Navigating Big Debt Crises",
+                          "Ray Dalio", CALIBRE_ROWS) is None
+
+
+def test_calibre_new_book_not_flagged():
+    assert find_duplicate("Antifragile", "Nassim Nicholas Taleb",
+                          CALIBRE_ROWS) is None
+
+
+def test_calibre_same_title_other_author_not_flagged():
+    assert find_duplicate("Principles: Life and Work", "Someone Else",
+                          CALIBRE_ROWS) is None
+
+
+def test_calibre_empty_library():
+    assert find_duplicate("Principles", "Ray Dalio", []) is None
+    assert find_duplicate("Principles", "Ray Dalio", None) is None
