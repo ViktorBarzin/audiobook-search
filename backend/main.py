@@ -18,6 +18,7 @@ from backend.annas import AnnasArchiveScraper
 from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
 from backend.models import AudiobookResult, AudiobookDetail
+from backend.dedupe import find_inflight_duplicate, is_same_book
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1592,18 +1593,28 @@ async def _download_audiobook(req: DownloadRequest, author: str, title: str):
                     results = search_resp.json().get("book", [])
                     for item in results:
                         book_data = item.get("libraryItem", {}).get("media", {}).get("metadata", {})
-                        existing_title = book_data.get("title", "").lower()
-                        existing_author = book_data.get("authorName", "").lower()
-                        if title.lower() in existing_title or existing_title in title.lower():
-                            if not author or author == "Unknown Author" or author.lower() in existing_author or existing_author in author.lower():
-                                raise HTTPException(
-                                    status_code=409,
-                                    detail=f"Book already exists in Audiobookshelf: '{book_data.get('title')}' by {book_data.get('authorName')}"
-                                )
+                        if is_same_book(title, author, book_data.get("title"),
+                                        book_data.get("authorName")):
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"Book already exists in Audiobookshelf: '{book_data.get('title')}' by {book_data.get('authorName')}"
+                            )
         except HTTPException:
             raise
         except Exception as e:
             logger.warning(f"Audiobookshelf duplicate check failed (proceeding anyway): {e}")
+
+        # Audiobookshelf only knows about books it has already IMPORTED, so a
+        # copy that is still downloading is invisible to the check above. That
+        # is how two copies of "Principles for Dealing with the Changing World
+        # Order" both landed on 2026-08-08 — they were queued back-to-back.
+        inflight = await _find_inflight_audiobook(title, author)
+        if inflight:
+            raise HTTPException(
+                status_code=409,
+                detail=(f"Already downloading: '{inflight.get('name')}' "
+                        f"({(inflight.get('progress') or 0) * 100:.0f}% complete)"),
+            )
 
     is_mam_torrent = req.magnet_url.startswith("https://www.myanonamouse.net/")
     _prepare_audiobook_save_path(save_path)
@@ -1665,6 +1676,32 @@ async def _download_audiobook(req: DownloadRequest, author: str, title: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to add torrent: {e}")
+
+
+async def _find_inflight_audiobook(title: str, author: str) -> dict | None:
+    """Return a torrent already downloading this book, or None.
+
+    Best-effort: if qBittorrent cannot be reached this returns None rather than
+    blocking the download, matching how the Audiobookshelf check degrades.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            login = await client.post(
+                f"{QBITTORRENT_URL}/api/v2/auth/login",
+                data={"username": QBITTORRENT_USER, "password": QBITTORRENT_PASS},
+            )
+            if login.status_code != 200:
+                logger.warning("In-flight duplicate check: qBittorrent login failed")
+                return None
+            resp = await client.get(
+                f"{QBITTORRENT_URL}/api/v2/torrents/info",
+                params={"category": "audiobooks"},
+            )
+            resp.raise_for_status()
+            return find_inflight_duplicate(title, author, resp.json())
+    except Exception as e:
+        logger.warning(f"In-flight duplicate check failed (proceeding anyway): {e}")
+        return None
 
 
 async def _check_cwa_duplicate(title: str, author: str):
