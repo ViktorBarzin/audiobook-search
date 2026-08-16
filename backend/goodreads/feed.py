@@ -100,12 +100,35 @@ def assert_shelf(xml: str, shelf: str) -> None:
         raise FeedError(f"unexpected shelf in feed: {title!r} (wanted {shelf!r})")
 
 
+async def fetch_all(
+    client: httpx.AsyncClient,
+    user_id: str,
+    shelf: str,
+    per_page: int = 100,
+    max_pages: int = 30,
+) -> list[ShelfItem]:
+    """Walk the whole shelf, newest first.
+
+    Used only for the seeding run: her to-read shelf holds ~576 books and a page
+    returns 100, so recording 'everything already there' means paginating. Normal
+    polling reads page one alone, which already contains anything new.
+    """
+    items: list[ShelfItem] = []
+    for page in range(1, max_pages + 1):
+        result = await fetch_shelf(client, user_id, shelf, per_page=per_page, page=page)
+        items.extend(result.items)
+        if len(result.items) < per_page:
+            break
+    return items
+
+
 async def fetch_shelf(
     client: httpx.AsyncClient,
     user_id: str,
     shelf: str,
     etag: str | None = None,
     per_page: int = 100,
+    page: int = 1,
 ) -> FeedResult:
     """Fetch one page of the shelf, newest first."""
     headers = {"User-Agent": USER_AGENT}
@@ -118,7 +141,7 @@ async def fetch_shelf(
             params={
                 "shelf": shelf,
                 "per_page": str(per_page),
-                "page": "1",
+                "page": str(page),
                 "sort": "date_added",
                 "order": "d",
             },

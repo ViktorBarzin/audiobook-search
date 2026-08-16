@@ -12,7 +12,7 @@ import os
 
 import httpx
 
-from backend.goodreads.feed import FeedError, FeedStatus, fetch_shelf
+from backend.goodreads.feed import FeedError, FeedStatus, fetch_all, fetch_shelf
 from backend.goodreads.store import MemorySeenStore, PostgresSeenStore
 from backend.goodreads.sync import DELAY_BETWEEN_BOOKS_S, GoodreadsSync
 from backend.libgen import LibGenScraper
@@ -92,6 +92,17 @@ async def poll_forever() -> None:
             downloads_enabled=DOWNLOADS_ENABLED,
             delay_s=DELAY_BETWEEN_BOOKS_S,
         )
+
+        # Seeding reads the whole shelf, not just the newest page: everything
+        # already there is history, and recording only the first 100 would leave
+        # the older tail looking new later.
+        if store.is_empty():
+            try:
+                everything = await fetch_all(client, GOODREADS_USER_ID, GOODREADS_SHELF)
+                seeded = await sync.process(everything)
+                logger.info("Seeded %d existing shelf items", seeded.seeded)
+            except Exception as exc:
+                logger.exception("Seeding failed; will retry on the next cycle: %s", exc)
 
         while True:
             try:

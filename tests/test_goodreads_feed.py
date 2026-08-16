@@ -127,3 +127,47 @@ async def test_http_error_raises_feed_error():
     async with make_client(handler) as client:
         with pytest.raises(FeedError):
             await fetch_shelf(client, "33074940", "to-read")
+
+
+# --------------------------------------------------------------------------- #
+# Seeding needs the whole shelf, not just the newest page                      #
+#                                                                              #
+# Her to-read shelf holds 576 books and a page returns 100. The first run must  #
+# record every one of them as already-handled, or the older tail would look     #
+# new the moment anything reshuffles it.                                       #
+# --------------------------------------------------------------------------- #
+
+async def test_fetch_all_pages_walks_until_a_short_page():
+    from backend.goodreads.feed import fetch_all
+
+    pages = {
+        "1": [dict(ONE_ITEM[0], book_id=str(i)) for i in range(100)],
+        "2": [dict(ONE_ITEM[0], book_id=str(100 + i)) for i in range(100)],
+        "3": [dict(ONE_ITEM[0], book_id=str(200 + i)) for i in range(37)],
+    }
+    seen_pages = []
+
+    def handler(request):
+        page = request.url.params.get("page", "1")
+        seen_pages.append(page)
+        return httpx.Response(200, text=build_feed(pages[page]))
+
+    async with make_client(handler) as client:
+        items = await fetch_all(client, "33074940", "to-read")
+
+    assert len(items) == 237
+    assert seen_pages == ["1", "2", "3"], "stops at the first short page"
+    assert len({i.book_id for i in items}) == 237
+
+
+async def test_fetch_all_stops_on_an_empty_page():
+    def handler(request):
+        page = request.url.params.get("page", "1")
+        return httpx.Response(200, text=build_feed(ONE_ITEM if page == "1" else []))
+
+    from backend.goodreads.feed import fetch_all
+
+    async with make_client(handler) as client:
+        items = await fetch_all(client, "33074940", "to-read")
+
+    assert len(items) == 1
