@@ -318,6 +318,30 @@ Worth remembering as a method point: the first explanation fitted the evidence t
 (CWA does rewrite the file, and does log the duplicate) and was still wrong. Counting the
 requests settled it.
 
+**Deferred work needed a way to resume.** Books are only re-examined on a cycle that
+returns 200, and an unchanged shelf answers 304 indefinitely — so a book left pending by
+an interrupted download, or claimed by a poller that died, was never reconsidered until
+she next added something. The shelf is now fetched unconditionally every fifteen minutes.
+Verified live: a row stranded `in_flight` by a killed poller resumed on its own and was
+recorded `owned` once the duplicate check recognised the book had already arrived.
+
+**Anna's Archive is wired in as a second source, and contributes nothing today.** Its
+domains come from Wikipedia and are probed before use; all of them answer 403 behind
+DDoS-Guard, from this network and through the UK VPN exit alike, so the source reports
+itself unavailable at the cost of one cached probe a day and starts contributing by
+itself if that lifts. Two limits are worth keeping in view: an unreachable source is
+reported as an outage rather than an empty result, so it can never cost a book its single
+attempt; and AA is a *discovery* source only, because the one working fetch route is
+libgen's keyed link by md5 — a book AA lists and libgen does not hold still cannot be
+downloaded.
+
+**Measured latency**, from a clean single-poller run (Middlemarch, 768 KB epub): claimed
+at 3s, in Calibre at 40s, on her shelf at 43s. The stages are feed fetch 0.8s, ISBN
+lookup 0.8s, title search 1.7s, download ~20s, upload and import ~17s, id resolution and
+shelving ~4s. Detection adds 0–120s depending on where in the poll cycle she adds the
+book, so **the wishlist-to-shelf time is typically one to two minutes**, and longer for
+large files.
+
 **Measured hit rate is 42%, not the 76% the naive matcher suggested.** That first
 number counted matches a strict matcher correctly refuses. Of 50 recent shelf items:
 21 download, 20 are absent from LibGen, 8 have no confident match, 1 is an unpublished
