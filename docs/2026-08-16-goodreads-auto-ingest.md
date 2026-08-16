@@ -325,27 +325,22 @@ she next added something. The shelf is now fetched unconditionally every fifteen
 Verified live: a row stranded `in_flight` by a killed poller resumed on its own and was
 recorded `owned` once the duplicate check recognised the book had already arrived.
 
-**Anna's Archive is usable after all, through the shared cluster browser.** It refuses
-every client we can send at it: `httpx` directly, `httpx` replaying a human-solved
-session's own cookies with a matching Chrome user-agent, FlareSolverr, the UK VPN exit,
-and Playwright-driven Chrome — all 403, all from the same home address that works fine in
-a person's browser. The check is on how the connection is made, not who makes it.
+**Anna's Archive can be searched, but not unattended — so it is out of the automatic
+path.** It refuses every client we can send at it: `httpx` directly, `httpx` replaying a
+human-solved session's own cookies with a matching Chrome user-agent, FlareSolverr, the UK
+VPN exit, and Playwright-driven Chrome — all 403, all from the same home address that
+works fine in a person's browser. The check is on how the connection is made, not who
+makes it. Only the shared headful Chrome gets through, and only after a human passes its
+hCaptcha there; that session then lapses after about twenty minutes, for an
+already-open tab and a fresh one alike.
 
-What does work is the shared headful Chrome once a human has passed its hCaptcha: after
-that, plain CDP navigation to `/search` returns real results. AA search now runs there, in
-a tab of its own that is closed afterwards, which needed the `ebooks` namespace labelled
-as a `chrome-service` client to pass that browser's network policy.
-
-Two properties shape how it is used. The session lasts about twenty minutes before AA
-asks for the check again, and the browser is shared with other work — so AA is a
-**fallback**, consulted only for books libgen could not confidently match, which is
-exactly where it helps. And a lapsed session is reported as an outage rather than an empty
-result, so it can never be mistaken for "this book does not exist".
-
-The coverage gain is real: *The Tokyo Zodiac Murders* is absent from libgen's own search,
-is found this way, and its md5 downloads from libgen's `get.php` (2,103,638 bytes) — that
-endpoint serves files libgen does not index, so AA discovery genuinely widens what we can
-fetch.
+The coverage it would add is real — *The Tokyo Zodiac Murders* is absent from libgen's own
+search, is found this way, and its md5 downloads from libgen's `get.php` (2,103,638
+bytes), which serves files libgen does not index. But a source that is available only in
+the minutes after someone solves a captcha would be unavailable on nearly every cycle, so
+the pipeline runs on libgen alone (Viktor's call, 2026-08-16). `backend/goodreads/
+annas_source.py` and its tests remain for ad-hoc lookups, and re-enabling it is one
+argument: `GoodreadsSync(..., fallback_source=AnnasSource())`.
 
 **Measured latency**, from a clean single-poller run (Middlemarch, 768 KB epub): claimed
 at 3s, in Calibre at 40s, on her shelf at 43s. The stages are feed fetch 0.8s, ISBN
