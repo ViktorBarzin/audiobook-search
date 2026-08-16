@@ -305,10 +305,18 @@ deployed path for real, and it was worth doing:
   poller — same image, its own deployment — would have kept running whatever code it
   started with. It now rolls both.
 
-**One behaviour to keep an eye on, which is CWA's own:** a single upload can produce two
-library records when CWA's ingest-processor rewrites the file with its epub-fixer and adds
-the result again. It happened for one of three test books, and CWA detects and logs the
-duplicate itself. The shelf still receives exactly one copy.
+**A book landed in Calibre twice, and the cause was ours.** The first reading of it
+blamed Calibre-Web's ingest-processor for re-adding the file after its epub-fixer rewrote
+it. The logs say otherwise: three requests to the ingest endpoint arrived from three
+different poller pods, two of which downloaded and uploaded the same book. A book was
+only recorded once its download and import had finished — a couple of minutes, given the
+id lookup — so a restarted or freshly deployed poller saw no record and started again.
+Books are now claimed before any work begins; an abandoned claim frees itself after
+fifteen minutes, and a validation run returns its claim immediately.
+
+Worth remembering as a method point: the first explanation fitted the evidence to hand
+(CWA does rewrite the file, and does log the duplicate) and was still wrong. Counting the
+requests settled it.
 
 **Measured hit rate is 42%, not the 76% the naive matcher suggested.** That first
 number counted matches a strict matcher correctly refuses. Of 50 recent shelf items:
