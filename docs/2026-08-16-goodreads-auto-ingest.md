@@ -285,6 +285,31 @@ after ~60s: a 24 MB epub imported correctly as book 497 but returned id `-1`, wh
 would have left it in the shared library and off her shelf. The id is now also read
 from the Calibre database, which knows it as soon as the import commits.
 
+**The end-to-end test found three more faults the unit tests could not.** Simulating a
+fresh addition (by clearing a book's row so the poller treats it as new) exercised the
+deployed path for real, and it was worth doing:
+
+- **The wrong book reached her shelf.** *Neuromancer* downloaded and imported correctly
+  as book 498, but the step that works out *which* book just arrived does a fuzzy search
+  whose fallback is a single word. It searched "Gibson", matched a CISSP study guide
+  co-authored by a different Gibson, and shelved that instead. The library is now asked
+  directly, matching title **and** author; if it cannot say confidently which book
+  arrived, nothing is shelved and the pipeline says so.
+- **An interrupted download wrote a book off permanently.** LibGen closed the connection
+  partway through a file (788,696 of 1,176,897 bytes) and the book was recorded as a
+  terminal error — the same mistake as treating a timeout as absence. Downloads now retry
+  (restarting from the landing page, since the link it hands out is single-use), and
+  infrastructure failures defer the book to a later cycle, bounded at three rounds so a
+  genuinely broken file stops being requested.
+- **The poller was not being deployed.** The deploy step only rolled `book-search`, so the
+  poller — same image, its own deployment — would have kept running whatever code it
+  started with. It now rolls both.
+
+**One behaviour to keep an eye on, which is CWA's own:** a single upload can produce two
+library records when CWA's ingest-processor rewrites the file with its epub-fixer and adds
+the result again. It happened for one of three test books, and CWA detects and logs the
+duplicate itself. The shelf still receives exactly one copy.
+
 **Measured hit rate is 42%, not the 76% the naive matcher suggested.** That first
 number counted matches a strict matcher correctly refuses. Of 50 recent shelf items:
 21 download, 20 are absent from LibGen, 8 have no confident match, 1 is an unpublished
