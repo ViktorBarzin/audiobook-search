@@ -1207,6 +1207,18 @@ async def goodreads_ingest(request: Request):
     if not book_id:
         raise HTTPException(status_code=502, detail="Calibre upload failed")
 
+    # -1 means "uploaded, but OPDS didn't surface an id in time". Give the import
+    # a little longer and ask the library database instead, otherwise the book
+    # lands in Calibre but never reaches her shelf.
+    if book_id < 0:
+        for _ in range(12):  # ~2 minutes
+            await asyncio.sleep(10)
+            found = _calibre_id_for(title, author)
+            if found:
+                book_id = found
+                logger.info(f"Resolved Calibre id {book_id} for {title!r} from the library")
+                break
+
     shelf_error = None
     if shelf_id and book_id > 0:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -1825,6 +1837,39 @@ def _calibre_library_rows() -> list[tuple[str, str]]:
         ))
     finally:
         conn.close()
+
+
+def _calibre_id_for(title: str, author: str) -> int | None:
+    """Find a book's Calibre id by title, newest first.
+
+    _upload_to_calibre polls OPDS for the id and gives up after ~60s, returning
+    -1. A large file can still be importing at that point — a 24 MB epub did
+    exactly this on 2026-08-16 — and without an id the book cannot be put on a
+    shelf. The library database knows the answer as soon as Calibre commits it,
+    so it is consulted directly as a second opinion.
+    """
+    db = os.path.join(CWA_LIBRARY_PATH, "metadata.db")
+    if not os.path.exists(db):
+        return None
+
+    # Goodreads carries series suffixes that Calibre's title does not.
+    wanted = _re.sub(r"\s*\([^)]*\)\s*$", "", title or "").strip().lower()
+    if not wanted:
+        return None
+
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = conn.execute(
+            "SELECT id, title FROM books WHERE lower(title) = ? ORDER BY timestamp DESC, id DESC",
+            (wanted,),
+        ).fetchall()
+    except sqlite3.Error as e:
+        logger.warning(f"Calibre id lookup failed for {title!r}: {e}")
+        return None
+    finally:
+        conn.close()
+
+    return rows[0][0] if rows else None
 
 
 async def _check_calibre_duplicate(title: str, author: str):
