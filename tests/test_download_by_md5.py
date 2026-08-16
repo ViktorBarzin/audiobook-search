@@ -89,3 +89,61 @@ async def test_the_job_finishes_rather_than_sitting_on_downloading(monkeypatch):
 
     assert job["status"] == "done", f"job ended as {job['status']!r}"
     assert job.get("book_id") == 505
+
+
+async def test_libgen_is_tried_before_stacks(monkeypatch):
+    """Stacks accepts an md5 and then never delivers, because it fetches from AA
+    — which is blocked. Trying it first left the job hanging on a route that
+    cannot work while libgen had the file all along."""
+    order = []
+    libgen = FakeLibgen()
+
+    class Stacks:
+        async def download_via_stacks(self, md5):
+            order.append("stacks")
+            return {"success": True, "message": "queued"}
+
+    class Watched(FakeLibgen):
+        async def download_file(self, md5):
+            order.append("libgen")
+            return await FakeLibgen.download_file(self, md5)
+
+    async def fake_upload(data, filename):
+        return 506
+
+    async def no_kindle(*a, **k):
+        return None
+
+    monkeypatch.setattr(bs_main, "libgen_scraper", Watched())
+    monkeypatch.setattr(bs_main, "annas_scraper", Stacks())
+    monkeypatch.setattr(bs_main, "_upload_to_calibre", fake_upload)
+    monkeypatch.setattr(bs_main, "_maybe_send_to_kindle", no_kindle)
+
+    job = {"status": "queued", "md5": "e" * 32, "message": "", "kindle_email": None}
+    bs_main._download_jobs["j10"] = job
+    await bs_main._process_download("j10", "e" * 32, "Unknown", "Unknown Author", None)
+
+    assert order and order[0] == "libgen", f"order was {order}"
+    assert job["status"] == "done"
+    assert job.get("book_id") == 506
+
+
+async def test_the_endpoint_does_not_wait_on_annas_archive(monkeypatch):
+    """Sharing a link from a phone should feel instant.
+
+    The endpoint asked Anna's Archive for the title first; AA is blocked, so it
+    burned a 60s FlareSolverr timeout before the job even started. Metadata is a
+    nicety here — Calibre reads the real title out of the file.
+    """
+    import asyncio as _asyncio
+
+    class SlowAA:
+        async def get_detail(self, md5):
+            await _asyncio.sleep(30)
+            return None
+
+    monkeypatch.setattr(bs_main, "annas_scraper", SlowAA())
+    monkeypatch.setattr(bs_main, "ANNAS_DETAIL_TIMEOUT", 0.2)
+
+    detail = await bs_main._detail_best_effort("a" * 32)
+    assert detail is None

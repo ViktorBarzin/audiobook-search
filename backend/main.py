@@ -48,6 +48,12 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 # Calibre-web shelf that Goodreads-sourced books are added to (0 = don't shelve).
 GOODREADS_SHELF_ID = int(os.getenv("GOODREADS_SHELF_ID", "0") or 0)
 
+# How long to spend asking Anna's Archive for a book's title before giving up.
+# AA is blocked from here, so that lookup burns a FlareSolverr timeout and
+# returns nothing; the download only needs the md5, and Calibre reads the real
+# metadata out of the file itself.
+ANNAS_DETAIL_TIMEOUT = float(os.getenv("ANNAS_DETAIL_TIMEOUT", "8"))
+
 # SMTP config for Send-to-Kindle
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.viktorbarzin.me")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -821,8 +827,19 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         except OSError:
             pass
         job["pre_existing"] = pre_existing
-        # Stage: downloading (try Stacks first)
+        # Stage: downloading. Try the keyed libgen fetch FIRST — it is the route
+        # that actually works. Stacks pulls from Anna's Archive, which is blocked
+        # here, and it ACCEPTS an md5 before failing to deliver, so leading with
+        # it left jobs waiting on a path that could never finish while libgen had
+        # the file all along.
         job["status"] = "downloading"
+        job["stage_detail"] = "Fetching from libgen..."
+        if await _try_direct_download(job_id, job, md5, title, author, detail):
+            job["status"] = "done"
+            job["message"] = "Added to Calibre"
+            await _maybe_send_to_kindle(job_id, title)
+            return
+
         job["stage_detail"] = "Sending to Stacks..."
         stacks_result = await annas_scraper.download_via_stacks(md5)
         stacks_ok = stacks_result.get("success")
@@ -1053,6 +1070,23 @@ async def _ttl_cleanup_job(job_id: str) -> None:
     _download_jobs.pop(job_id, None)
 
 
+async def _detail_best_effort(md5: str):
+    """Anna's Archive metadata if it is quick, otherwise nothing.
+
+    Never let it hold up the download: sharing a link should feel instant, and
+    the md5 alone is enough to fetch the book.
+    """
+    if not annas_scraper:
+        return None
+    try:
+        return await asyncio.wait_for(
+            annas_scraper.get_detail(md5), timeout=ANNAS_DETAIL_TIMEOUT,
+        )
+    except Exception as e:
+        logger.info(f"Skipping Anna's Archive metadata for {md5}: {type(e).__name__}")
+        return None
+
+
 @app.post("/api/download-url")
 async def download_url(request: Request):
     """iOS Shortcut endpoint - accept an AA URL, kick off async download, return job_id."""
@@ -1099,7 +1133,7 @@ async def download_url(request: Request):
     if not annas_scraper:
         raise HTTPException(status_code=503, detail="Anna's Archive scraper not available")
 
-    detail = await annas_scraper.get_detail(md5)
+    detail = await _detail_best_effort(md5)
     title = detail.title if detail else "Unknown"
     author = detail.author if detail else "Unknown Author"
 
