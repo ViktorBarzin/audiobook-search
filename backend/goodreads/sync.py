@@ -36,6 +36,13 @@ _REASON_TO_OUTCOME = {
 DELAY_BETWEEN_BOOKS_S = 2.0
 MAX_PER_CYCLE = 10
 
+# How many times a transient failure (a source outage, a truncated download, a
+# failed import) may defer a book before we stop trying. The one-attempt rule is
+# about books that are not out there; infrastructure hiccups are not that, but
+# they still must not retry forever — libgen closed a connection mid-download on
+# 2026-08-16 and an unbounded retry would have hammered it every two minutes.
+MAX_ATTEMPTS = 3
+
 
 def search_queries(item: ShelfItem) -> list[str]:
     """Queries to try, most selective first.
@@ -102,20 +109,37 @@ class GoodreadsSync:
         for item in fresh[: self.max_per_cycle]:
             try:
                 await self._process_one(item, result)
-            except SourceUnavailable as exc:
-                # Deliberately not recorded: the book still has its one attempt,
-                # and the next cycle will take it once the source is reachable.
-                logger.warning("Source unavailable while handling %r: %s", item.title, exc)
-                result.deferred += 1
-            except Exception as exc:
-                logger.exception("Failed processing %s", item.title)
-                self.store.record(item, Outcome.ERROR, reason=str(exc)[:300])
-                result.errors += 1
-                await self._say(result, f"⚠️ *{item.title}* — ingest failed: {exc}")
+            except (SourceUnavailable, Exception) as exc:
+                # Neither a source outage nor a failed download means "this book
+                # does not exist", so it keeps its claim on being fetched — but
+                # only for a bounded number of cycles.
+                if not isinstance(exc, SourceUnavailable):
+                    logger.exception("Failed processing %s", item.title)
+                await self._defer_or_give_up(item, exc, result)
             if self.delay_s:
                 await asyncio.sleep(self.delay_s)
 
         return result
+
+    async def _defer_or_give_up(self, item: ShelfItem, exc: Exception,
+                                result: CycleResult) -> None:
+        reason = f"{type(exc).__name__}: {exc}"[:300]
+        attempts = self.store.defer(item, reason)
+
+        if attempts < MAX_ATTEMPTS:
+            logger.warning(
+                "Deferring %r after attempt %d/%d: %s",
+                item.title, attempts, MAX_ATTEMPTS, reason,
+            )
+            result.deferred += 1
+            return
+
+        self.store.record(item, Outcome.ERROR, reason=reason)
+        result.errors += 1
+        await self._say(
+            result,
+            f"⚠️ *{item.title}* — {item.author}: gave up after {attempts} attempts ({exc})",
+        )
 
     async def _process_one(self, item: ShelfItem, result: CycleResult) -> None:
         candidates, isbn_md5s = await self._gather_candidates(item)

@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 class Outcome(str, Enum):
     SEEDED = "seeded"            # present at first run; deliberately not fetched
+    PENDING = "pending"          # a transient failure; still owed an attempt
     DOWNLOADED = "downloaded"
     OWNED = "owned"              # already in the Calibre library
     NOT_FOUND = "not_found"      # no source had it
@@ -35,8 +36,10 @@ CREATE TABLE IF NOT EXISTS goodreads_seen (
     reason       TEXT,
     md5          TEXT,
     calibre_id   INTEGER,
+    attempts     INTEGER NOT NULL DEFAULT 0,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE goodreads_seen ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS goodreads_seen_outcome_idx ON goodreads_seen (outcome);
 """
 
@@ -54,7 +57,20 @@ class MemorySeenStore:
         return not self._rows
 
     def known_ids(self) -> set[str]:
-        return set(self._rows)
+        """Books needing no further work. A pending row is deliberately absent."""
+        return {k for k, v in self._rows.items() if v["outcome"] != Outcome.PENDING.value}
+
+    def attempts_for(self, book_id: str) -> int:
+        row = self._rows.get(book_id)
+        return row.get("attempts", 0) if row else 0
+
+    def defer(self, item, reason: str) -> int:
+        """Record a transient failure and return how many attempts have now been made."""
+        row = self._rows.setdefault(item.book_id, {"attempts": 0})
+        row.update({"outcome": Outcome.PENDING.value, "title": item.title,
+                    "author": item.author, "isbn": item.isbn, "reason": reason})
+        row["attempts"] = row.get("attempts", 0) + 1
+        return row["attempts"]
 
     def outcome(self, book_id: str) -> Outcome | None:
         row = self._rows.get(book_id)
@@ -71,9 +87,11 @@ class MemorySeenStore:
         return len(self._rows)
 
     def record(self, item, outcome: Outcome, reason=None, md5=None, calibre_id=None) -> None:
+        attempts = self._rows.get(item.book_id, {}).get("attempts", 0)
         self._rows[item.book_id] = {
             "outcome": outcome.value, "title": item.title, "author": item.author,
             "isbn": item.isbn, "reason": reason, "md5": md5, "calibre_id": calibre_id,
+            "attempts": attempts,
         }
 
 
@@ -101,9 +119,35 @@ class PostgresSeenStore:
             return cur.fetchone() is None
 
     def known_ids(self) -> set[str]:
+        """Books needing no further work. A pending row is deliberately absent."""
         with self._connection().cursor() as cur:
-            cur.execute("SELECT book_id FROM goodreads_seen")
+            cur.execute("SELECT book_id FROM goodreads_seen WHERE outcome <> %s",
+                        (Outcome.PENDING.value,))
             return {row[0] for row in cur.fetchall()}
+
+    def attempts_for(self, book_id: str) -> int:
+        with self._connection().cursor() as cur:
+            cur.execute("SELECT attempts FROM goodreads_seen WHERE book_id = %s", (book_id,))
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+    def defer(self, item, reason: str) -> int:
+        """Record a transient failure and return how many attempts have now been made."""
+        with self._connection().cursor() as cur:
+            cur.execute(
+                """INSERT INTO goodreads_seen
+                       (book_id, title, author, isbn, added_at, outcome, reason, attempts)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                   ON CONFLICT (book_id) DO UPDATE SET
+                       outcome = EXCLUDED.outcome,
+                       reason = EXCLUDED.reason,
+                       attempts = goodreads_seen.attempts + 1,
+                       processed_at = now()
+                   RETURNING attempts""",
+                (item.book_id, item.title, item.author, item.isbn, item.added_at,
+                 Outcome.PENDING.value, reason),
+            )
+            return cur.fetchone()[0]
 
     def outcome(self, book_id: str) -> Outcome | None:
         with self._connection().cursor() as cur:

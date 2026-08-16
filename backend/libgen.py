@@ -124,8 +124,29 @@ class LibGenScraper:
         head = data[:64].lstrip().lower()
         return not (head.startswith(b"<!doctype") or head.startswith(b"<html"))
 
+    DOWNLOAD_ATTEMPTS = 3
+
     async def download_file(self, md5: str) -> tuple[bytes | None, str | None]:
-        """Fetch an ebook by md5 from libgen. Returns (bytes, filename)."""
+        """Fetch an ebook by md5 from libgen. Returns (bytes, filename).
+
+        Retries a dropped transfer: libgen has closed the connection partway
+        through a file (788,696 of 1,176,897 bytes on 2026-08-16), and one blip
+        should not fail an ingest. The keyed get.php link is single-use, so each
+        attempt starts again from ads.php.
+        """
+        for attempt in range(1, self.DOWNLOAD_ATTEMPTS + 1):
+            data, filename = await self._download_once(md5)
+            if data:
+                return data, filename
+            if attempt < self.DOWNLOAD_ATTEMPTS:
+                logger.info(
+                    "Retrying libgen download for %s (attempt %d/%d)",
+                    md5, attempt + 1, self.DOWNLOAD_ATTEMPTS,
+                )
+                await asyncio.sleep(2 * attempt)
+        return None, None
+
+    async def _download_once(self, md5: str) -> tuple[bytes | None, str | None]:
         mirror = self._working_mirror or await self._get_mirror()
         if not mirror or not self._is_li_mirror(mirror):
             mirror = "https://libgen.li"

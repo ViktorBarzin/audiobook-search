@@ -203,7 +203,8 @@ async def test_reports_success_and_miss_once_each():
     assert any("May We Feed the King" in m for m in notifier.messages)
 
 
-async def test_ingest_failure_is_recorded_and_reported():
+async def test_first_ingest_failure_defers_quietly():
+    """A one-off failure is not news, and must not spend the book's attempt."""
     store = MemorySeenStore()
     store.mark_seeded(["0"])
     item = shelf_item("41")
@@ -217,8 +218,9 @@ async def test_ingest_failure_is_recorded_and_reported():
     )
     await sync.process([item])
 
-    assert sync.store.outcome("41") == Outcome.ERROR
-    assert any("503" in m for m in notifier.messages)
+    assert sync.store.outcome("41") != Outcome.ERROR
+    assert "41" not in sync.store.known_ids()
+    assert notifier.messages == [], "no Slack line until we actually give up"
 
 
 # --------------------------------------------------------------------------- #
@@ -259,9 +261,64 @@ async def test_source_outage_does_not_consume_the_attempt():
                          notify=FakeNotifier(), downloads_enabled=True)
 
     await sync.process([item])
-    assert sync.store.outcome("51") is None, "an outage must leave the book unhandled"
+    assert sync.store.outcome("51") != Outcome.NOT_FOUND, "an outage is not an absence"
+    assert "51" not in sync.store.known_ids(), "the book must stay retryable"
     assert ingest.calls == []
 
     source.fail = False
     await sync.process([item])
     assert sync.store.outcome("51") == Outcome.DOWNLOADED, "retried once the source is back"
+
+
+# --------------------------------------------------------------------------- #
+# Transient ingest failures are retried, but not forever                       #
+#                                                                              #
+# Live 2026-08-16: libgen closed the connection mid-download (788696 of 1176897 #
+# bytes). The book was recorded as a terminal error and so was abandoned for    #
+# good — the same mistake as treating a search timeout as "not out there".      #
+# Infrastructure failures now defer and are retried a bounded number of times.  #
+# --------------------------------------------------------------------------- #
+
+class FlakyIngest(FakeIngest):
+    def __init__(self, fail_times):
+        super().__init__()
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    async def __call__(self, **kwargs):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise RuntimeError("HTTP 502: download failed")
+        return dict(self.result)
+
+
+async def test_a_failed_download_is_retried_on_the_next_cycle():
+    store = MemorySeenStore()
+    store.mark_seeded(["0"])
+    item = shelf_item("61")
+    ingest = FlakyIngest(fail_times=1)
+    sync, *_ = build([item], [candidate()], store=store, ingest=ingest)
+
+    await sync.process([item])
+    assert sync.store.outcome("61") != Outcome.DOWNLOADED
+    assert "61" not in sync.store.known_ids(), "a deferred book must stay retryable"
+
+    await sync.process([item])
+    assert sync.store.outcome("61") == Outcome.DOWNLOADED
+    assert ingest.attempts == 2
+
+
+async def test_repeated_failures_eventually_give_up():
+    store = MemorySeenStore()
+    store.mark_seeded(["0"])
+    item = shelf_item("62")
+    ingest = FlakyIngest(fail_times=99)
+    sync, _, _, notifier, _ = build([item], [candidate()], store=store, ingest=ingest)
+
+    for _ in range(6):
+        await sync.process([item])
+
+    assert sync.store.outcome("62") == Outcome.ERROR
+    assert "62" in sync.store.known_ids(), "a book we gave up on must not be retried"
+    assert ingest.attempts <= 4, "must stop hammering the source"
+    assert any("62" in m or "Strange Houses" in m for m in notifier.messages)
