@@ -1,70 +1,150 @@
-"""Anna's Archive as a discovery source for the pipeline.
+"""Anna's Archive, searched through the cluster's headful Chrome.
 
-AA indexes more than libgen does, so it is worth asking. Two limits are worth
-stating plainly:
+AA sits behind DDoS-Guard, which refuses our HTTP clients outright. Measured
+2026-08-16, all from the same home IP that works fine in a human's browser:
 
-- **It is unreachable from this network.** Every AA domain answers 403 behind
-  DDoS-Guard, direct and through the UK VPN exit alike (re-checked 2026-08-16).
-  This source therefore contributes nothing today; it is wired so that it starts
-  contributing by itself if that changes, and costs one cached probe meanwhile.
-- **Discovery only.** The pipeline's single working fetch route is libgen's
-  keyed `ads.php` → `get.php` by md5, so an AA record that libgen does not also
-  hold cannot be downloaded: AA's own `slow_download` is challenge-gated and
-  `fast_download` is paid. AA therefore helps for books libgen has but our
-  libgen *search* missed, not for books libgen lacks.
+- `httpx` direct → 403, even replaying a human-solved session's `__ddg2_`
+  cookies with a matching Chrome user-agent, so the check is on the TLS/HTTP
+  fingerprint rather than the session.
+- FlareSolverr → solves Cloudflare, not DDoS-Guard.
+- NordVPN UK egress → no change.
+- Playwright-driven Chrome → challenged, even in the browser holding the solved
+  session.
+
+What does work is the shared cluster Chrome (`chrome-service`) once a human has
+passed the captcha in it: after that, plain CDP navigation to `/search` returns
+real results. So this source drives that browser, in its own tab, and treats a
+lapsed session as an outage rather than an empty result — an empty list would
+read as "this book does not exist" and spend the book's single attempt.
+
+The session is human-maintained: when DDoS-Guard next challenges, AA quietly
+drops out until someone solves it again, and the pipeline runs on libgen alone.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
 import re
+import urllib.request
 
-import httpx
-from bs4 import BeautifulSoup
-
-from backend.goodreads.aa_domains import working_domain
 from backend.goodreads.isbn import to_isbn13
 from backend.goodreads.matcher import Candidate
-from backend.goodreads.sources import SourceUnavailable, parse_size_bytes
+from backend.goodreads.sources import SourceUnavailable
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+CDP_URL = os.getenv("CHROME_CDP_URL", "http://chrome-service.chrome-service.svc.cluster.local:9222")
+AA_DOMAIN = os.getenv("ANNAS_SEARCH_DOMAIN", "annas-archive.pk")
+PAGE_SETTLE_SECONDS = float(os.getenv("ANNAS_PAGE_SETTLE_SECONDS", "12"))
 
-_MD5_HREF_RE = re.compile(r"^/md5/([a-f0-9]{32})$", re.IGNORECASE)
-_EXT_RE = re.compile(r"\b(epub|azw3|mobi|fb2|pdf)\b", re.IGNORECASE)
-_SIZE_RE = re.compile(r"[\d.]+\s*[kmg]?b\b", re.IGNORECASE)
+_MD5_RE = re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE)
+_EXT_RE = re.compile(r"\.(epub|azw3|mobi|fb2|pdf)\b", re.IGNORECASE)
+
+# Reads every /md5/ anchor with the text around it. Sidebar links come through
+# too; the matcher's title+author rules are what separate them from real hits,
+# which is safer than guessing at AA's result-container markup.
+EXTRACT_JS = r"""JSON.stringify({
+  title: document.title,
+  rows: [...document.querySelectorAll('a[href^="/md5/"]')].slice(0, 60).map(a => {
+    let box = a;
+    for (let i = 0; i < 4 && box.parentElement; i++) box = box.parentElement;
+    return {
+      md5: a.getAttribute('href').split('/')[2],
+      lines: (box.innerText || '').split('\n').map(s => s.trim()).filter(Boolean).slice(0, 4)
+    };
+  })
+})"""
+
+
+def parse_rows(rows: list[dict]) -> list[Candidate]:
+    """Turn extracted anchors into Candidates.
+
+    An AA row reads: a file path (which carries the extension), the title, the
+    authors, then publisher and blurb. Size is not exposed per row, and None is
+    accepted by the matcher's size floor.
+    """
+    candidates: list[Candidate] = []
+
+    for row in rows:
+        md5 = (row.get("md5") or "").lower()
+        if not _MD5_RE.match(md5):
+            continue
+
+        lines = [ln for ln in (row.get("lines") or []) if ln]
+        if not lines:
+            continue
+
+        path_line = lines[0] if _EXT_RE.search(lines[0] or "") else ""
+        rest = [ln for ln in lines if ln != path_line]
+        if not rest:
+            continue
+
+        ext_match = _EXT_RE.search(path_line)
+        candidates.append(Candidate(
+            md5=md5,
+            title=rest[0],
+            author=rest[1] if len(rest) > 1 else None,
+            ext=(ext_match.group(1).lower() if ext_match else "epub"),
+            # AA rows carry no language; the query pins lang=en.
+            language="English",
+            size_bytes=None,
+            source="annas",
+        ))
+
+    return candidates
+
+
+async def _cdp_evaluate(url: str, js: str) -> dict:
+    """Open our own tab in the shared browser, read a page, close the tab."""
+    import websockets
+
+    def _http(path: str, method: str = "GET"):
+        request = urllib.request.Request(f"{CDP_URL}{path}", method=method)
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode()
+        return json.loads(body) if body.strip().startswith(("{", "[")) else {}
+
+    tab = await asyncio.to_thread(_http, "/json/new?about:blank", "PUT")
+    tab_id = tab.get("id")
+    try:
+        async with websockets.connect(tab["webSocketDebuggerUrl"], max_size=80_000_000) as ws:
+            counter = 0
+
+            async def evaluate(expression: str):
+                nonlocal counter
+                counter += 1
+                await ws.send(json.dumps({
+                    "id": counter, "method": "Runtime.evaluate",
+                    "params": {"expression": expression, "returnByValue": True,
+                               "awaitPromise": True, "userGesture": True},
+                }))
+                while True:
+                    message = json.loads(await ws.recv())
+                    if message.get("id") == counter:
+                        return message.get("result", {}).get("result", {}).get("value")
+
+            await evaluate(f"location.href={json.dumps(url)}")
+            await asyncio.sleep(PAGE_SETTLE_SECONDS)
+            return json.loads(await evaluate(EXTRACT_JS) or "{}")
+    finally:
+        if tab_id:
+            try:
+                await asyncio.to_thread(_http, f"/json/close/{tab_id}")
+            except Exception as exc:
+                logger.warning("Could not close CDP tab %s: %s", tab_id, exc)
 
 
 class AnnasSource:
-    """Search Anna's Archive, returning Candidates the matcher can judge."""
+    """Search Anna's Archive through the shared headful browser."""
 
-    TIMEOUT = 30.0
-
-    def __init__(self):
-        self.client = httpx.AsyncClient(
-            timeout=self.TIMEOUT, headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
-        )
-        self._domain: str | None = None
-        self._domain_checked = False
+    def __init__(self, evaluator=None):
+        self._evaluate = evaluator or _cdp_evaluate
 
     async def close(self):
-        await self.client.aclose()
-
-    async def _base(self) -> str:
-        """Resolve a domain that actually serves results, or report an outage.
-
-        working_domain() caches for 24h, including the negative answer, so a
-        blocked Anna's Archive costs one probe a day rather than one per book.
-        """
-        if not self._domain_checked:
-            self._domain = await working_domain(self.client)
-            self._domain_checked = True
-        if not self._domain:
-            raise SourceUnavailable("no reachable Anna's Archive domain")
-        return f"https://{self._domain}"
+        return None
 
     async def search_by_isbn(self, isbn: str | None) -> list[Candidate]:
         isbn13 = to_isbn13(isbn)
@@ -76,48 +156,21 @@ class AnnasSource:
         return await self._search(query)
 
     async def _search(self, query: str) -> list[Candidate]:
-        base = await self._base()
-        url = (f"{base}/search?q={httpx.QueryParams({'q': query})['q']}"
-               "&content=book_nonfiction&content=book_fiction"
-               "&ext=epub&ext=pdf&ext=mobi&lang=en")
+        from urllib.parse import quote_plus
+
+        url = (f"https://{AA_DOMAIN}/search?q={quote_plus(query)}"
+               "&content=book_nonfiction&content=book_fiction&ext=epub&lang=en")
+
         try:
-            response = await self.client.get(url)
-            response.raise_for_status()
+            page = await self._evaluate(url, EXTRACT_JS)
         except Exception as exc:
-            # Never return [] here: an empty list reads as "this book does not
-            # exist" and would spend the book's one attempt on a blocked source.
-            raise SourceUnavailable(f"Anna's Archive search failed: {exc}") from exc
+            raise SourceUnavailable(f"cluster browser unreachable: {exc}") from exc
 
-        return self._parse(response.text)
+        title = (page or {}).get("title") or ""
+        if "ddos-guard" in title.lower():
+            raise SourceUnavailable(
+                "Anna's Archive is showing its captcha again — the shared browser "
+                "session needs a human to pass it before AA can be searched"
+            )
 
-    @staticmethod
-    def _parse(html: str) -> list[Candidate]:
-        soup = BeautifulSoup(html, "html.parser")
-        candidates: list[Candidate] = []
-
-        for link in soup.find_all("a", href=True):
-            match = _MD5_HREF_RE.match(link["href"].strip())
-            if not match:
-                continue
-
-            lines = [ln.strip() for ln in link.get_text("\n").split("\n") if ln.strip()]
-            if not lines:
-                continue
-
-            blob = " ".join(lines)
-            ext = _EXT_RE.search(blob)
-            size = _SIZE_RE.search(blob)
-
-            candidates.append(Candidate(
-                md5=match.group(1).lower(),
-                title=lines[0],
-                author=lines[1] if len(lines) > 1 else None,
-                ext=(ext.group(1).lower() if ext else "epub"),
-                # AA search exposes no per-result language; the query pins
-                # lang=en, which is the only signal available here.
-                language="English",
-                size_bytes=parse_size_bytes(size.group(0) if size else None),
-                source="annas",
-            ))
-
-        return candidates
+        return parse_rows((page or {}).get("rows") or [])
