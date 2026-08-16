@@ -1070,6 +1070,18 @@ async def _ttl_cleanup_job(job_id: str) -> None:
     _download_jobs.pop(job_id, None)
 
 
+# A share from a phone can arrive in several shapes: an Anna's Archive book page,
+# a libgen link carrying ?md5=, or the bare hash. All of them identify the same
+# file, so take any of them rather than insisting on one site's URL format.
+_MD5_ANYWHERE_RE = _re.compile(r"(?<![a-f0-9])([a-f0-9]{32})(?![a-f0-9])", _re.IGNORECASE)
+
+
+def extract_md5(shared: str | None) -> str | None:
+    """Pull a book's md5 out of whatever was shared, or None."""
+    match = _MD5_ANYWHERE_RE.search(shared or "")
+    return match.group(1).lower() if match else None
+
+
 async def _detail_best_effort(md5: str):
     """Anna's Archive metadata if it is quick, otherwise nothing.
 
@@ -1120,10 +1132,13 @@ async def download_url(request: Request):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
-    md5_match = _re.search(r"/md5/([a-f0-9]+)", url, _re.IGNORECASE)
-    if not md5_match:
-        raise HTTPException(status_code=400, detail=f"URL must be an Anna's Archive book page (/md5/...). Got: {url[:200]}")
-    md5 = md5_match.group(1)
+    md5 = extract_md5(url)
+    if not md5:
+        raise HTTPException(
+            status_code=400,
+            detail="Share an Anna's Archive or libgen book link (or the book's "
+                   f"md5). Nothing book-shaped in: {url[:200]}",
+        )
 
     # Deduplicate: if an active job exists for this MD5, return it
     for jid, job in _download_jobs.items():
