@@ -239,11 +239,13 @@ class LibGenScraper:
         )
         return rows_to_candidates(html)
 
-    # Searches for the Goodreads pipeline get a longer budget and one retry than
-    # the interactive UI: each book is only attempted once, so a timeout would
-    # otherwise be indistinguishable from the book not existing.
-    SEARCH_TIMEOUT = 30.0
-    SEARCH_ATTEMPTS = 2
+    # Searches for the Goodreads pipeline are separate from the interactive
+    # search path above, which retries and then returns [] on failure. The
+    # pipeline attempts each book exactly once, so "" and "not found" must not
+    # look alike: this path raises SourceUnavailable instead of returning empty,
+    # letting the poller defer the book rather than spend its single attempt.
+    PIPELINE_SEARCH_TIMEOUT = 30.0
+    PIPELINE_SEARCH_ATTEMPTS = 2
 
     async def _get_with_retry(self, params: dict, what: str) -> str:
         mirror = self._working_mirror or await self._get_mirror()
@@ -251,10 +253,11 @@ class LibGenScraper:
             raise SourceUnavailable("no libgen.li-style mirror available")
 
         last_error: Exception | None = None
-        for attempt in range(self.SEARCH_ATTEMPTS):
+        for attempt in range(self.PIPELINE_SEARCH_ATTEMPTS):
             try:
                 r = await self.client.get(
-                    f"{mirror}/index.php", params=params, timeout=self.SEARCH_TIMEOUT,
+                    f"{mirror}/index.php", params=params,
+                    timeout=self.PIPELINE_SEARCH_TIMEOUT,
                 )
                 r.raise_for_status()
                 return r.text
@@ -262,9 +265,10 @@ class LibGenScraper:
                 last_error = e
                 logger.warning(
                     "LibGen search for %s failed (attempt %d/%d): %s",
-                    what, attempt + 1, self.SEARCH_ATTEMPTS, e or type(e).__name__,
+                    what, attempt + 1, self.PIPELINE_SEARCH_ATTEMPTS,
+                    e or type(e).__name__,
                 )
-                if attempt + 1 < self.SEARCH_ATTEMPTS:
+                if attempt + 1 < self.PIPELINE_SEARCH_ATTEMPTS:
                     await asyncio.sleep(2)
 
         raise SourceUnavailable(f"libgen unreachable for {what}: {last_error}")
