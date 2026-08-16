@@ -611,6 +611,31 @@ async def health_deep():
 async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail, mirror_urls: list[str] = None) -> bool:
     """Attempt direct download from libgen mirrors or provided mirror URLs.
     Returns True if uploaded to Calibre."""
+    # An md5 on its own is enough: libgen's keyed ads.php -> get.php serves files
+    # by hash, including ones its own search does not index. This matters because
+    # Anna's Archive detail pages are unreachable from here, so a book shared
+    # from AA arrives as a bare md5 — which used to end the job right here with
+    # "All download methods failed" while that same md5 downloaded fine.
+    if not detail and not mirror_urls:
+        if not libgen_scraper:
+            return False
+        try:
+            file_data, filename = await libgen_scraper.download_file(md5)
+        except Exception as e:
+            logger.warning(f"LibGen md5 download failed for {md5}: {e}")
+            return False
+        if not file_data or len(file_data) < MIN_EBOOK_SIZE_BYTES:
+            return False
+
+        filename = filename or f"{author} - {title}.epub"
+        book_id = await _upload_to_calibre(file_data, filename)
+        if not book_id:
+            return False
+        job["book_id"] = book_id
+        job["stage_detail"] = f"Downloaded {filename} ({len(file_data)} bytes)"
+        logger.info(f"Fetched {md5} from libgen by hash: {filename}")
+        return True
+
     if not detail:
         return False
 
