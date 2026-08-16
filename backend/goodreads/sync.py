@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 
 from backend.goodreads.matcher import (
@@ -43,6 +44,41 @@ MAX_PER_CYCLE = 10
 # they still must not retry forever — libgen closed a connection mid-download on
 # 2026-08-16 and an unbounded retry would have hammered it every two minutes.
 MAX_ATTEMPTS = 3
+
+
+# Anna's Archive can't be searched automatically — it only answers a human in a
+# browser — so a miss hands Viktor a ready-made search to open.
+ANNAS_DOMAIN = "annas-archive.pk"
+
+
+def annas_search_url(item: ShelfItem) -> str:
+    """A search on Anna's Archive for this book, ready to click."""
+    from urllib.parse import quote_plus
+
+    title = re.sub(r"\s*\([^)]*\)\s*$", "", item.title or "").strip()
+    query = f"{title} {author_surname(item.author)}".strip()
+    return f"https://{ANNAS_DOMAIN}/search?q={quote_plus(query)}"
+
+
+def format_miss(item: ShelfItem, reason: str) -> str:
+    """The message for a book we could not deliver.
+
+    It has a job to do: Viktor searches Anna's Archive by hand from here, so the
+    search link and the ISBN matter more than the wording.
+    """
+    lines = [
+        f"🔎 *{item.title}* — {item.author}",
+        f"No copy found on LibGen ({reason}). "
+        f"Search Anna's Archive: {annas_search_url(item)}",
+    ]
+    if item.isbn:
+        lines.append(f"ISBN {item.isbn}")
+    return "\n".join(lines)
+
+
+def format_success(item: ShelfItem, ext: str, reason: str) -> str:
+    return (f"📖 *{item.title}* — {item.author} → Anca's shelf "
+            f"({ext}, matched by {reason})")
 
 
 def search_queries(item: ShelfItem) -> list[str]:
@@ -151,10 +187,11 @@ class GoodreadsSync:
 
         self.store.record(item, Outcome.ERROR, reason=reason)
         result.errors += 1
-        await self._say(
-            result,
-            f"⚠️ *{item.title}* — {item.author}: gave up after {attempts} attempts ({exc})",
-        )
+        await self._say(result, "\n".join([
+            f"⚠️ *{item.title}* — {item.author}",
+            f"Gave up after {attempts} attempts ({exc}). "
+            f"Search Anna's Archive: {annas_search_url(item)}",
+        ]))
 
     async def _process_one(self, item: ShelfItem, result: CycleResult) -> None:
         candidates, isbn_md5s = await self._gather_candidates(item)
@@ -177,10 +214,7 @@ class GoodreadsSync:
                 result.skipped += 1
                 return
             result.missed += 1
-            await self._say(
-                result,
-                f"🔎 *{item.title}* — {item.author}: no copy found ({match.reason})",
-            )
+            await self._say(result, format_miss(item, match.reason))
             return
 
         if not self.downloads_enabled:
@@ -208,11 +242,7 @@ class GoodreadsSync:
         self.store.record(item, Outcome.DOWNLOADED, reason=match.reason,
                           md5=match.candidate.md5, calibre_id=book_id)
         result.downloaded += 1
-        await self._say(
-            result,
-            f"📖 *{item.title}* — {item.author} → Anca's shelf "
-            f"({match.candidate.ext}, matched by {match.reason})",
-        )
+        await self._say(result, format_success(item, match.candidate.ext, match.reason))
 
     async def _gather_candidates(self, item: ShelfItem, source=None, required: bool = True):
         """Collect candidates from a source, ISBN first.
