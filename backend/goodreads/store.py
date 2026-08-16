@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class Outcome(str, Enum):
     SEEDED = "seeded"            # present at first run; deliberately not fetched
     PENDING = "pending"          # a transient failure; still owed an attempt
+    IN_FLIGHT = "in_flight"      # a worker is downloading it right now
     DOWNLOADED = "downloaded"
     OWNED = "owned"              # already in the Calibre library
     NOT_FOUND = "not_found"      # no source had it
@@ -24,6 +25,11 @@ class Outcome(str, Enum):
     SKIPPED = "skipped"          # placeholder for an unpublished book
     ERROR = "error"
 
+
+# How long a claim is trusted. A pod that dies mid-download would otherwise
+# strand the book forever; after this the work is considered abandoned and any
+# worker may take it over.
+CLAIM_TIMEOUT_SECONDS = 900
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goodreads_seen (
@@ -49,6 +55,7 @@ class MemorySeenStore:
 
     def __init__(self):
         self._rows: dict[str, dict] = {}
+        self._claim_age: dict[str, float] = {}
 
     def ensure_schema(self) -> None:
         pass
@@ -57,8 +64,45 @@ class MemorySeenStore:
         return not self._rows
 
     def known_ids(self) -> set[str]:
-        """Books needing no further work. A pending row is deliberately absent."""
+        """Books needing no attention: finished, or being worked on right now.
+
+        A pending row is deliberately absent so it gets retried.
+        """
         return {k for k, v in self._rows.items() if v["outcome"] != Outcome.PENDING.value}
+
+    def claim(self, item) -> bool:
+        """Take ownership of a book before any work starts.
+
+        Returns False when another worker already holds it or it is finished.
+        Claiming first is what stops a restart or a redeploy from downloading
+        the same book twice.
+        """
+        row = self._rows.get(item.book_id)
+        if row is not None and row["outcome"] not in (Outcome.PENDING.value,):
+            return False
+        self._rows[item.book_id] = {
+            "outcome": Outcome.IN_FLIGHT.value, "title": item.title,
+            "author": item.author, "isbn": item.isbn,
+            "attempts": (row or {}).get("attempts", 0),
+        }
+        self._claim_age[item.book_id] = 0.0
+        return True
+
+    def release(self, item) -> None:
+        """Give a claim back without recording an outcome."""
+        row = self._rows.get(item.book_id)
+        if row and row["outcome"] == Outcome.IN_FLIGHT.value:
+            del self._rows[item.book_id]
+
+    def expire_claims(self, older_than_seconds: int = CLAIM_TIMEOUT_SECONDS) -> int:
+        """Release claims held by workers that never came back."""
+        released = 0
+        for book_id, row in list(self._rows.items()):
+            if row["outcome"] == Outcome.IN_FLIGHT.value:
+                if self._claim_age.get(book_id, 0.0) >= older_than_seconds:
+                    del self._rows[book_id]
+                    released += 1
+        return released
 
     def attempts_for(self, book_id: str) -> int:
         row = self._rows.get(book_id)
@@ -119,11 +163,42 @@ class PostgresSeenStore:
             return cur.fetchone() is None
 
     def known_ids(self) -> set[str]:
-        """Books needing no further work. A pending row is deliberately absent."""
+        """Books needing no attention: finished, or claimed by a live worker."""
         with self._connection().cursor() as cur:
-            cur.execute("SELECT book_id FROM goodreads_seen WHERE outcome <> %s",
-                        (Outcome.PENDING.value,))
+            cur.execute(
+                """SELECT book_id FROM goodreads_seen
+                   WHERE outcome <> %s
+                     AND NOT (outcome = %s
+                              AND processed_at < now() - make_interval(secs => %s))""",
+                (Outcome.PENDING.value, Outcome.IN_FLIGHT.value, CLAIM_TIMEOUT_SECONDS),
+            )
             return {row[0] for row in cur.fetchall()}
+
+    def claim(self, item) -> bool:
+        """Atomically take ownership of a book before any work starts.
+
+        The whole point is that this happens BEFORE the download: a row written
+        only on completion left a window of minutes in which a second worker saw
+        no record and fetched the same book again.
+        """
+        with self._connection().cursor() as cur:
+            cur.execute(
+                """INSERT INTO goodreads_seen
+                       (book_id, title, author, isbn, added_at, outcome)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (book_id) DO UPDATE SET
+                       outcome = EXCLUDED.outcome,
+                       processed_at = now()
+                   WHERE goodreads_seen.outcome = %s
+                      OR (goodreads_seen.outcome = %s
+                          AND goodreads_seen.processed_at
+                              < now() - make_interval(secs => %s))
+                   RETURNING book_id""",
+                (item.book_id, item.title, item.author, item.isbn, item.added_at,
+                 Outcome.IN_FLIGHT.value,
+                 Outcome.PENDING.value, Outcome.IN_FLIGHT.value, CLAIM_TIMEOUT_SECONDS),
+            )
+            return cur.fetchone() is not None
 
     def attempts_for(self, book_id: str) -> int:
         with self._connection().cursor() as cur:
@@ -171,6 +246,14 @@ class PostgresSeenStore:
                 rows,
             )
         return len(rows)
+
+    def release(self, item) -> None:
+        """Give a claim back without recording an outcome."""
+        with self._connection().cursor() as cur:
+            cur.execute(
+                "DELETE FROM goodreads_seen WHERE book_id = %s AND outcome = %s",
+                (item.book_id, Outcome.IN_FLIGHT.value),
+            )
 
     def record(self, item, outcome: Outcome, reason=None, md5=None, calibre_id=None) -> None:
         with self._connection().cursor() as cur:

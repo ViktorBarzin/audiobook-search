@@ -107,6 +107,13 @@ class GoodreadsSync:
             return result
 
         for item in fresh[: self.max_per_cycle]:
+            # Claim before doing anything expensive. Recording the outcome only
+            # after the download completes left a window of minutes in which a
+            # restarted or redeployed worker saw no row and fetched the same
+            # book again — which is how one book landed in Calibre twice.
+            if not self.store.claim(item):
+                logger.info("Skipping %r — another worker holds it", item.title)
+                continue
             try:
                 await self._process_one(item, result)
             except (SourceUnavailable, Exception) as exc:
@@ -161,6 +168,7 @@ class GoodreadsSync:
         if not self.downloads_enabled:
             # Validation mode: report the pick but leave the book unhandled, so the
             # one attempt it is entitled to is still available once downloads are on.
+            self.store.release(item)
             result.would_download += 1
             await self._say(
                 result,

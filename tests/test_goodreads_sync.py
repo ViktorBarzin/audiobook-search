@@ -164,6 +164,7 @@ async def test_gate_disabled_matches_but_never_downloads():
     assert ingest.calls == []
     assert result.would_download == 1
     assert sync.store.outcome("21") is None, "a dry run must not consume the one attempt"
+    assert "21" not in sync.store.known_ids(), "and must not leave the book claimed"
     assert any("would download" in m.lower() for m in notifier.messages)
 
 
