@@ -18,6 +18,7 @@ from backend.mam import MAMScraper
 from backend.annas import AnnasArchiveScraper
 from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
+from backend.goodreads.matcher import author_surname, normalize_author, normalize_title
 from backend.models import AudiobookResult, AudiobookDetail
 from backend.dedupe import find_duplicate, find_inflight_duplicate, is_same_book
 
@@ -1203,21 +1204,30 @@ async def goodreads_ingest(request: Request):
             detail=f"downloaded file is only {len(file_data)} bytes — refusing to import",
         )
 
-    book_id = await _upload_to_calibre(file_data, filename)
-    if not book_id:
+    uploaded = await _upload_to_calibre(file_data, filename)
+    if not uploaded:
         raise HTTPException(status_code=502, detail="Calibre upload failed")
 
-    # -1 means "uploaded, but OPDS didn't surface an id in time". Give the import
-    # a little longer and ask the library database instead, otherwise the book
-    # lands in Calibre but never reaches her shelf.
-    if book_id < 0:
-        for _ in range(12):  # ~2 minutes
-            await asyncio.sleep(10)
-            found = _calibre_id_for(title, author)
-            if found:
-                book_id = found
-                logger.info(f"Resolved Calibre id {book_id} for {title!r} from the library")
-                break
+    # The id returned by _upload_to_calibre comes from a fuzzy OPDS search whose
+    # fallback term is a single word, so it can name a book that was already in
+    # the library: fetching Neuromancer once resolved to a CISSP study guide
+    # co-authored by a different Gibson, which was then shelved. The library
+    # database is the authority here — matched on title AND author — and no id
+    # at all is a better outcome than a confident wrong one.
+    book_id = None
+    for _ in range(12):  # ~2 minutes; a large import may still be committing
+        book_id = _calibre_id_for(title, author)
+        if book_id:
+            break
+        await asyncio.sleep(10)
+
+    if book_id:
+        logger.info(f"Resolved Calibre id {book_id} for {title!r} from the library")
+    else:
+        logger.warning(
+            f"Imported {title!r} but could not identify it in the library; not shelving"
+        )
+        book_id = -1
 
     shelf_error = None
     if shelf_id and book_id > 0:
@@ -1852,16 +1862,18 @@ def _calibre_id_for(title: str, author: str) -> int | None:
     if not os.path.exists(db):
         return None
 
-    # Goodreads carries series suffixes that Calibre's title does not.
-    wanted = _re.sub(r"\s*\([^)]*\)\s*$", "", title or "").strip().lower()
+    wanted = normalize_title(title)
     if not wanted:
         return None
+    surname = author_surname(author)
 
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
     try:
         rows = conn.execute(
-            "SELECT id, title FROM books WHERE lower(title) = ? ORDER BY timestamp DESC, id DESC",
-            (wanted,),
+            "SELECT b.id, b.title, ("
+            "  SELECT group_concat(a.name, ' & ') FROM authors a"
+            "  JOIN books_authors_link l ON l.author = a.id WHERE l.book = b.id"
+            ") FROM books b ORDER BY b.timestamp DESC, b.id DESC"
         ).fetchall()
     except sqlite3.Error as e:
         logger.warning(f"Calibre id lookup failed for {title!r}: {e}")
@@ -1869,7 +1881,17 @@ def _calibre_id_for(title: str, author: str) -> int | None:
     finally:
         conn.close()
 
-    return rows[0][0] if rows else None
+    for book_id, book_title, book_author in rows:
+        if normalize_title(book_title) != wanted:
+            continue
+        # The author must agree too. Titles alone let a shared surname through:
+        # searching for Neuromancer once matched a CISSP guide co-authored by a
+        # different Gibson, which then reached Anca's shelf.
+        if surname and book_author and surname not in normalize_author(book_author).split():
+            continue
+        return book_id
+
+    return None
 
 
 async def _check_calibre_duplicate(title: str, author: str):

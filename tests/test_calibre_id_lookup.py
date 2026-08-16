@@ -60,3 +60,39 @@ def test_prefers_the_newest_row_when_titles_repeat(library, tmp_path):
     conn.close()
 
     assert bs_main._calibre_id_for("Strange Houses", "Uketsu") == 499
+
+
+# --------------------------------------------------------------------------- #
+# The id must come from the library, never from a fuzzy search                 #
+#                                                                              #
+# Live failure 2026-08-16: Neuromancer imported as book 498, but the OPDS id    #
+# poll searched the fallback term "Gibson" and returned book 263 — a CISSP      #
+# study guide co-authored by Darril Gibson — which was then put on Anca's       #
+# shelf. Resolving the id by exact title is the only safe answer, and no id at  #
+# all is better than a confident wrong one.                                    #
+# --------------------------------------------------------------------------- #
+
+def test_does_not_match_a_book_that_merely_shares_an_author_word(library, tmp_path):
+    conn = sqlite3.connect(tmp_path / "metadata.db")
+    conn.execute(
+        "INSERT INTO books VALUES (?,?,?)",
+        (263, "(ISC)2 CISSP Certified Information Systems Security Professional "
+              "Official Study Guide", "2024-01-01 00:00:00+00:00"),
+    )
+    conn.execute("INSERT INTO authors VALUES (2,'Mike Chapple & Darril Gibson')")
+    conn.execute("INSERT INTO books_authors_link VALUES (263,2)")
+    conn.commit()
+    conn.close()
+
+    assert bs_main._calibre_id_for("Neuromancer (Sprawl, #1)", "William Gibson") is None
+
+
+def test_matches_when_calibre_keeps_a_subtitle_goodreads_omits(library, tmp_path):
+    conn = sqlite3.connect(tmp_path / "metadata.db")
+    conn.execute("INSERT INTO books VALUES (?,?,?)",
+                 (500, "So Good They Can't Ignore You: Why Skills Trump Passion",
+                  "2026-08-16 14:00:00+00:00"))
+    conn.commit()
+    conn.close()
+
+    assert bs_main._calibre_id_for("So Good They Can't Ignore You", "Cal Newport") == 500
