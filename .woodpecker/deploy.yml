@@ -12,6 +12,11 @@ steps:
     commands:
       - "kubectl set image deployment/book-search book-search=\"${IMAGE_NAME}:${IMAGE_TAG}\" -n ebooks"
       - "kubectl rollout status deployment/book-search -n ebooks --timeout=300s"
+      # The Goodreads poller runs the same image from its own deployment. Without
+      # this it stays on whatever it started with and quietly runs stale code
+      # after every change here.
+      - "kubectl set image deployment/goodreads-sync goodreads-sync=\"${IMAGE_NAME}:${IMAGE_TAG}\" -n ebooks"
+      - "kubectl rollout status deployment/goodreads-sync -n ebooks --timeout=300s"
 
   - name: notify
     image: plugins/slack
