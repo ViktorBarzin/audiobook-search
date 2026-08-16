@@ -60,3 +60,32 @@ async def test_a_tiny_file_is_refused(monkeypatch):
     """A 154-byte rate-limit stub was once imported as a real book."""
     monkeypatch.setattr(bs_main, "libgen_scraper", FakeLibgen(data=b"tiny"))
     assert await bs_main._try_direct_download("j4", {}, "d" * 32, "T", "A", None) is False
+
+
+async def test_the_job_finishes_rather_than_sitting_on_downloading(monkeypatch):
+    """An iOS Shortcut polls for 'done'; leaving it on 'downloading' looks stuck."""
+    libgen = FakeLibgen()
+
+    async def fake_upload(data, filename):
+        return 505
+
+    class NoStacks:
+        async def download_via_stacks(self, md5):
+            return {"success": False, "error": "stacks unavailable"}
+
+    monkeypatch.setattr(bs_main, "libgen_scraper", libgen)
+    monkeypatch.setattr(bs_main, "annas_scraper", NoStacks())
+    monkeypatch.setattr(bs_main, "_upload_to_calibre", fake_upload)
+    async def no_kindle(*a, **k):
+        return None
+
+    monkeypatch.setattr(bs_main, "_maybe_send_to_kindle", no_kindle)
+
+    job = {"status": "queued", "title": "Unknown", "author": "Unknown Author",
+           "md5": "a" * 32, "message": "", "kindle_email": None}
+    bs_main._download_jobs["j9"] = job
+
+    await bs_main._process_download("j9", "a" * 32, "Unknown", "Unknown Author", None)
+
+    assert job["status"] == "done", f"job ended as {job['status']!r}"
+    assert job.get("book_id") == 505

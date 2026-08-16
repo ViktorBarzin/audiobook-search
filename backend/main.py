@@ -834,7 +834,13 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                 job["message"] = stacks_result.get("error", "Stacks failed and no direct mirror available")
                 job["stage_detail"] = job["message"]
                 return
-            # _try_direct_download already uploaded via HTTP and set book_id
+            # _try_direct_download already uploaded via HTTP and set book_id.
+            # Settle the job here: a caller polling for "done" (the iOS Shortcut)
+            # would otherwise watch it sit on "downloading" forever.
+            job["status"] = "done"
+            job["message"] = "Added to Calibre"
+            await _maybe_send_to_kindle(job_id, title)
+            return
         else:
             already_downloaded = "already downloaded" in stacks_result.get("message", "").lower()
             logger.info(f"[{job_id}] Stacks accepted {md5} (already_downloaded={already_downloaded})")
