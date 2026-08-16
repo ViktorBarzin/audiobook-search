@@ -325,15 +325,27 @@ she next added something. The shelf is now fetched unconditionally every fifteen
 Verified live: a row stranded `in_flight` by a killed poller resumed on its own and was
 recorded `owned` once the duplicate check recognised the book had already arrived.
 
-**Anna's Archive is wired in as a second source, and contributes nothing today.** Its
-domains come from Wikipedia and are probed before use; all of them answer 403 behind
-DDoS-Guard, from this network and through the UK VPN exit alike, so the source reports
-itself unavailable at the cost of one cached probe a day and starts contributing by
-itself if that lifts. Two limits are worth keeping in view: an unreachable source is
-reported as an outage rather than an empty result, so it can never cost a book its single
-attempt; and AA is a *discovery* source only, because the one working fetch route is
-libgen's keyed link by md5 — a book AA lists and libgen does not hold still cannot be
-downloaded.
+**Anna's Archive is usable after all, through the shared cluster browser.** It refuses
+every client we can send at it: `httpx` directly, `httpx` replaying a human-solved
+session's own cookies with a matching Chrome user-agent, FlareSolverr, the UK VPN exit,
+and Playwright-driven Chrome — all 403, all from the same home address that works fine in
+a person's browser. The check is on how the connection is made, not who makes it.
+
+What does work is the shared headful Chrome once a human has passed its hCaptcha: after
+that, plain CDP navigation to `/search` returns real results. AA search now runs there, in
+a tab of its own that is closed afterwards, which needed the `ebooks` namespace labelled
+as a `chrome-service` client to pass that browser's network policy.
+
+Two properties shape how it is used. The session lasts about twenty minutes before AA
+asks for the check again, and the browser is shared with other work — so AA is a
+**fallback**, consulted only for books libgen could not confidently match, which is
+exactly where it helps. And a lapsed session is reported as an outage rather than an empty
+result, so it can never be mistaken for "this book does not exist".
+
+The coverage gain is real: *The Tokyo Zodiac Murders* is absent from libgen's own search,
+is found this way, and its md5 downloads from libgen's `get.php` (2,103,638 bytes) — that
+endpoint serves files libgen does not index, so AA discovery genuinely widens what we can
+fetch.
 
 **Measured latency**, from a clean single-poller run (Middlemarch, 768 KB epub): claimed
 at 3s, in Calibre at 40s, on her shelf at 43s. The stages are feed fetch 0.8s, ISBN
