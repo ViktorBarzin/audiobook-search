@@ -323,3 +323,66 @@ async def test_repeated_failures_eventually_give_up():
     assert "62" in sync.store.known_ids(), "a book we gave up on must not be retried"
     assert ingest.attempts <= 4, "must stop hammering the source"
     assert any("62" in m or "Strange Houses" in m for m in notifier.messages)
+
+
+# --------------------------------------------------------------------------- #
+# Anna's Archive is a fallback, not a parallel source                          #
+#                                                                              #
+# Its session is human-maintained and lapses ~20 minutes after someone passes   #
+# the captcha, and it shares a browser with whatever else uses it. Asking it    #
+# only for the books libgen could not confidently match is both where it adds   #
+# value and the lightest way to use it.                                        #
+# --------------------------------------------------------------------------- #
+
+async def test_fallback_is_not_consulted_when_the_primary_matches():
+    store = MemorySeenStore()
+    store.mark_seeded(["0"])
+    item = shelf_item("71")
+    primary = FakeSource([candidate()])
+    fallback = FakeSource([candidate(md5="f" * 32)])
+
+    sync = GoodreadsSync(source=primary, ingest=FakeIngest(), store=store,
+                         notify=FakeNotifier(), downloads_enabled=True,
+                         fallback_source=fallback)
+    await sync.process([item])
+
+    assert fallback.text_calls == [], "libgen matched, so AA must not be asked"
+    assert sync.store.outcome("71") == Outcome.DOWNLOADED
+
+
+async def test_fallback_is_consulted_when_the_primary_finds_nothing():
+    store = MemorySeenStore()
+    store.mark_seeded(["0"])
+    item = shelf_item("72", title="The Tokyo Zodiac Murders", author="Soji Shimada")
+    primary = FakeSource([])
+    fallback = FakeSource([candidate(title="The Tokyo Zodiac Murders", author="Soji Shimada",
+                                     md5="f" * 32)])
+
+    sync = GoodreadsSync(source=primary, ingest=(ingest := FakeIngest()), store=store,
+                         notify=FakeNotifier(), downloads_enabled=True,
+                         fallback_source=fallback)
+    await sync.process([item])
+
+    assert fallback.text_calls, "libgen missed, so AA should be tried"
+    assert ingest.calls == ["f" * 32]
+    assert sync.store.outcome("72") == Outcome.DOWNLOADED
+
+
+async def test_an_unavailable_fallback_leaves_the_primary_result_alone():
+    """AA's session lapses constantly; that must never change the outcome."""
+    from backend.goodreads.sources import SourceUnavailable
+
+    store = MemorySeenStore()
+    store.mark_seeded(["0"])
+    item = shelf_item("73", title="May We Feed the King", author="Rebecca Perry")
+
+    class Blocked(FakeSource):
+        async def search_candidates(self, query):
+            raise SourceUnavailable("captcha again")
+
+    sync = GoodreadsSync(source=FakeSource([]), ingest=FakeIngest(), store=store,
+                         notify=FakeNotifier(), downloads_enabled=True,
+                         fallback_source=Blocked())
+    await sync.process([item])
+
+    assert sync.store.outcome("73") == Outcome.NOT_FOUND

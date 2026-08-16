@@ -15,7 +15,6 @@ import httpx
 
 from backend.goodreads.feed import FeedError, FeedStatus, fetch_all, fetch_shelf
 from backend.goodreads.annas_source import AnnasSource
-from backend.goodreads.sources import MultiSource
 from backend.goodreads.store import MemorySeenStore, PostgresSeenStore
 from backend.goodreads.sync import DELAY_BETWEEN_BOOKS_S, GoodreadsSync
 from backend.libgen import LibGenScraper
@@ -99,16 +98,19 @@ async def poll_forever() -> None:
     )
 
     store = build_store()
-    # libgen first: it is the source we can actually download from, so it wins
-    # when both offer the same md5. Anna's Archive is asked second for the books
-    # libgen's own search misses; it is 403 behind DDoS-Guard from here today and
-    # simply reports itself unavailable, at the cost of one cached probe a day.
-    source = MultiSource([LibGenScraper(), AnnasSource()])
+    # libgen is the primary: it is the source we can actually download from.
+    # Anna's Archive is a FALLBACK, asked only for books libgen could not match —
+    # it reaches more collections, but only works while a human-passed captcha
+    # session is fresh in the shared browser (~20 minutes), so it is used
+    # sparingly and drops out quietly when challenged again.
+    source = LibGenScraper()
+    fallback = AnnasSource()
     etag: str | None = None
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         sync = GoodreadsSync(
             source=source,
+            fallback_source=fallback,
             ingest=build_ingest(client),
             store=store,
             notify=build_notifier(client),

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from backend.goodreads.matcher import (
     ShelfItem,
     author_surname,
+    is_placeholder,
     normalize_title,
     select_candidate,
 )
@@ -75,8 +76,15 @@ class CycleResult:
 
 class GoodreadsSync:
     def __init__(self, source, ingest, store, notify, downloads_enabled: bool = False,
-                 delay_s: float = 0.0, max_per_cycle: int = MAX_PER_CYCLE):
+                 delay_s: float = 0.0, max_per_cycle: int = MAX_PER_CYCLE,
+                 fallback_source=None):
         self.source = source
+        # Consulted only for books the primary could not confidently match.
+        # Anna's Archive lives here: its session is human-maintained and lapses
+        # about twenty minutes after someone passes its captcha, and it shares a
+        # browser with other work — so it is asked rarely, and exactly where it
+        # earns its keep.
+        self.fallback_source = fallback_source
         self.ingest = ingest
         self.store = store
         self.notify = notify
@@ -152,6 +160,16 @@ class GoodreadsSync:
         candidates, isbn_md5s = await self._gather_candidates(item)
         match = select_candidate(item, candidates, isbn_matched_md5s=isbn_md5s)
 
+        if match.candidate is None and self.fallback_source and not is_placeholder(item.title):
+            extra, extra_isbn = await self._gather_candidates(
+                item, source=self.fallback_source, required=False,
+            )
+            if extra:
+                candidates = candidates + extra
+                match = select_candidate(
+                    item, candidates, isbn_matched_md5s=isbn_md5s | extra_isbn,
+                )
+
         if match.candidate is None:
             outcome = _REASON_TO_OUTCOME.get(match.reason, Outcome.NO_MATCH)
             self.store.record(item, outcome, reason=match.reason)
@@ -196,28 +214,37 @@ class GoodreadsSync:
             f"({match.candidate.ext}, matched by {match.reason})",
         )
 
-    async def _gather_candidates(self, item: ShelfItem):
-        """Collect candidates, ISBN first.
+    async def _gather_candidates(self, item: ShelfItem, source=None, required: bool = True):
+        """Collect candidates from a source, ISBN first.
 
         A placeholder title is discarded before any request goes out: those books
         are unpublished, so searching for them only produces load and noise.
-        """
-        from backend.goodreads.matcher import is_placeholder
 
+        `required=False` marks an optional source — an outage there is swallowed,
+        because it must not turn a book the primary already answered for into a
+        deferred one.
+        """
         if is_placeholder(item.title):
             return [], set()
 
+        source = source or self.source
         candidates, isbn_md5s = [], set()
 
-        if item.isbn:
-            by_isbn = await self.source.search_by_isbn(item.isbn)
-            candidates.extend(by_isbn)
-            isbn_md5s = {c.md5 for c in by_isbn}
+        try:
+            if item.isbn:
+                by_isbn = await source.search_by_isbn(item.isbn)
+                candidates.extend(by_isbn)
+                isbn_md5s = {c.md5 for c in by_isbn}
 
-        for query in search_queries(item):
-            candidates.extend(await self.source.search_candidates(query))
-            if candidates:
-                break
+            for query in search_queries(item):
+                candidates.extend(await source.search_candidates(query))
+                if candidates:
+                    break
+        except SourceUnavailable:
+            if required:
+                raise
+            logger.info("Optional source unavailable for %r; continuing", item.title)
+            return [], set()
 
         deduped = {}
         for candidate in candidates:
