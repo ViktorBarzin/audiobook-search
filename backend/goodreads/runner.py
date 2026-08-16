@@ -9,10 +9,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 import httpx
 
 from backend.goodreads.feed import FeedError, FeedStatus, fetch_all, fetch_shelf
+from backend.goodreads.annas_source import AnnasSource
+from backend.goodreads.sources import MultiSource
 from backend.goodreads.store import MemorySeenStore, PostgresSeenStore
 from backend.goodreads.sync import DELAY_BETWEEN_BOOKS_S, GoodreadsSync
 from backend.libgen import LibGenScraper
@@ -31,8 +34,24 @@ API_KEY = os.getenv("API_KEY", "")
 SHELF_ID = int(os.getenv("GOODREADS_SHELF_ID", "0") or 0)
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
+# How often to fetch the shelf WITHOUT the conditional header. A quiet shelf
+# answers 304 forever, and items are only re-examined on a 200 — so without this
+# a book left pending by a transient failure, or claimed by a pod that died, is
+# never looked at again until she happens to add something.
+FULL_REFRESH_SECONDS = int(os.getenv("GOODREADS_FULL_REFRESH_SECONDS", "900"))
+
 # A repeated failure (feed down, source down) should say so once, not every cycle.
 _last_error: str | None = None
+
+
+def etag_to_send(etag: str | None, last_full: float, now: float,
+                 interval: float = FULL_REFRESH_SECONDS) -> str | None:
+    """The validator to send this cycle, or None to force a full fetch."""
+    if etag is None:
+        return None
+    if now - last_full >= interval:
+        return None
+    return etag
 
 
 def build_notifier(client: httpx.AsyncClient):
@@ -80,7 +99,11 @@ async def poll_forever() -> None:
     )
 
     store = build_store()
-    source = LibGenScraper()
+    # libgen first: it is the source we can actually download from, so it wins
+    # when both offer the same md5. Anna's Archive is asked second for the books
+    # libgen's own search misses; it is 403 behind DDoS-Guard from here today and
+    # simply reports itself unavailable, at the cost of one cached probe a day.
+    source = MultiSource([LibGenScraper(), AnnasSource()])
     etag: str | None = None
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -104,10 +127,15 @@ async def poll_forever() -> None:
             except Exception as exc:
                 logger.exception("Seeding failed; will retry on the next cycle: %s", exc)
 
+        last_full = time.monotonic()
+
         while True:
             try:
+                send = etag_to_send(etag, last_full, time.monotonic())
+                if send is None:
+                    last_full = time.monotonic()
                 result = await fetch_shelf(
-                    client, GOODREADS_USER_ID, GOODREADS_SHELF, etag=etag,
+                    client, GOODREADS_USER_ID, GOODREADS_SHELF, etag=send,
                 )
                 _clear_error()
                 if result.status is FeedStatus.OK:

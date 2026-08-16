@@ -86,3 +86,46 @@ def rows_to_candidates(html: str, source: str = "libgen") -> list[Candidate]:
         ))
 
     return candidates
+
+
+class MultiSource:
+    """Ask several sources and merge what they offer.
+
+    A source that is unreachable is skipped rather than allowed to fail the
+    search: Anna's Archive has been 403 behind DDoS-Guard from this network all
+    day, and libgen results must still get through. Only when *every* source is
+    unreachable is that reported as an outage — which keeps it distinguishable
+    from "the book is not out there", the distinction that protects each book's
+    single attempt.
+    """
+
+    def __init__(self, sources):
+        self.sources = list(sources)
+
+    async def search_by_isbn(self, isbn):
+        return await self._gather("search_by_isbn", isbn)
+
+    async def search_candidates(self, query):
+        return await self._gather("search_candidates", query)
+
+    async def _gather(self, method: str, arg):
+        merged: dict[str, Candidate] = {}
+        outages = 0
+
+        for source in self.sources:
+            try:
+                for candidate in await getattr(source, method)(arg):
+                    # First source wins on a shared md5: they are ordered with the
+                    # one we can actually download from first.
+                    merged.setdefault(candidate.md5, candidate)
+            except SourceUnavailable as exc:
+                outages += 1
+                logger.warning("Source %s unavailable: %s", type(source).__name__, exc)
+            except Exception as exc:
+                outages += 1
+                logger.warning("Source %s failed: %s", type(source).__name__, exc)
+
+        if outages == len(self.sources) and self.sources:
+            raise SourceUnavailable("every source is unreachable")
+
+        return list(merged.values())
