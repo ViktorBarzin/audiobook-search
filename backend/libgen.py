@@ -1,9 +1,13 @@
+import asyncio
 import logging
 import re
 from urllib.parse import quote
 import httpx
 from bs4 import BeautifulSoup
 
+from backend.goodreads.isbn import to_isbn13
+from backend.goodreads.matcher import Candidate
+from backend.goodreads.sources import SourceUnavailable, rows_to_candidates
 from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
@@ -155,6 +159,72 @@ class LibGenScraper:
             return await self._search_li(query, mirror)
         else:
             return await self._search_classic(query, mirror)
+
+    async def search_by_isbn(self, isbn: str | None) -> list[Candidate]:
+        """Look a book up by identifier, returning downloadable files.
+
+        libgen indexes ISBN-13 only: querying the ISBN-10 that Goodreads supplies
+        returns an empty result set rather than an error, so the conversion is
+        required for this path to find anything.
+        """
+        isbn13 = to_isbn13(isbn)
+        if not isbn13:
+            return []
+
+        html = await self._get_with_retry(
+            {"req": isbn13, "objects[]": "f", "res": "25"},
+            what=f"ISBN {isbn13}",
+        )
+        return rows_to_candidates(html)
+
+    async def search_candidates(self, query: str) -> list[Candidate]:
+        """Search by free text, returning Candidates rather than UI results.
+
+        Kept separate from search() so the interactive UI's result shape stays
+        untouched while the pipeline gets the language and byte-size fields it
+        needs to judge a match.
+        """
+        html = await self._get_with_retry(
+            {
+                "req": query,
+                "columns[]": ["t", "a"],
+                "objects[]": "f",
+                "topics[]": "l",
+                "res": "25",
+            },
+            what=repr(query),
+        )
+        return rows_to_candidates(html)
+
+    # Searches for the Goodreads pipeline get a longer budget and one retry than
+    # the interactive UI: each book is only attempted once, so a timeout would
+    # otherwise be indistinguishable from the book not existing.
+    SEARCH_TIMEOUT = 30.0
+    SEARCH_ATTEMPTS = 2
+
+    async def _get_with_retry(self, params: dict, what: str) -> str:
+        mirror = self._working_mirror or await self._get_mirror()
+        if not mirror or not self._is_li_mirror(mirror):
+            raise SourceUnavailable("no libgen.li-style mirror available")
+
+        last_error: Exception | None = None
+        for attempt in range(self.SEARCH_ATTEMPTS):
+            try:
+                r = await self.client.get(
+                    f"{mirror}/index.php", params=params, timeout=self.SEARCH_TIMEOUT,
+                )
+                r.raise_for_status()
+                return r.text
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "LibGen search for %s failed (attempt %d/%d): %s",
+                    what, attempt + 1, self.SEARCH_ATTEMPTS, e or type(e).__name__,
+                )
+                if attempt + 1 < self.SEARCH_ATTEMPTS:
+                    await asyncio.sleep(2)
+
+        raise SourceUnavailable(f"libgen unreachable for {what}: {last_error}")
 
     async def _search_li(self, query: str, mirror: str) -> list[AudiobookResult]:
         """Search libgen.li-style mirrors (index.php with different params)."""

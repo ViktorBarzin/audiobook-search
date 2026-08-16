@@ -44,6 +44,9 @@ API_KEY = os.getenv("API_KEY", "")
 SHORTCUT_ICLOUD_URL = os.getenv("SHORTCUT_ICLOUD_URL", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
+# Calibre-web shelf that Goodreads-sourced books are added to (0 = don't shelve).
+GOODREADS_SHELF_ID = int(os.getenv("GOODREADS_SHELF_ID", "0") or 0)
+
 # SMTP config for Send-to-Kindle
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.viktorbarzin.me")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -1125,6 +1128,103 @@ async def send_to_kindle(request: Request):
     if err:
         raise HTTPException(status_code=500, detail=f"Failed to send: {err}")
     return {"status": "ok", "message": f"Sent to {kindle_email}"}
+
+
+async def _add_to_shelf(client: httpx.AsyncClient, shelf_id: int, book_id: int) -> str | None:
+    """Put an imported book on a calibre-web shelf. Returns an error string or None.
+
+    CWA gates this on check_shelf_edit_permissions: a *public* shelf is writable by
+    any account with the edit-shelves role, so the admin session used everywhere
+    else here can add to a shelf owned by another user without their password.
+    """
+    r = await client.get(f"{CALIBRE_WEB_URL}/")
+    if r.status_code != 200:
+        return f"GET / returned {r.status_code}"
+    m = _re.search(r'name="csrf_token"\s+value="([^"]+)"', r.text)
+    if not m:
+        return "no CSRF token"
+
+    r = await client.post(
+        f"{CALIBRE_WEB_URL}/shelf/add/{shelf_id}/{book_id}",
+        data={"csrf_token": m.group(1)},
+        headers={"X-Requested-With": "XMLHttpRequest", "X-CSRFToken": m.group(1)},
+    )
+    if r.status_code == 200:
+        return None
+    # CWA answers 400 when the book is already on the shelf, which is not a failure
+    # for an idempotent pipeline that may retry.
+    if r.status_code == 400 and "already part of the shelf" in r.text.lower():
+        return None
+    return f"shelf/add returned {r.status_code}: {r.text[:120]}"
+
+
+@app.post("/api/goodreads/ingest")
+async def goodreads_ingest(request: Request):
+    """Fetch one already-matched book by md5, import it, and shelve it.
+
+    The Goodreads poller runs in its own pod and owns the decision of *what* to
+    fetch; this endpoint owns the mechanics, because the ingest directory, the CWA
+    session and the Calibre library are all already mounted and working here.
+    """
+    _verify_api_key(request)
+    data = await request.json()
+
+    md5 = (data.get("md5") or "").lower()
+    title = data.get("title") or "Unknown"
+    author = data.get("author") or "Unknown Author"
+    shelf_id = int(data.get("shelf_id") or GOODREADS_SHELF_ID or 0)
+
+    if not _re.fullmatch(r"[a-f0-9]{32}", md5):
+        raise HTTPException(status_code=400, detail="a 32-character md5 is required")
+
+    if not libgen_scraper:
+        raise HTTPException(status_code=503, detail="LibGen scraper not available")
+
+    try:
+        await _check_cwa_duplicate(title, author)
+    except HTTPException as e:
+        if e.status_code == 409:
+            return {"status": "duplicate", "message": str(e.detail)}
+        raise
+
+    file_data, filename = await libgen_scraper.download_file(md5)
+    if not file_data:
+        raise HTTPException(status_code=502, detail=f"download failed for md5 {md5}")
+
+    reason = _invalid_ingest_reason(filename or "", "")
+    if not filename or (reason and "size" not in reason):
+        ext = ".pdf" if file_data[:4] == b"%PDF" else ".epub"
+        filename = f"{author} - {title}{ext}"
+
+    if len(file_data) < MIN_EBOOK_SIZE_BYTES:
+        raise HTTPException(
+            status_code=502,
+            detail=f"downloaded file is only {len(file_data)} bytes — refusing to import",
+        )
+
+    book_id = await _upload_to_calibre(file_data, filename)
+    if not book_id:
+        raise HTTPException(status_code=502, detail="Calibre upload failed")
+
+    shelf_error = None
+    if shelf_id and book_id > 0:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            if await _cwa_login(client):
+                shelf_error = await _add_to_shelf(client, shelf_id, book_id)
+            else:
+                shelf_error = "CWA login failed"
+        if shelf_error:
+            logger.warning(f"Shelf add failed for book {book_id}: {shelf_error}")
+
+    asyncio.create_task(_notify_slack(title, author, "ebook", "goodreads"))
+
+    return {
+        "status": "ok",
+        "book_id": book_id,
+        "filename": filename,
+        "bytes": len(file_data),
+        "shelf_error": shelf_error,
+    }
 
 
 @app.get("/shortcut")

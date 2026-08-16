@@ -5,6 +5,7 @@ from urllib.parse import quote
 import httpx
 from bs4 import BeautifulSoup
 
+from backend.goodreads.aa_domains import working_domain
 from backend.models import AudiobookResult, AudiobookDetail
 
 logger = logging.getLogger(__name__)
@@ -113,9 +114,26 @@ class AnnasArchiveScraper:
 
         return None
 
+    async def _current_base_url(self) -> str:
+        """Resolve the base URL, preferring a domain proven to serve results.
+
+        ANNAS_DOMAIN stays authoritative when set explicitly; otherwise the domain
+        is discovered from Wikipedia and probed, so a rotation away from whatever
+        is hardcoded stops being a silent outage.
+        """
+        if os.getenv("ANNAS_DOMAIN"):
+            return self.base_url
+        try:
+            domain = await working_domain(self.client)
+        except Exception as e:
+            logger.warning(f"AA domain discovery failed: {e}")
+            return self.base_url
+        return f"https://{domain}" if domain else self.base_url
+
     async def search(self, query: str) -> list[AudiobookResult]:
         """Search Anna's Archive for ebooks. Uses public site (Stacks is download-only)."""
-        search_url = f"{self.base_url}/search?q={quote(query)}&content=book_nonfiction&content=book_fiction&ext=epub&ext=pdf&ext=mobi&sort=&lang=en"
+        base_url = await self._current_base_url()
+        search_url = f"{base_url}/search?q={quote(query)}&content=book_nonfiction&content=book_fiction&ext=epub&ext=pdf&ext=mobi&sort=&lang=en"
 
         html = await self._fetch_public(search_url)
         if not html:
