@@ -1149,7 +1149,8 @@ async def _add_to_shelf(client: httpx.AsyncClient, shelf_id: int, book_id: int) 
         data={"csrf_token": m.group(1)},
         headers={"X-Requested-With": "XMLHttpRequest", "X-CSRFToken": m.group(1)},
     )
-    if r.status_code == 200:
+    # Verified live: CWA answers 204 No Content on success, not 200.
+    if 200 <= r.status_code < 300:
         return None
     # CWA answers 400 when the book is already on the shelf, which is not a failure
     # for an idempotent pipeline that may retry.
