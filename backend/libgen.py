@@ -22,6 +22,14 @@ LIBGEN_MIRRORS = [
 ]
 
 
+# A dropped connection to a healthy mirror is common enough to matter: measured
+# ~12% of searches on 2026-08-16 while libgen.li itself answered in under 3s.
+# Without a retry that blip returned zero results and read, from the outside,
+# exactly like an IP block.
+SEARCH_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 0.5
+
+
 class LibGenScraper:
     """Library Genesis ebook search. Direct search without JS challenges."""
 
@@ -39,9 +47,15 @@ class LibGenScraper:
     async def close(self):
         await self.client.aclose()
 
-    async def _get_mirror(self) -> str | None:
-        """Find a working LibGen mirror."""
-        if self._working_mirror:
+    async def _get_mirror(self, exclude: set[str] | None = None) -> str | None:
+        """Find a working LibGen mirror, skipping any in `exclude`.
+
+        Health checks stay on a short timeout, which is what keeps fall-through
+        cheap: the dead mirrors (.is/.rs/.st) cost 5s each here rather than the
+        20s connect timeout a real search against them would burn.
+        """
+        exclude = exclude or set()
+        if self._working_mirror and self._working_mirror not in exclude:
             try:
                 r = await self.client.get(self._working_mirror, timeout=5)
                 if r.status_code == 200:
@@ -50,6 +64,8 @@ class LibGenScraper:
                 self._working_mirror = None
 
         for mirror in LIBGEN_MIRRORS:
+            if mirror in exclude:
+                continue
             try:
                 r = await self.client.get(mirror, timeout=5)
                 if r.status_code == 200:
@@ -150,15 +166,42 @@ class LibGenScraper:
         return data, filename
 
     async def search(self, query: str) -> list[AudiobookResult]:
-        """Search LibGen for ebooks."""
+        """Search LibGen for ebooks, retrying transient connection failures.
+
+        A mirror that answers with an EMPTY result table has answered — that is
+        "no such book", and it returns immediately. Only a raised transport
+        error is retried, which is why the per-mirror helpers propagate instead
+        of swallowing exceptions.
+        """
         mirror = await self._get_mirror()
         if not mirror:
             return []
 
-        if self._is_li_mirror(mirror):
-            return await self._search_li(query, mirror)
-        else:
-            return await self._search_classic(query, mirror)
+        tried: set[str] = set()
+        while mirror:
+            tried.add(mirror)
+            for attempt in range(1, SEARCH_ATTEMPTS + 1):
+                try:
+                    if self._is_li_mirror(mirror):
+                        return await self._search_li(query, mirror)
+                    return await self._search_classic(query, mirror)
+                except Exception as e:
+                    # str(e) is empty for the httpx connection errors this
+                    # actually hits, so the TYPE is the only usable detail.
+                    logger.warning(
+                        "LibGen search failed on %s (attempt %d/%d): %s: %s",
+                        mirror, attempt, SEARCH_ATTEMPTS, type(e).__name__, e,
+                    )
+                    if attempt < SEARCH_ATTEMPTS:
+                        await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            # This mirror is exhausted; look for another healthy one.
+            self._working_mirror = None
+            mirror = await self._get_mirror(exclude=tried)
+            if mirror:
+                logger.info("LibGen falling through to %s", mirror)
+
+        logger.error("LibGen search failed on every mirror tried: %s", ", ".join(sorted(tried)))
+        return []
 
     async def search_by_isbn(self, isbn: str | None) -> list[Candidate]:
         """Look a book up by identifier, returning downloadable files.
@@ -228,21 +271,20 @@ class LibGenScraper:
 
     async def _search_li(self, query: str, mirror: str) -> list[AudiobookResult]:
         """Search libgen.li-style mirrors (index.php with different params)."""
-        try:
-            r = await self.client.get(
-                f"{mirror}/index.php",
-                params={
-                    "req": query,
-                    "columns[]": ["t", "a"],
-                    "objects[]": "f",
-                    "topics[]": "l",
-                    "res": "25",
-                },
-            )
-            r.raise_for_status()
-        except Exception as e:
-            logger.error(f"LibGen search failed: {e}")
-            return []
+        # Transport errors PROPAGATE: `search` owns the retry and the
+        # fall-through, and it can only distinguish "request failed" from
+        # "no matches" if this raises rather than returning [].
+        r = await self.client.get(
+            f"{mirror}/index.php",
+            params={
+                "req": query,
+                "columns[]": ["t", "a"],
+                "objects[]": "f",
+                "topics[]": "l",
+                "res": "25",
+            },
+        )
+        r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
         table = soup.find("table", class_="table-striped")
@@ -296,23 +338,20 @@ class LibGenScraper:
 
     async def _search_classic(self, query: str, mirror: str) -> list[AudiobookResult]:
         """Search classic libgen.is-style mirrors."""
-        try:
-            r = await self.client.get(
-                f"{mirror}/search.php",
-                params={
-                    "req": query,
-                    "lg_topic": "libgen",
-                    "open": "0",
-                    "view": "simple",
-                    "res": "25",
-                    "phrase": "1",
-                    "column": "def",
-                },
-            )
-            r.raise_for_status()
-        except Exception as e:
-            logger.error(f"LibGen search failed: {e}")
-            return []
+        # Propagates for the same reason as _search_li — see there.
+        r = await self.client.get(
+            f"{mirror}/search.php",
+            params={
+                "req": query,
+                "lg_topic": "libgen",
+                "open": "0",
+                "view": "simple",
+                "res": "25",
+                "phrase": "1",
+                "column": "def",
+            },
+        )
+        r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
         table = soup.find("table", class_="c")
