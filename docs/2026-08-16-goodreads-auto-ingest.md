@@ -226,10 +226,49 @@ since LibGen currently carries the whole pipeline.
 
 ## Reporting
 
-`#alerts` receives one line when a book reaches her shelf, one line when a book was found but
-rejected or could not be fetched (with the reason), and nothing on quiet cycles. Repeated
-errors — a source down, the feed unreachable — are posted once and then suppressed until the
-condition changes, so a broken dependency cannot produce a message every two minutes.
+Every book she adds produces exactly one line in `#alerts`, and nothing is said on quiet
+cycles. Silence for a book that was handled reads as though nothing happened, so all four
+outcomes speak:
+
+| Outcome | Message |
+|---|---|
+| Downloaded | `📖 Title — Author → Anca's shelf (epub, matched by isbn)` |
+| Already held | `📚 Title — Author: already in Calibre, nothing to fetch` |
+| Not found | `🔎 Title — Author` + an Anna's Archive search link + the ISBN |
+| Given up after retries | `⚠️ Title — Author` + the same search link |
+
+The two failure messages carry a ready-made Anna's Archive search because that is what
+happens next: AA only answers a person in a browser, so Viktor opens the link, finds the
+book by hand, and shares it back (see below). Repeated errors — a source down, the feed
+unreachable — are posted once and suppressed until the condition changes, so a broken
+dependency cannot produce a message every two minutes.
+
+## Adding a book by hand
+
+When the pipeline cannot find something, the manual route needs no file transfer from the
+phone. Sharing the book's link is enough:
+
+```
+POST https://book-search.viktorbarzin.me/api/download-url
+Header: X-Api-Key: <book_search_api_key>
+Body:   {"url": "<an Anna's Archive link, a libgen link, or the bare md5>"}
+→ {"job_id": "..."}   poll /api/download-status/<job_id> until "done"
+```
+
+The server takes the md5 out of whatever was shared and fetches the file from libgen by
+hash — which serves files libgen's own search does not index, so this works for books the
+pipeline itself could not find. Measured: accepted in 8s, in Calibre 23s later. Repeated
+shares of the same book collapse onto one job.
+
+Three things had to be fixed for this to work, all of them consequences of leaning on
+Anna's Archive, which does not answer us: the job used to give up when it could not read
+AA's detail page (the md5 alone is enough), Stacks was asked before libgen and accepts a
+book it can never deliver, and the endpoint blocked for over a minute waiting out an AA
+metadata lookup that cannot succeed. Books arriving this way land in the shared library
+rather than on her shelf, since a shared link says nothing about who it is for.
+
+If the file is already on the phone, the alternative is the calibre-web upload page at
+`calibre.viktorbarzin.me`.
 
 ## What shipped
 
