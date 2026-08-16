@@ -53,3 +53,12 @@ def test_success_names_the_book_and_where_it_went():
     assert "Middlemarch" in text
     assert "shelf" in text.lower()
     assert "epub" in text
+
+
+def test_already_owned_book_is_reported_too():
+    """Every book she adds ends in exactly one line — silence reads as nothing happened."""
+    from backend.goodreads.sync import format_owned
+
+    text = format_owned(item(title="The Bell Jar", author="Sylvia Plath"))
+    assert "The Bell Jar" in text
+    assert "already" in text.lower()

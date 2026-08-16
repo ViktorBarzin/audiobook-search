@@ -76,6 +76,11 @@ def format_miss(item: ShelfItem, reason: str) -> str:
     return "\n".join(lines)
 
 
+def format_owned(item: ShelfItem) -> str:
+    """She added a book the library already holds — nothing to fetch, but still news."""
+    return f"📚 *{item.title}* — {item.author}: already in Calibre, nothing to fetch"
+
+
 def format_success(item: ShelfItem, ext: str, reason: str) -> str:
     return (f"📖 *{item.title}* — {item.author} → Anca's shelf "
             f"({ext}, matched by {reason})")
@@ -236,6 +241,7 @@ class GoodreadsSync:
         if response.get("status") == "duplicate":
             self.store.record(item, Outcome.OWNED, reason="already in Calibre",
                               md5=match.candidate.md5)
+            await self._say(result, format_owned(item))
             return
 
         book_id = response.get("book_id")
