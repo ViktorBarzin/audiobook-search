@@ -22,14 +22,28 @@ class AudioBookBayScraper:
         await self.client.aclose()
 
     async def search(self, query: str) -> list[AudiobookResult]:
-        """Search AudioBookBay for audiobooks."""
-        search_url = f"{self.BASE_URL}/?s={quote(query)}&tt=1"
+        """Search AudioBookBay for audiobooks.
+
+        The query is lowercased first: measured 2026-08-21, audiobookbay.lu
+        redirects any `?s=` carrying an uppercase letter to its own root and
+        serves the newest uploads there. Lowercase queries are answered
+        normally, so folding the case is what makes a human-typed query work.
+        """
+        search_url = f"{self.BASE_URL}/?s={quote(query.lower())}&tt=1"
 
         try:
             response = await self.client.get(search_url)
             response.raise_for_status()
         except Exception as e:
             print(f"Search request failed: {e}")
+            return []
+
+        # Landing on the site root means the search was discarded, and the posts
+        # below would be the front page's newest uploads. Those parse cleanly and
+        # are otherwise indistinguishable from genuine hits, so stop here rather
+        # than return nine unrelated books as if they answered the query.
+        if str(response.url).rstrip("/") == self.BASE_URL.rstrip("/"):
+            print(f"Search bounced to the front page, discarding: {query!r}")
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
