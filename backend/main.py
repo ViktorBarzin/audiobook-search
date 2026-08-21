@@ -19,7 +19,7 @@ from backend.annas import AnnasArchiveScraper
 from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
 from backend.goodreads.matcher import author_surname, normalize_author, normalize_title
-from backend.kindle import choose_kindle_format
+from backend.kindle import MAX_BOOK_BYTES, choose_kindle_format
 from backend.models import AudiobookResult, AudiobookDetail
 from backend.dedupe import find_duplicate, find_inflight_duplicate, is_same_book
 
@@ -793,6 +793,16 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str,
             if not book_data:
                 return f"No downloadable format found for book {book_id}"
 
+        # Our relay caps a message at 20 MiB and answers an oversized one with a
+        # bounce, long after the caller has been told the send succeeded. Catching
+        # it here turns that into an error the caller can actually report.
+        if len(book_data) > MAX_BOOK_BYTES:
+            return (
+                f"{fmt} for book {book_id} is too large to mail: "
+                f"{len(book_data) / 1048576:.1f} MB, limit "
+                f"{MAX_BOOK_BYTES / 1048576:.0f} MB"
+            )
+
         from email.mime.multipart import MIMEMultipart
         from email.mime.application import MIMEApplication
 
@@ -1341,7 +1351,8 @@ async def goodreads_ingest(request: Request):
     elif book_id <= 0:
         kindle_skipped = "not identified in the library, so it cannot be fetched to send"
     else:
-        fmt, kindle_skipped = choose_kindle_format(_calibre_formats_for(book_id))
+        formats = _calibre_formats_for(book_id)
+        fmt, kindle_skipped = choose_kindle_format(formats, sizes=formats)
         if fmt:
             kindle_error = await _send_to_kindle(
                 book_id, title, GOODREADS_KINDLE_EMAIL, formats=(fmt,),
@@ -1969,27 +1980,28 @@ def _calibre_library_rows() -> list[tuple[str, str]]:
         conn.close()
 
 
-def _calibre_formats_for(book_id: int) -> list[str]:
-    """Formats Calibre holds for a book, straight from the library database.
+def _calibre_formats_for(book_id: int) -> dict[str, int]:
+    """Formats Calibre holds for a book, mapped to their size in bytes.
 
-    Asked before forwarding to a Kindle so a PDF-only book can be left alone
-    deliberately rather than discovered as a failed OPDS fetch.
+    Asked before forwarding to a Kindle so a PDF-only or too-large book can be
+    left alone deliberately, rather than discovered as a failed OPDS fetch or a
+    bounce off the mail relay minutes later.
     """
     db = os.path.join(CWA_LIBRARY_PATH, "metadata.db")
     if not os.path.exists(db) or book_id <= 0:
-        return []
+        return {}
 
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
     try:
         rows = conn.execute(
-            "SELECT format FROM data WHERE book = ?", (book_id,)
+            "SELECT format, uncompressed_size FROM data WHERE book = ?", (book_id,)
         ).fetchall()
     except sqlite3.Error as e:
         logger.warning(f"Format lookup failed for book {book_id}: {e}")
-        return []
+        return {}
     finally:
         conn.close()
-    return [r[0] for r in rows if r and r[0]]
+    return {r[0]: (r[1] or 0) for r in rows if r and r[0]}
 
 
 def _calibre_id_for(title: str, author: str) -> int | None:

@@ -90,3 +90,43 @@ async def test_the_default_still_tries_epub_then_pdf(monkeypatch, smtp_ready):
     assert len(smtp_ready) == 1
     assert any("epub" in path for path in requested)
     assert any("pdf" in path for path in requested)
+
+
+async def test_an_oversized_book_is_refused_before_the_relay_bounces_it(
+    monkeypatch, smtp_ready,
+):
+    """Brevo rejects a message over 20 MiB with dsn=5.3.4, and the sending app
+    only sees a 200 — so the size has to be caught here to be visible at all."""
+    from backend.kindle import MAX_BOOK_BYTES
+
+    def handler(request):
+        if "/opds/download/501/epub/" in request.url.path:
+            return httpx.Response(200, content=b"E" * (MAX_BOOK_BYTES + 1))
+        return httpx.Response(404)
+
+    opds_client_factory(monkeypatch, handler)
+
+    error = await bs_main._send_to_kindle(
+        501, "Strange Houses", "anca@kindle.com", formats=("epub",),
+    )
+
+    assert error and "too large" in error.lower()
+    assert smtp_ready == [], "nothing should reach SMTP"
+
+
+async def test_a_book_at_the_limit_is_still_sent(monkeypatch, smtp_ready):
+    from backend.kindle import MAX_BOOK_BYTES
+
+    def handler(request):
+        if "/opds/download/501/epub/" in request.url.path:
+            return httpx.Response(200, content=b"E" * MAX_BOOK_BYTES)
+        return httpx.Response(404)
+
+    opds_client_factory(monkeypatch, handler)
+
+    error = await bs_main._send_to_kindle(
+        501, "Just Under", "anca@kindle.com", formats=("epub",),
+    )
+
+    assert error is None
+    assert len(smtp_ready) == 1
