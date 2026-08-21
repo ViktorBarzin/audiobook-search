@@ -81,9 +81,23 @@ def format_owned(item: ShelfItem) -> str:
     return f"📚 *{item.title}* — {item.author}: already in Calibre, nothing to fetch"
 
 
-def format_success(item: ShelfItem, ext: str, reason: str) -> str:
-    return (f"📖 *{item.title}* — {item.author} → Anca's shelf "
-            f"({ext}, matched by {reason})")
+def format_success(item: ShelfItem, ext: str, reason: str,
+                   kindle_sent: bool = False, kindle_error: str | None = None,
+                   kindle_skipped: str | None = None) -> str:
+    """The one line a delivered book gets.
+
+    The Kindle clause is the part worth reading: a deliberate skip is news but
+    not a problem, while a failed send leaves the book in Calibre and needs a
+    person, so only that case carries a warning marker.
+    """
+    where = "Anca's shelf + Kindle" if kindle_sent else "Anca's shelf"
+    line = f"📖 *{item.title}* — {item.author} → {where} ({ext}, matched by {reason})"
+
+    if kindle_error:
+        return f"{line} · ⚠️ Kindle send did not go through: {kindle_error}"
+    if kindle_skipped:
+        return f"{line} · not sent to Kindle: {kindle_skipped}"
+    return line
 
 
 def search_queries(item: ShelfItem) -> list[str]:
@@ -112,6 +126,7 @@ class CycleResult:
     errors: int = 0
     would_download: int = 0
     deferred: int = 0  # source was down; retried next cycle
+    sent_to_kindle: int = 0
     messages: list[str] = field(default_factory=list)
 
 
@@ -248,7 +263,18 @@ class GoodreadsSync:
         self.store.record(item, Outcome.DOWNLOADED, reason=match.reason,
                           md5=match.candidate.md5, calibre_id=book_id)
         result.downloaded += 1
-        await self._say(result, format_success(item, match.candidate.ext, match.reason))
+        # Forwarding to the Kindle is the ingest endpoint's job — it holds the
+        # SMTP credentials and knows which formats actually landed in Calibre —
+        # so this only reports what it did. A response with none of these fields
+        # means forwarding is switched off, and the line reads as it always did.
+        if response.get("kindle_sent"):
+            result.sent_to_kindle += 1
+        await self._say(result, format_success(
+            item, match.candidate.ext, match.reason,
+            kindle_sent=bool(response.get("kindle_sent")),
+            kindle_error=response.get("kindle_error"),
+            kindle_skipped=response.get("kindle_skipped"),
+        ))
 
     async def _gather_candidates(self, item: ShelfItem, source=None, required: bool = True):
         """Collect candidates from a source, ISBN first.

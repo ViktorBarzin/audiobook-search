@@ -19,6 +19,7 @@ from backend.annas import AnnasArchiveScraper
 from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
 from backend.goodreads.matcher import author_surname, normalize_author, normalize_title
+from backend.kindle import choose_kindle_format
 from backend.models import AudiobookResult, AudiobookDetail
 from backend.dedupe import find_duplicate, find_inflight_duplicate, is_same_book
 
@@ -47,6 +48,12 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 # Calibre-web shelf that Goodreads-sourced books are added to (0 = don't shelve).
 GOODREADS_SHELF_ID = int(os.getenv("GOODREADS_SHELF_ID", "0") or 0)
+
+# Kindle address that Goodreads-sourced books are forwarded to once they are in
+# Calibre. Empty means shelve only, which is how the pipeline shipped. Only books
+# we actually fetch are forwarded: a book the library already held may well be on
+# the device already, and a second copy there is a nuisance to clear up.
+GOODREADS_KINDLE_EMAIL = os.getenv("GOODREADS_KINDLE_EMAIL", "").strip()
 
 # How long to spend asking Anna's Archive for a book's title before giving up.
 # AA is blocked from here, so that lookup burns a FlareSolverr timeout and
@@ -762,7 +769,8 @@ def _smtp_send_with_retry(msg, max_attempts: int = SMTP_MAX_ATTEMPTS) -> None:
     raise last_exc
 
 
-async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | None:
+async def _send_to_kindle(book_id: int, title: str, kindle_email: str,
+                          formats: tuple[str, ...] = ("epub", "pdf")) -> str | None:
     """Send book to Kindle email. Returns None on success, error string on failure.
 
     SMTP send retries up to SMTP_MAX_ATTEMPTS times with exponential backoff —
@@ -776,7 +784,7 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str) -> str | 
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             book_data = None
             fmt = None
-            for try_fmt in ("epub", "pdf"):
+            for try_fmt in formats:
                 r = await client.get(f"{CALIBRE_WEB_URL}/opds/download/{book_id}/{try_fmt}/", auth=auth)
                 if r.status_code == 200 and len(r.content) > 100:
                     book_data = r.content
@@ -1319,7 +1327,36 @@ async def goodreads_ingest(request: Request):
         if shelf_error:
             logger.warning(f"Shelf add failed for book {book_id}: {shelf_error}")
 
-    asyncio.create_task(_notify_slack(title, author, "ebook", "goodreads"))
+    # Forward to the Kindle, which is the point of the shelf for her. Reported
+    # back in three separate fields because "we chose not to send this" and "the
+    # send broke" mean different things to whoever reads the Slack line: only the
+    # second one needs a person. Either way the book is already in Calibre and on
+    # the shelf, so nothing here is allowed to fail the ingest.
+    kindle_sent = False
+    kindle_error = None
+    kindle_skipped = None
+
+    if not GOODREADS_KINDLE_EMAIL:
+        kindle_skipped = "no Kindle address configured"
+    elif book_id <= 0:
+        kindle_skipped = "not identified in the library, so it cannot be fetched to send"
+    else:
+        fmt, kindle_skipped = choose_kindle_format(_calibre_formats_for(book_id))
+        if fmt:
+            kindle_error = await _send_to_kindle(
+                book_id, title, GOODREADS_KINDLE_EMAIL, formats=(fmt,),
+            )
+            kindle_sent = kindle_error is None
+            if kindle_error:
+                logger.warning(
+                    f"Kindle send failed for book {book_id} ({title!r}): {kindle_error}"
+                )
+
+    # No Slack post from here. The poller announces every outcome itself, with
+    # the match reason and the shelf, and its contract is exactly one line per
+    # book — this endpoint posting as well made that two, which was already the
+    # case before Kindle forwarding and would now have said "Kindle" twice.
+    # backend/goodreads/sync.py owns the message for this pipeline.
 
     return {
         "status": "ok",
@@ -1327,6 +1364,9 @@ async def goodreads_ingest(request: Request):
         "filename": filename,
         "bytes": len(file_data),
         "shelf_error": shelf_error,
+        "kindle_sent": kindle_sent,
+        "kindle_error": kindle_error,
+        "kindle_skipped": kindle_skipped,
     }
 
 
@@ -1927,6 +1967,29 @@ def _calibre_library_rows() -> list[tuple[str, str]]:
         ))
     finally:
         conn.close()
+
+
+def _calibre_formats_for(book_id: int) -> list[str]:
+    """Formats Calibre holds for a book, straight from the library database.
+
+    Asked before forwarding to a Kindle so a PDF-only book can be left alone
+    deliberately rather than discovered as a failed OPDS fetch.
+    """
+    db = os.path.join(CWA_LIBRARY_PATH, "metadata.db")
+    if not os.path.exists(db) or book_id <= 0:
+        return []
+
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = conn.execute(
+            "SELECT format FROM data WHERE book = ?", (book_id,)
+        ).fetchall()
+    except sqlite3.Error as e:
+        logger.warning(f"Format lookup failed for book {book_id}: {e}")
+        return []
+    finally:
+        conn.close()
+    return [r[0] for r in rows if r and r[0]]
 
 
 def _calibre_id_for(title: str, author: str) -> int | None:
