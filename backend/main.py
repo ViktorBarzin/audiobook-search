@@ -628,6 +628,32 @@ async def health_deep():
     )
 
 
+CALIBRE_ID_ATTEMPTS = 12
+CALIBRE_ID_INTERVAL = 10
+
+
+async def _resolve_calibre_id(title: str, author: str) -> int | None:
+    """Ask the library database for a freshly imported book's id.
+
+    _upload_to_calibre gets the id from an OPDS poll that stops at the first
+    non-None answer, and _opds_search answers -1 when it finds an entry with no
+    downloadable format yet — which is what CWA looks like mid-import. So a book
+    that imports a moment later resolves to -1, and every consumer of that id
+    quietly does nothing: on 2026-09-04 Obviously Awesome was in the library as
+    id 507 ten seconds after the upload call had given up.
+
+    The Goodreads path already reads metadata.db, matched on title AND author.
+    This is the same wait, for the shortcut path.
+    """
+    for attempt in range(CALIBRE_ID_ATTEMPTS):
+        book_id = _calibre_id_for(title, author)
+        if book_id:
+            return book_id
+        if attempt < CALIBRE_ID_ATTEMPTS - 1:
+            await asyncio.sleep(CALIBRE_ID_INTERVAL)
+    return None
+
+
 def _no_route_message(md5: str, title: str, upstream: str | None = None) -> str:
     """Say which routes were tried and what would open one.
 
@@ -724,6 +750,11 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
         book_id = await _upload_to_calibre(file_data, filename)
         if not book_id:
             return False
+        if book_id <= 0:
+            # Upload succeeded but the id is still unknown; the library settles
+            # it. Without this the Kindle send downstream skips in silence.
+            job["stage_detail"] = "Uploaded, waiting for Calibre to import..."
+            book_id = await _resolve_calibre_id(title, author) or book_id
         job["book_id"] = book_id
         job["stage_detail"] = f"Downloaded {filename} ({len(file_data)} bytes)"
         logger.info(f"Fetched {md5} from libgen by hash: {filename}")
@@ -1150,7 +1181,23 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
         return
     bid = job["book_id"]
     if bid <= 0:
-        return
+        # A last look at the library, then say so. Returning quietly here is
+        # what made a job report "Added to Calibre" while the Kindle got
+        # nothing — the caller had no way to tell delivery had not happened.
+        bid = await _resolve_calibre_id(job.get("title") or title, job.get("author") or "")
+        if not bid or bid <= 0:
+            job["status"] = "failed"
+            job["message"] = (
+                "Added to Calibre but could not identify the book in the library, "
+                "so it was not sent to the Kindle. Send it by hand from Calibre."
+            )
+            job["stage_detail"] = job["message"]
+            logger.warning(
+                "[%s] No Calibre id for %r; skipping Kindle send to %s",
+                job_id, title, kindle_email,
+            )
+            return
+        job["book_id"] = bid
     job["stage_detail"] = "Sending to Kindle..."
     err = await _send_to_kindle(bid, title, kindle_email)
     if err:
