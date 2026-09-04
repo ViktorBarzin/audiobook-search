@@ -20,6 +20,8 @@ from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
 from backend.goodreads.matcher import (
     ShelfItem,
+    _is_usable,
+    _rank,
     author_surname,
     is_placeholder,
     normalize_author,
@@ -631,6 +633,30 @@ async def health_deep():
 CALIBRE_ID_ATTEMPTS = 12
 CALIBRE_ID_INTERVAL = 10
 
+# Anna's Archive builds every page title as "<page title> - <site title>"
+# (allthethings/templates/layouts/index.html), so a title shared from the iOS
+# share sheet arrives as "Obviously Awesome - Anna's Archive". The magnifier
+# glyph appears in some of their headings. Stripping this here costs one regex
+# and saves building text-manipulation actions inside Shortcuts.
+_AA_TITLE_SUFFIX_RE = _re.compile(
+    r"\s*[-–—|]?\s*(?:\U0001F50D\s*)?[-–—|]?\s*Anna[’']?s?\s+Archive\s*$",
+    _re.IGNORECASE,
+)
+_TRAILING_GLYPH_RE = _re.compile(r"\s*\U0001F50D\s*$")
+
+
+def _clean_shared_title(shared: str | None) -> str:
+    """Turn a shared page title into something searchable.
+
+    Returns "" when nothing but the site name was shared, which happens if the
+    share came from Anna's Archive's homepage rather than a book page.
+    """
+    if not shared:
+        return ""
+    cleaned = _AA_TITLE_SUFFIX_RE.sub("", shared.strip())
+    cleaned = _TRAILING_GLYPH_RE.sub("", cleaned)
+    return cleaned.strip()
+
 
 async def _resolve_calibre_id(title: str, author: str) -> int | None:
     """Ask the library database for a freshly imported book's id.
@@ -690,6 +716,7 @@ async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str |
     what keeps this from repeating the fuzzy last-word search that once shelved
     a CISSP study guide as Neuromancer. No confident match means no download.
     """
+    title = _clean_shared_title(title)
     if not libgen_scraper or not title or is_placeholder(title):
         return None, None
     if normalize_title(title) == normalize_title("Unknown"):
@@ -702,24 +729,65 @@ async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str |
         logger.warning(f"LibGen title search failed for {query!r}: {type(e).__name__}: {e}")
         return None, None
 
-    item = ShelfItem(book_id="", title=title, author=author or "", isbn=None, added_at=None)
-    match = select_candidate(item, candidates)
-    if not match.candidate:
+    if author:
+        item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
+        match = select_candidate(item, candidates)
+        chosen, how = match.candidate, match.reason
+    else:
+        chosen, how = _pick_on_title_alone(title, candidates), "title_only"
+
+    if not chosen:
         logger.info(
-            "No confident libgen match for %r by %r (%d candidates, reason=%s)",
-            title, author, len(candidates), match.reason,
+            "No confident libgen match for %r by %r (%d candidates)",
+            title, author or "(no author)", len(candidates),
         )
         return None, None
 
     logger.info(
         "Falling back to libgen md5 %s for %r by %r (matched on %s)",
-        match.candidate.md5, title, author, match.reason,
+        chosen.md5, title, author or "(no author)", how,
     )
     try:
-        return await libgen_scraper.download_file(match.candidate.md5)
+        return await libgen_scraper.download_file(chosen.md5)
     except Exception as e:
-        logger.warning(f"LibGen fallback download failed for {match.candidate.md5}: {e}")
+        logger.warning(f"LibGen fallback download failed for {chosen.md5}: {e}")
         return None, None
+
+
+def _pick_on_title_alone(title: str, candidates: list) -> object | None:
+    """Choose a file from a title with no author to corroborate it.
+
+    Anna's Archive page titles carry no author, so a book shared from a phone
+    arrives as a title and nothing else. Two rules keep that from picking the
+    wrong book, which is a real failure here: a fuzzy search once shelved a
+    CISSP study guide as Neuromancer because both list a Gibson.
+
+    1. The title must match EXACTLY once normalized. None of the
+       noise-tolerant extension matching _titles_agree allows, which would let
+       "Dune" take "Dune Messiah".
+    2. Every exact-title candidate must agree on one author surname. Where two
+       real books share a title ("Principles" by Dalio and by Carnap) there is
+       nothing to choose between them, so nothing is chosen.
+    """
+    wanted = normalize_title(title)
+    exact = [
+        c for c in candidates
+        if _is_usable(c) and normalize_title(c.title) == wanted
+    ]
+    if not exact:
+        return None
+
+    surnames = {author_surname(c.author) for c in exact}
+    surnames.discard("")
+    if len(surnames) != 1:
+        logger.info(
+            "Title %r is ambiguous without an author: %d candidates across "
+            "authors %s. Refusing to guess.",
+            title, len(exact), sorted(surnames) or ["(none)"],
+        )
+        return None
+
+    return sorted(exact, key=_rank)[0]
 
 
 async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail, mirror_urls: list[str] = None) -> bool:
@@ -1311,7 +1379,10 @@ async def download_url(request: Request):
 
     detail = await _detail_best_effort(md5)
     # A caller-supplied name wins: it came from the page a human was looking at,
-    # while AA metadata is usually absent here.
+    # while AA metadata is usually absent here. Clean it once, here, so the
+    # Kindle subject and the ingest filename get the book's name rather than
+    # "Obviously Awesome - Anna's Archive".
+    given_title = _clean_shared_title(given_title) or None
     title = given_title or (detail.title if detail else None) or "Unknown"
     author = given_author or (detail.author if detail else None) or "Unknown Author"
 
