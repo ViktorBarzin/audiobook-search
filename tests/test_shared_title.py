@@ -150,3 +150,53 @@ async def test_a_bare_site_title_is_not_searched_for(monkeypatch):
 
     assert data is None
     assert fake.queries == []
+
+
+# --- real libgen title cells, which are not clean ------------------------
+
+
+async def test_edition_and_isbn_noise_in_the_title_cell_still_matches(monkeypatch):
+    """Measured against live libgen on 2026-09-04.
+
+    Searching 'Thinking, Fast and Slow' returned 25 candidates and NOT ONE had
+    a clean title: libgen's title cell absorbs edition wording and ISBNs, e.g.
+    'Thinking, Fast and Slow 1st ed 9780141033570' and 'Thinking Fast And Slow
+    b l 4322674'. Requiring exact equality refused every one of them, so the
+    comparison has to be the matcher's noise-tolerant one.
+    """
+    import backend.main as bs_main
+    fake = FakeLibGen([
+        cand(EBOOK_MD5, "Thinking, Fast and Slow 1st ed 9780141033570", "Daniel Kahneman"),
+        cand(OTHER_MD5, "Thinking Fast And Slow b l 4322674", "Kahneman, Daniel"),
+    ])
+    monkeypatch.setattr(bs_main, "libgen_scraper", fake)
+
+    data, _ = await bs_main._libgen_by_title("Thinking, Fast and Slow", "")
+
+    assert data == EBOOK
+
+
+async def test_a_real_word_in_the_remainder_is_still_a_different_book(monkeypatch):
+    """'Dune' must not take 'Dune Messiah', noise tolerance or not."""
+    import backend.main as bs_main
+    fake = FakeLibGen([cand(EBOOK_MD5, "Dune Messiah", "Frank Herbert")])
+    monkeypatch.setattr(bs_main, "libgen_scraper", fake)
+
+    data, _ = await bs_main._libgen_by_title("Dune", "")
+
+    assert data is None
+    assert fake.download_calls == []
+
+
+async def test_noise_tolerance_does_not_defeat_the_ambiguity_guard(monkeypatch):
+    """Two authors behind noisy spellings of one title is still ambiguous."""
+    import backend.main as bs_main
+    fake = FakeLibGen([
+        cand(EBOOK_MD5, "Principles 1st ed 9781501124020", "Ray Dalio"),
+        cand(OTHER_MD5, "Principles 2nd ed 0415288967", "Rudolf Carnap"),
+    ])
+    monkeypatch.setattr(bs_main, "libgen_scraper", fake)
+
+    data, _ = await bs_main._libgen_by_title("Principles", "")
+
+    assert data is None

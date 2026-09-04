@@ -22,6 +22,7 @@ from backend.goodreads.matcher import (
     ShelfItem,
     _is_usable,
     _rank,
+    _titles_agree,
     author_surname,
     is_placeholder,
     normalize_author,
@@ -762,32 +763,32 @@ def _pick_on_title_alone(title: str, candidates: list) -> object | None:
     wrong book, which is a real failure here: a fuzzy search once shelved a
     CISSP study guide as Neuromancer because both list a Gibson.
 
-    1. The title must match EXACTLY once normalized. None of the
-       noise-tolerant extension matching _titles_agree allows, which would let
-       "Dune" take "Dune Messiah".
-    2. Every exact-title candidate must agree on one author surname. Where two
-       real books share a title ("Principles" by Dalio and by Carnap) there is
-       nothing to choose between them, so nothing is chosen.
+    1. The title must agree under _titles_agree, which allows the offered title
+       to extend the wanted one with bookkeeping tokens but not with a real
+       word. So "Dune" cannot take "Dune Messiah". Plain equality is too strict
+       to be usable: searching "Thinking, Fast and Slow" on 2026-09-04 returned
+       25 candidates and not one had a clean title, because libgen's title cell
+       absorbs edition wording and ISBNs ("Thinking, Fast and Slow 1st ed
+       9780141033570", "Thinking Fast And Slow b l 4322674").
+    2. Every title-matching candidate must agree on one author surname. Where
+       two real books share a title ("Principles" by Dalio and by Carnap) there
+       is nothing to choose between them, so nothing is chosen.
     """
-    wanted = normalize_title(title)
-    exact = [
-        c for c in candidates
-        if _is_usable(c) and normalize_title(c.title) == wanted
-    ]
-    if not exact:
+    matching = [c for c in candidates if _is_usable(c) and _titles_agree(title, c.title)]
+    if not matching:
         return None
 
-    surnames = {author_surname(c.author) for c in exact}
+    surnames = {author_surname(c.author) for c in matching}
     surnames.discard("")
     if len(surnames) != 1:
         logger.info(
             "Title %r is ambiguous without an author: %d candidates across "
             "authors %s. Refusing to guess.",
-            title, len(exact), sorted(surnames) or ["(none)"],
+            title, len(matching), sorted(surnames) or ["(none)"],
         )
         return None
 
-    return sorted(exact, key=_rank)[0]
+    return sorted(matching, key=_rank)[0]
 
 
 async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail, mirror_urls: list[str] = None) -> bool:
