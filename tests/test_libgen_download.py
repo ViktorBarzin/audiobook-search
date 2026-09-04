@@ -12,21 +12,36 @@ page as Referer. Passing ads.php straight to a plain GET (what the old code did)
 returns HTML, never a file. These tests pin that flow.
 """
 
+import hashlib
+
 import httpx
 import pytest
 
 from backend.libgen import LibGenScraper
 
 MD5 = "b8eef1eb09cab009626eb5eebb0223f4"
-ADS_HTML = (
-    '<html><body><table><tr><td>'
-    f'<a href="get.php?md5={MD5}&key=WUKQ514O52MPM9X6">GET</a>'
-    '</td></tr></table></body></html>'
-)
 # Real MOBI: PalmDB puts the book name at offset 0, so magic-byte sniffing on
 # the first 4 bytes fails — "BOOKMOBI" lives at offset 60.
 MOBI = b"Principles" + b"\x00" * 50 + b"BOOKMOBI" + b"\x00" * 2000
 EPUB = b"PK\x03\x04" + b"\x00" * 2000
+
+# A delivered file is now checked against the md5 that was asked for, so a
+# happy-path fixture has to ask for the hash its own payload actually has.
+# The failure-path tests below keep the arbitrary MD5: they never get far
+# enough to hash anything.
+MOBI_MD5 = hashlib.md5(MOBI).hexdigest()
+EPUB_MD5 = hashlib.md5(EPUB).hexdigest()
+
+
+def ads_html(md5: str, key: str = "WUKQ514O52MPM9X6") -> str:
+    return (
+        '<html><body><table><tr><td>'
+        f'<a href="get.php?md5={md5}&key={key}">GET</a>'
+        '</td></tr></table></body></html>'
+    )
+
+
+ADS_HTML = ads_html(MD5)
 
 
 def _scraper(handler):
@@ -100,31 +115,31 @@ async def test_download_file_follows_ads_then_get_with_referer():
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "ads.php" in str(request.url):
-            return httpx.Response(200, text=ADS_HTML)
+            return httpx.Response(200, text=ads_html(MOBI_MD5))
         seen["referer"] = request.headers.get("referer")
         seen["url"] = str(request.url)
         return httpx.Response(200, content=MOBI, headers={
             "content-disposition": 'attachment; filename=" Principles.mobi"'})
 
-    data, name = await _scraper(handler).download_file(MD5)
+    data, name = await _scraper(handler).download_file(MOBI_MD5)
 
     assert data == MOBI
     assert name == "Principles.mobi"
-    assert seen["url"] == f"https://libgen.li/get.php?md5={MD5}&key=WUKQ514O52MPM9X6"
+    assert seen["url"] == f"https://libgen.li/get.php?md5={MOBI_MD5}&key=WUKQ514O52MPM9X6"
     # Referer is load-bearing — libgen.li rejects the keyed URL without it.
-    assert seen["referer"] == f"https://libgen.li/ads.php?md5={MD5}"
+    assert seen["referer"] == f"https://libgen.li/ads.php?md5={MOBI_MD5}"
 
 
 @pytest.mark.asyncio
 async def test_download_file_synthesises_name_when_no_disposition():
     def handler(request):
         if "ads.php" in str(request.url):
-            return httpx.Response(200, text=ADS_HTML)
+            return httpx.Response(200, text=ads_html(EPUB_MD5))
         return httpx.Response(200, content=EPUB)
 
-    data, name = await _scraper(handler).download_file(MD5)
+    data, name = await _scraper(handler).download_file(EPUB_MD5)
     assert data == EPUB
-    assert name == f"{MD5}.epub"
+    assert name == f"{EPUB_MD5}.epub"
 
 
 @pytest.mark.asyncio

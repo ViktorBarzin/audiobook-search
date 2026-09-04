@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import re
 from urllib.parse import quote
@@ -124,6 +125,26 @@ class LibGenScraper:
         head = data[:64].lstrip().lower()
         return not (head.startswith(b"<!doctype") or head.startswith(b"<html"))
 
+    MD5_RE = re.compile(r"^[a-f0-9]{32}$", re.I)
+
+    @staticmethod
+    def _hash_matches(data: bytes, md5: str) -> bool:
+        """Confirm the bytes are the file we asked for.
+
+        libgen serves a truncated transfer with a 200 and no error: on
+        2026-09-04 cdn3.booksdl.lc returned exactly 1,048,576 bytes of a ~2 MB
+        epub, then 121,017 bytes on the next attempt. A prefix still begins
+        "PK\\x03\\x04", so _looks_like_ebook passes it and Calibre would take a
+        corrupt book. The md5 is what we asked for, so it verifies the answer
+        for free.
+
+        Some callers hold a libgen id rather than a hash; there is nothing to
+        compare those against, so they skip the check.
+        """
+        if not LibGenScraper.MD5_RE.match(md5 or ""):
+            return True
+        return hashlib.md5(data).hexdigest() == md5.lower()
+
     DOWNLOAD_ATTEMPTS = 3
 
     async def download_file(self, md5: str) -> tuple[bytes | None, str | None]:
@@ -177,6 +198,14 @@ class LibGenScraper:
         if not self._looks_like_ebook(data):
             logger.warning(
                 f"LibGen returned {len(data)} bytes of non-ebook content for {md5}"
+            )
+            return None, None
+
+        if not self._hash_matches(data, md5):
+            logger.warning(
+                "LibGen served a truncated or wrong file for %s: %d bytes hash "
+                "to %s. Discarding.",
+                md5, len(data), hashlib.md5(data).hexdigest(),
             )
             return None, None
 

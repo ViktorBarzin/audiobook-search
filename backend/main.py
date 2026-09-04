@@ -18,7 +18,14 @@ from backend.mam import MAMScraper
 from backend.annas import AnnasArchiveScraper
 from backend.libgen import LibGenScraper
 from backend.openlib import OpenLibraryScraper
-from backend.goodreads.matcher import author_surname, normalize_author, normalize_title
+from backend.goodreads.matcher import (
+    ShelfItem,
+    author_surname,
+    is_placeholder,
+    normalize_author,
+    normalize_title,
+    select_candidate,
+)
 from backend.kindle import MAX_BOOK_BYTES, choose_kindle_format
 from backend.models import AudiobookResult, AudiobookDetail
 from backend.dedupe import find_duplicate, find_inflight_duplicate, is_same_book
@@ -621,6 +628,74 @@ async def health_deep():
     )
 
 
+def _no_route_message(md5: str, title: str, upstream: str | None = None) -> str:
+    """Say which routes were tried and what would open one.
+
+    The old text was whatever Stacks last said — "No mirrors found" — which
+    reads like the book does not exist. On 2026-09-04 it meant libgen had no
+    file for that md5 and Anna's Archive was 403, while the book was on libgen
+    under other hashes. Naming the missing input is what makes the difference
+    actionable from a phone.
+    """
+    if not title or is_placeholder(title) or title == "Unknown":
+        return (
+            f"No download route for {md5}: libgen has no file for this hash and "
+            "Anna's Archive is unreachable, so the title is unknown and cannot "
+            "be searched for. Re-share with the book's title to search libgen "
+            "by name."
+        )
+    detail = f" (upstream: {upstream})" if upstream else ""
+    return (
+        f"No download route for {title!r}: libgen has no file for md5 {md5} and "
+        f"no confident title match, and Anna's Archive is unreachable{detail}."
+    )
+
+
+async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str | None]:
+    """Find the same book on libgen under a different hash.
+
+    An md5 shared from Anna's Archive names one FILE. libgen mirrors most books
+    many times over, but not always that exact file: Obviously Awesome (April
+    Dunford) arrived on 2026-09-04 as an AA-only md5 that libgen's ads.php and
+    md5 search both had nothing for, while the book itself sat there under a
+    dozen other hashes.
+
+    Identity is settled by title AND author through the shared matcher, which is
+    what keeps this from repeating the fuzzy last-word search that once shelved
+    a CISSP study guide as Neuromancer. No confident match means no download.
+    """
+    if not libgen_scraper or not title or is_placeholder(title):
+        return None, None
+    if normalize_title(title) == normalize_title("Unknown"):
+        return None, None
+
+    query = f"{title} {author}".strip() if author else title
+    try:
+        candidates = await libgen_scraper.search_candidates(query)
+    except Exception as e:
+        logger.warning(f"LibGen title search failed for {query!r}: {type(e).__name__}: {e}")
+        return None, None
+
+    item = ShelfItem(book_id="", title=title, author=author or "", isbn=None, added_at=None)
+    match = select_candidate(item, candidates)
+    if not match.candidate:
+        logger.info(
+            "No confident libgen match for %r by %r (%d candidates, reason=%s)",
+            title, author, len(candidates), match.reason,
+        )
+        return None, None
+
+    logger.info(
+        "Falling back to libgen md5 %s for %r by %r (matched on %s)",
+        match.candidate.md5, title, author, match.reason,
+    )
+    try:
+        return await libgen_scraper.download_file(match.candidate.md5)
+    except Exception as e:
+        logger.warning(f"LibGen fallback download failed for {match.candidate.md5}: {e}")
+        return None, None
+
+
 async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, author: str, detail, mirror_urls: list[str] = None) -> bool:
     """Attempt direct download from libgen mirrors or provided mirror URLs.
     Returns True if uploaded to Calibre."""
@@ -636,7 +711,12 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
             file_data, filename = await libgen_scraper.download_file(md5)
         except Exception as e:
             logger.warning(f"LibGen md5 download failed for {md5}: {e}")
-            return False
+            file_data, filename = None, None
+        if not file_data:
+            # libgen has no file for this exact hash. The book may still be
+            # there under another one, if the caller told us what it is.
+            job["stage_detail"] = "Not on libgen by hash, searching by title..."
+            file_data, filename = await _libgen_by_title(title, author)
         if not file_data or len(file_data) < MIN_EBOOK_SIZE_BYTES:
             return False
 
@@ -866,7 +946,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # Fallback: direct download for libgen mirrors
             if not await _try_direct_download(job_id, job, md5, title, author, detail):
                 job["status"] = "failed"
-                job["message"] = stacks_result.get("error", "Stacks failed and no direct mirror available")
+                job["message"] = _no_route_message(
+                    md5, title, upstream=stacks_result.get("error"),
+                )
                 job["stage_detail"] = job["message"]
                 return
             # _try_direct_download already uploaded via HTTP and set book_id.
@@ -1128,12 +1210,21 @@ async def download_url(request: Request):
     url = None
 
     kindle_email = None
+    # An optional title/author from the caller. Anna's Archive is 403 behind
+    # DDoS-Guard from this network, so its detail page cannot supply them, and
+    # without a name the libgen title fallback has nothing to search for — which
+    # is how Obviously Awesome failed on 2026-09-04 with the book on libgen all
+    # along. iOS Shortcuts has the shared page's title to hand.
+    given_title = None
+    given_author = None
     if "json" in content_type:
         try:
             data = await request.json()
             if isinstance(data, dict):
                 url = data.get("url", "")
                 kindle_email = data.get("kindle_email") or None
+                given_title = data.get("title") or None
+                given_author = data.get("author") or None
             else:
                 url = str(data)
         except Exception:
@@ -1142,10 +1233,15 @@ async def download_url(request: Request):
         form = await request.form()
         url = form.get("url", "")
         kindle_email = form.get("kindle_email") or None
+        given_title = form.get("title") or None
+        given_author = form.get("author") or None
     else:
         url = body.decode("utf-8", errors="replace").strip()
 
-    logging.info(f"download-url: url={url!r} kindle_email={kindle_email!r}")
+    logging.info(
+        f"download-url: url={url!r} kindle_email={kindle_email!r} "
+        f"title={given_title!r} author={given_author!r}"
+    )
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
@@ -1167,8 +1263,10 @@ async def download_url(request: Request):
         raise HTTPException(status_code=503, detail="Anna's Archive scraper not available")
 
     detail = await _detail_best_effort(md5)
-    title = detail.title if detail else "Unknown"
-    author = detail.author if detail else "Unknown Author"
+    # A caller-supplied name wins: it came from the page a human was looking at,
+    # while AA metadata is usually absent here.
+    title = given_title or (detail.title if detail else None) or "Unknown"
+    author = given_author or (detail.author if detail else None) or "Unknown Author"
 
     job_id = uuid.uuid4().hex[:12]
     _download_jobs[job_id] = {
