@@ -208,12 +208,25 @@ class AnnasArchiveScraper:
 
     async def get_detail(self, md5: str) -> AudiobookDetail | None:
         """Get detail page for an Anna's Archive book and extract download links."""
-        detail_url = f"{self.base_url}/md5/{md5}"
+        html = await self._fetch_public(f"{self.base_url}/md5/{md5}")
+        if not html:
+            return None
+        return self.parse_detail(html, md5)
 
-        html = await self._fetch_public(detail_url)
+    def parse_detail(self, html: str, md5: str) -> AudiobookDetail | None:
+        """Read a detail page that somebody else fetched.
+
+        Split from get_detail because Anna's Archive is human-only for us:
+        DDoS-Guard 403s /md5/ for plain requests, for six real browser TLS
+        handshakes via curl-impersonate, and for the cluster's headful Chrome.
+        A phone in a person's hand can load the page, so the iOS Shortcut sends
+        what Safari already rendered and the parsing happens here, where it can
+        be changed and deployed without anyone editing their shortcut.
+        """
         if not html:
             return None
 
+        detail_url = f"{self.base_url}/md5/{md5}"
         soup = BeautifulSoup(html, "html.parser")
 
         try:
