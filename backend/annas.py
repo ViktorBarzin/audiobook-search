@@ -17,6 +17,39 @@ FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr.servarr.sv
 # Self-hosted Stacks instance (Anna's Archive download manager)
 STACKS_URL = os.getenv("STACKS_URL", "http://annas-archive-stacks.ebooks.svc.cluster.local")
 
+# A year, a language tag, a file size, an ISBN: all of them sit in links next to
+# the author on a detail page, and none of them is a person.
+_NOT_A_NAME_RE = re.compile(
+    r"^(?:\d{4}|[a-z]{2}(?:-[A-Za-z]{2})?|[\d.]+\s?[KMG]B|[\d-]{10,17})$",
+    re.IGNORECASE,
+)
+
+
+def _author_link_after(title_elem) -> str | None:
+    """The first link after the title whose text reads like a person's name.
+
+    Anna's Archive renders the author as a plain link under the title, with the
+    publication year as the next link along. Matching on position rather than on
+    a class name survives the site's Tailwind classes being regenerated, which
+    is how every other selector here ended up stale.
+    """
+    # The author is the FIRST link after the title, so a short window is enough
+    # and keeps a download link further down the page from being read as a name.
+    for link in title_elem.find_all_next("a", limit=6):
+        href = link.get("href", "")
+        if any(part in href for part in ("/md5/", "_download/", "libgen", "library.lol")):
+            continue
+        text = link.get_text(strip=True).replace("\xa0", " ").strip()
+        if not text or len(text) > 80:
+            continue
+        # Breadcrumb path segments end in "/", and a bare glyph is a search icon.
+        if text.endswith("/") or not re.search(r"[A-Za-z]{2}", text):
+            continue
+        if _NOT_A_NAME_RE.match(text):
+            continue
+        return text
+    return None
+
 
 class AnnasArchiveScraper:
     """Anna's Archive ebook search. Prioritizes self-hosted Stacks, falls back to public site."""
@@ -286,6 +319,16 @@ class AnnasArchiveScraper:
                 if author_match:
                     author = author_match.group(1).strip()
 
+            # Fallback 4a: the link right under the title. This is what the
+            # live page actually uses — read off a real one on 2026-09-06,
+            # where the title sits in its own div and the author and the year
+            # follow as sibling links, with no div.italic, no "by X" in the
+            # <title>, and no og:description. The file-path breadcrumb also
+            # names the author, but it comes BEFORE the title in the document
+            # and its segments end in "/", so walking forward skips it.
+            if not author and title_elem:
+                author = _author_link_after(title_elem)
+
             # Fallback 4: Look for structured "Author: Name" label in page text
             if not author:
                 # Require colon after "Author" to avoid matching "Debut author Shen Tao introduces..."
@@ -340,6 +383,17 @@ class AnnasArchiveScraper:
             # Add LibGen direct download URLs as fallback
             mirror_urls.append(f"https://libgen.li/get.php?md5={md5}")
             mirror_urls.append(f"https://libgen.is/get.php?md5={md5}")
+
+            if not author:
+                # Every author selector here was written against markup that had
+                # already moved on, and finding that out cost a night of driving
+                # a phone. One log line makes the next move a five-minute fix.
+                where = html.find(title) if title else -1
+                excerpt = html[max(0, where - 200):where + 600] if where >= 0 else html[:800]
+                logger.info(
+                    "No author on the page for %s (title %r). Markup around it: %s",
+                    md5, title, re.sub(r"\s+", " ", excerpt),
+                )
 
             return AudiobookDetail(
                 id=f"annas:{md5}",
