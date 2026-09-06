@@ -1315,12 +1315,38 @@ async def _ttl_cleanup_job(job_id: str) -> None:
 # a libgen link carrying ?md5=, or the bare hash. All of them identify the same
 # file, so take any of them rather than insisting on one site's URL format.
 _MD5_ANYWHERE_RE = _re.compile(r"(?<![a-f0-9])([a-f0-9]{32})(?![a-f0-9])", _re.IGNORECASE)
+_PERCENT_ESCAPE_RE = _re.compile(r"%[0-9A-Fa-f]{2}")
 
 
 def extract_md5(shared: str | None) -> str | None:
     """Pull a book's md5 out of whatever was shared, or None."""
     match = _MD5_ANYWHERE_RE.search(shared or "")
     return match.group(1).lower() if match else None
+
+
+_MD5_IN_PAGE_RE = _re.compile(
+    r"(?:/md5/|/slow_download/|/fast_download/|md5=)([a-fA-F0-9]{32})"
+)
+
+
+def _md5_from_page(page: str | None) -> str | None:
+    """Recover a book's md5 from the Anna's Archive page the caller posted.
+
+    An AA detail page names its own md5 in every download link on it, while a
+    "readers also enjoyed" recommendation is linked once, so the most frequent
+    hash is the page's own book. This is the recovery path for a shortcut whose
+    URL variable resolved to nothing, which happened on 2026-09-06 with the
+    whole 263 KB page arriving alongside three empty headers.
+    """
+    if not page:
+        return None
+    counts: dict[str, int] = {}
+    for match in _MD5_IN_PAGE_RE.finditer(page[:MAX_PAGE_BYTES]):
+        found = match.group(1).lower()
+        counts[found] = counts.get(found, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda h: counts[h])
 
 
 def _detail_from_page(page: str | None, md5: str):
@@ -1443,11 +1469,26 @@ async def download_url(request: Request):
     # the API key in a header arrived fine. The difference is the construct, a
     # whole-value attachment in a dictionary versus an inline attachment
     # described by attachmentsByRange, so the shortcut now only uses the former.
-    # Values are percent-encoded by the shortcut, since an HTTP header cannot
-    # carry a raw title with spaces or non-ASCII.
+    # Values arrive raw. The shortcut used to percent-encode them through a URL
+    # Encode action, and that action's output was the one thing that never
+    # reached this handler (2026-09-06: url and title empty, while the api key,
+    # the Kindle address and the 263 KB page body all arrived). So decoding is
+    # now conditional, for the older hand-built shortcut and for anyone posting
+    # an encoded value by hand.
     def _hdr(name: str) -> str | None:
         raw = request.headers.get(name)
-        return unquote(raw) if raw else None
+        if not raw:
+            return None
+        # Starlette hands header bytes over as latin-1; iOS sends UTF-8. Undo
+        # that when the result is valid UTF-8, so a Cyrillic title survives.
+        try:
+            raw = raw.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        decoded = unquote(raw)
+        # unquote leaves an invalid escape alone, so "100% Awesome" is safe
+        # either way; this only guards a title that genuinely contains "%20".
+        return decoded if _PERCENT_ESCAPE_RE.search(raw) else raw
 
     url = _hdr("X-Book-Url") or url
     given_title = _hdr("X-Book-Title") or given_title
@@ -1458,6 +1499,13 @@ async def download_url(request: Request):
         f"download-url: url={url!r} kindle_email={kindle_email!r} "
         f"title={given_title!r} author={given_author!r} page={len(given_page or '')}b"
     )
+
+    # A page with no URL beside it is still enough: the page names its own book.
+    if not url:
+        recovered = _md5_from_page(given_page)
+        if recovered:
+            url = recovered
+            logging.info("Recovered %s from the posted page, no URL was sent", recovered)
 
     if not url:
         logging.warning(

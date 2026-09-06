@@ -106,25 +106,32 @@ def test_no_secret_is_baked_into_the_published_file(shortcut):
     assert b"X-Api-Key" in blob, "the header name itself is expected"
 
 
-def test_both_values_are_percent_encoded_before_they_become_headers(shortcut):
-    """The AA link carries :// ? and &, the title spaces and an apostrophe.
+def test_no_value_passes_through_a_url_encode_action(shortcut):
+    """URL Encode is the one step whose output never reached the server.
 
-    Both now travel as HTTP headers, which cannot carry either raw.
+    Measured live 2026-09-06: the API key, the Kindle address and the page body
+    all arrived, and each of those references an action output directly. The URL
+    and the title arrived empty, and those two were the ones that went through
+    is.workflow.actions.urlencode first. Headers carry raw values now, and the
+    endpoint percent-decodes only what looks encoded.
     """
+    ids = [a["WFWorkflowActionIdentifier"] for a in shortcut["WFWorkflowActions"]]
+    assert "is.workflow.actions.urlencode" not in ids
+
+
+def test_the_url_and_title_headers_read_the_safari_page_directly(shortcut):
     actions = shortcut["WFWorkflowActions"]
-    encoders = {
-        a["WFWorkflowActionParameters"]["UUID"]
-        for a in actions
-        if a["WFWorkflowActionIdentifier"] == "is.workflow.actions.urlencode"
-    }
-    assert len(encoders) == 2, "the url and the title both need encoding"
+    by_uuid = {a["WFWorkflowActionParameters"]["UUID"]: a for a in actions}
 
     request = actions[-1]["WFWorkflowActionParameters"]
     items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
     by_name = {i["WFKey"]["Value"]["string"]: i["WFValue"] for i in items}
 
-    assert by_name["X-Book-Url"]["Value"]["OutputUUID"] in encoders
-    assert by_name["X-Book-Title"]["Value"]["OutputUUID"] in encoders
+    for name in ("X-Book-Url", "X-Book-Title"):
+        source = by_uuid[by_name[name]["Value"]["OutputUUID"]]
+        assert source["WFWorkflowActionIdentifier"] == (
+            "is.workflow.actions.properties.safariwebpage"
+        ), f"{name} should come straight off the shared page"
 
 
 def test_the_request_posts_to_a_static_url_with_headers(shortcut):

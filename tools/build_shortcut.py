@@ -144,30 +144,11 @@ def text_action(out_uuid: str, value: str = "") -> dict:
     }
 
 
-def url_encode(source_uuid: str, source_name: str, out_uuid: str) -> dict:
-    """Percent-encode a previous action's output.
-
-    Both values need this. The shared link is
-    "https://annas-archive.pk/md5/<md5>?&check=1", whose "://", "?" and "&"
-    would otherwise terminate the query string early, and the page title
-    carries spaces and an apostrophe ("Obviously Awesome - Anna's Archive").
-    """
-    return {
-        "WFWorkflowActionIdentifier": "is.workflow.actions.urlencode",
-        "WFWorkflowActionParameters": {
-            "UUID": out_uuid,
-            "WFInput": action_output(source_uuid, source_name),
-        },
-    }
-
-
 def build(name: str = "Download to Calibre", who: str = "you") -> dict:
     key_uuid = new_uuid()
     mail_uuid = new_uuid()
     url_uuid = new_uuid()
-    url_enc_uuid = new_uuid()
     title_uuid = new_uuid()
-    title_enc_uuid = new_uuid()
 
     page_uuid = new_uuid()
 
@@ -179,9 +160,7 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
         # shared item.
         safari_property("Page Contents", page_uuid),
         safari_property("URL", url_uuid),
-        url_encode(url_uuid, "URL", url_enc_uuid),
         safari_property("Name", title_uuid),
-        url_encode(title_uuid, "Name", title_enc_uuid),
         {
             "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
             "WFWorkflowActionParameters": {
@@ -195,12 +174,17 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
                 # attachment inside a dictionary resolved correctly. So every
                 # value now rides in a header, which is the shape that works.
                 "WFURL": ENDPOINT,
-                # Percent-encoded, because an HTTP header cannot carry a raw
-                # title with spaces or non-ASCII.
+                # Raw, straight off the shared page. Percent-encoding these
+                # through a URL Encode action is what broke the second live run
+                # on 2026-09-06: the api key, the Kindle address and the page
+                # body all arrived, and those three reference an action output
+                # directly, while the url and the title went through
+                # is.workflow.actions.urlencode and arrived empty. The endpoint
+                # decodes only values that look encoded, so both shapes work.
                 "WFHTTPHeaders": dictionary_value([
                     ("X-Api-Key", action_output(key_uuid, "Text")),
-                    ("X-Book-Url", action_output(url_enc_uuid, "URL Encoded Text")),
-                    ("X-Book-Title", action_output(title_enc_uuid, "URL Encoded Text")),
+                    ("X-Book-Url", action_output(url_uuid, "URL")),
+                    ("X-Book-Title", action_output(title_uuid, "Name")),
                     ("X-Kindle-Email", action_output(mail_uuid, "Text")),
                 ]),
                 "WFHTTPBodyType": "File",
