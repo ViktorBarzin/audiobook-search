@@ -157,6 +157,51 @@ def test_no_page_still_works(client):
     assert r.json()["title"] == "Some Book"
 
 
+# --- the page as a raw body -----------------------------------------------
+
+
+def test_a_raw_body_is_the_page_when_the_query_string_carries_the_url(client):
+    """What the generated shortcut sends.
+
+    Building a JSON dictionary blind is the risky part of a generated
+    shortcut: the body key is WFJSONBody in one action library and
+    WFJSONValues in another, and the wrong one sends nothing with no error. A
+    URL carrying query params plus a raw body needs neither, so the generated
+    shortcut sticks to well-documented constructs.
+    """
+    r = client.post(
+        f"/api/download-url?url={MD5}&title=Ignored%20-%20Anna%27s%20Archive",
+        content=AA_PAGE.encode(),
+        headers={**HDRS, "Content-Type": "text/plain"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["author"] == "April Dunford", "the body was read as the page"
+
+
+def test_a_raw_body_is_still_the_url_when_the_query_string_is_empty(client):
+    """The oldest caller posts a bare md5 as the body. Do not break it."""
+    r = client.post(
+        "/api/download-url",
+        content=MD5.encode(),
+        headers={**HDRS, "Content-Type": "text/plain"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["job_id"]
+
+
+def test_a_raw_body_that_is_not_a_page_is_ignored(client):
+    r = client.post(
+        f"/api/download-url?url={MD5}&title=Some%20Book",
+        content=b"not a page",
+        headers={**HDRS, "Content-Type": "text/plain"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["title"] == "Some Book"
+
+
 # --- a page must not divert the download away from what works --------------
 
 

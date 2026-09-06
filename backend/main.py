@@ -65,6 +65,16 @@ SHORTCUT_FILE = os.getenv(
     "SHORTCUT_FILE",
     os.path.join(os.path.dirname(__file__), "static", "download-to-calibre.shortcut"),
 )
+# Apple signs a shortcut with `shortcuts sign`, which only exists on macOS, and
+# iOS 15 dropped the "Allow Untrusted Shortcuts" setting, so an UNSIGNED file
+# cannot be installed at all (confirmed on Viktor's phone 2026-09-04). This is
+# the same generator output signed on his Mac with --mode anyone, and it is
+# what /shortcut hands out. Regenerate with tools/sign_shortcut.sh whenever the
+# generator changes; the unsigned file beside it stays as the drift reference.
+SHORTCUT_SIGNED_FILE = os.getenv(
+    "SHORTCUT_SIGNED_FILE",
+    os.path.join(os.path.dirname(__file__), "static", "download-to-calibre.signed.shortcut"),
+)
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 # Calibre-web shelf that Goodreads-sourced books are added to (0 = don't shelve).
@@ -1408,7 +1418,15 @@ async def download_url(request: Request):
         given_author = form.get("author") or None
         given_page = form.get("page") or None
     else:
-        url = body.decode("utf-8", errors="replace").strip()
+        raw = body.decode("utf-8", errors="replace").strip()
+        # A raw body is either the shared link, which is how the oldest caller
+        # posts, or the Anna's Archive page, which is how the generated
+        # shortcut posts. Query params carry the url in the second case, and a
+        # page is recognisable as markup, so the two never collide.
+        if raw[:400].lstrip().lower().startswith(("<!doctype", "<html")):
+            given_page = raw
+        elif not request.query_params.get("url"):
+            url = raw
 
     # Query parameters fill in whatever the body did not carry. The generated
     # iOS Shortcut uses them: a URL with query params is a plain
@@ -1681,12 +1699,14 @@ async def shortcut_redirect():
         # once. Sharing the installed shortcut from the phone produces an
         # Apple-signed iCloud link; point SHORTCUT_ICLOUD_URL at that and this
         # endpoint redirects there instead, with no toggle needed.
-        if os.path.exists(SHORTCUT_FILE):
-            return FileResponse(
-                SHORTCUT_FILE,
-                media_type="application/octet-stream",
-                filename="Download to Calibre.shortcut",
-            )
+        # The signed copy is the only one a phone can actually install.
+        for path in (SHORTCUT_SIGNED_FILE, SHORTCUT_FILE):
+            if path and os.path.exists(path):
+                return FileResponse(
+                    path,
+                    media_type="application/octet-stream",
+                    filename="Download to Calibre.shortcut",
+                )
         raise HTTPException(status_code=404, detail="Shortcut not configured")
     return RedirectResponse(url=SHORTCUT_ICLOUD_URL)
 

@@ -166,6 +166,8 @@ def build() -> dict:
     title_uuid = new_uuid()
     title_enc_uuid = new_uuid()
 
+    page_uuid = new_uuid()
+
     actions = [
         text_action(key_uuid),
         text_action(mail_uuid),
@@ -173,6 +175,10 @@ def build() -> dict:
         url_encode(url_uuid, "URL", url_enc_uuid),
         safari_property("Name", title_uuid),
         url_encode(title_uuid, "Name", title_enc_uuid),
+        # The page Safari already rendered. Anna's Archive is human-only for
+        # us, so this is the only way the author ever reaches the server, and
+        # it costs no network call because the page is already loaded.
+        safari_property("Page Contents", page_uuid),
         {
             "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
             "WFWorkflowActionParameters": {
@@ -192,6 +198,13 @@ def build() -> dict:
                 "WFHTTPHeaders": dictionary_value([
                     ("X-Api-Key", action_output(key_uuid, "Text")),
                 ]),
+                # The page goes as the raw body. A JSON body would need a
+                # WFDictionaryFieldValue under a key named WFJSONBody in one
+                # action library and WFJSONValues in another; the wrong name
+                # sends nothing and reports no error, and there is no iOS
+                # instrument here to catch that. A raw body needs neither.
+                "WFHTTPBodyType": "File",
+                "WFRequestVariable": action_output(page_uuid, "Page Contents"),
             },
         },
     ]

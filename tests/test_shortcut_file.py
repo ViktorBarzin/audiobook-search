@@ -8,6 +8,7 @@ the wrong action index, or a value that needed percent-encoding and did not get
 it.
 """
 
+import os
 import plistlib
 
 import pytest
@@ -148,8 +149,36 @@ def test_the_request_posts_with_the_key_in_a_header(shortcut):
 # --- the endpoint that hands it out ---------------------------------------
 
 
-def test_shortcut_endpoint_serves_the_file_when_no_icloud_url(monkeypatch):
+def test_shortcut_endpoint_serves_the_signed_file(monkeypatch):
+    """Only a signed file installs.
+
+    iOS 15 removed "Allow Untrusted Shortcuts" and an unsigned import was
+    refused on a real phone on 2026-09-04. Apple's signed container is an
+    Apple Encrypted Archive, so it starts AEA1 rather than being a readable
+    plist.
+    """
     monkeypatch.setattr(bs_main, "SHORTCUT_ICLOUD_URL", "")
+    client = TestClient(bs_main.app)
+
+    r = client.get("/shortcut")
+
+    assert r.status_code == 200
+    assert r.content[:4] == b"AEA1", "an unsigned shortcut cannot be installed"
+    assert len(r.content) > len(open(bs_main.SHORTCUT_FILE, "rb").read())
+
+
+def test_the_unsigned_file_is_kept_as_the_drift_reference(monkeypatch):
+    """It cannot be served, but it is what the generator is checked against."""
+    assert os.path.exists(bs_main.SHORTCUT_FILE)
+    assert plistlib.loads(open(bs_main.SHORTCUT_FILE, "rb").read())[
+        "WFWorkflowName"
+    ] == "Download to Calibre"
+
+
+def test_the_unsigned_file_is_served_only_if_no_signed_one_exists(monkeypatch, tmp_path):
+    """A fresh checkout before anyone has signed should still hand out something."""
+    monkeypatch.setattr(bs_main, "SHORTCUT_ICLOUD_URL", "")
+    monkeypatch.setattr(bs_main, "SHORTCUT_SIGNED_FILE", str(tmp_path / "absent"))
     client = TestClient(bs_main.app)
 
     r = client.get("/shortcut")
