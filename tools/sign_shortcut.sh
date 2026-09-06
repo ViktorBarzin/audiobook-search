@@ -17,25 +17,34 @@
 #                                     -c wireguard -- wg show wg0)
 #   - a relay container exists:
 #       kubectl debug -n wireguard <pod> --image=alpine:3.20 \
-#         --target=wireguard -c relay1 -- sleep 900
-#       kubectl -n wireguard exec <pod> -c relay1 -- apk add --no-cache socat
+#         --target=wireguard -c relayN -- sleep 900   (then RELAY_CONTAINER=relayN)
+#       kubectl -n wireguard exec <pod> -c relayN -- apk add --no-cache socat
 #
 # Usage: tools/sign_shortcut.sh [pod-name]
 set -eu
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-UNSIGNED="$HERE/backend/static/download-to-calibre.shortcut"
-SIGNED="$HERE/backend/static/download-to-calibre.signed.shortcut"
+# Sign every variant. They differ only in name and in whose Kindle address the
+# import question asks for; neither address is baked in.
+VARIANTS=("" "anca")
 
 POD="${1:-$(kubectl -n wireguard get pod -l app=wireguard -o jsonpath='{.items[0].metadata.name}')}"
 HOST=viktorbarzin@10.3.5.2
-RELAY="kubectl -n wireguard exec -i $POD -c relay1 -- socat - TCP:10.3.5.2:22"
+# The relay container name changes each time one is created, since an
+# ephemeral container cannot be removed from a live pod and its name must
+# be unique. Override with RELAY_CONTAINER.
+RELAY_CONTAINER="${RELAY_CONTAINER:-relay1}"
+RELAY="kubectl -n wireguard exec -i $POD -c $RELAY_CONTAINER -- socat - TCP:10.3.5.2:22"
 SSH_OPTS=(-o "ProxyCommand=$RELAY" -o StrictHostKeyChecking=accept-new
           -o ConnectTimeout=20 -o BatchMode=yes)
 
-python3 "$HERE/tools/build_shortcut.py" "$UNSIGNED"
+for variant in "${VARIANTS[@]}"; do
+  stem="download-to-calibre${variant:+-$variant}"
+  UNSIGNED="$HERE/backend/static/$stem.shortcut"
+  SIGNED="$HERE/backend/static/$stem.signed.shortcut"
+  python3 "$HERE/tools/build_shortcut.py" "$UNSIGNED" $variant
 
-echo "== uploading unsigned ($(stat -c%s "$UNSIGNED") bytes) =="
+echo "== uploading unsigned $stem ($(stat -c%s "$UNSIGNED") bytes) =="
 # base64 over the ssh channel, because scp has no route of its own here.
 # macOS base64 wants -i/-o rather than positional arguments.
 base64 -w0 "$UNSIGNED" | ssh "${SSH_OPTS[@]}" "$HOST" \
@@ -51,5 +60,6 @@ ssh "${SSH_OPTS[@]}" "$HOST" 'base64 -i /tmp/dtc-signed.shortcut' | tr -d '\n' |
 
 ssh "${SSH_OPTS[@]}" "$HOST" 'rm -f /tmp/dtc.b64 /tmp/dtc-unsigned.shortcut /tmp/dtc-signed.shortcut'
 
-head -c 4 "$SIGNED" | grep -q AEA1 || { echo "not an Apple Encrypted Archive"; exit 1; }
-echo "wrote $SIGNED ($(stat -c%s "$SIGNED") bytes, AEA1)"
+  head -c 4 "$SIGNED" | grep -q AEA1 || { echo "not an Apple Encrypted Archive"; exit 1; }
+  echo "wrote $SIGNED ($(stat -c%s "$SIGNED") bytes, AEA1)"
+done

@@ -176,15 +176,69 @@ def test_the_unsigned_file_is_kept_as_the_drift_reference(monkeypatch):
 
 
 def test_the_unsigned_file_is_served_only_if_no_signed_one_exists(monkeypatch, tmp_path):
-    """A fresh checkout before anyone has signed should still hand out something."""
+    """A checkout nobody has signed yet should still hand out something."""
     monkeypatch.setattr(bs_main, "SHORTCUT_ICLOUD_URL", "")
-    monkeypatch.setattr(bs_main, "SHORTCUT_SIGNED_FILE", str(tmp_path / "absent"))
+    # A static dir holding the unsigned build and no signed sibling.
+    (tmp_path / "download-to-calibre.shortcut").write_bytes(
+        plistlib.dumps(build(), fmt=plistlib.FMT_BINARY)
+    )
+    monkeypatch.setattr(bs_main, "SHORTCUT_STATIC_DIR", str(tmp_path))
     client = TestClient(bs_main.app)
 
     r = client.get("/shortcut")
 
     assert r.status_code == 200
     assert plistlib.loads(r.content)["WFWorkflowName"] == "Download to Calibre"
+
+
+def test_the_two_variants_differ_only_in_name_and_prompt():
+    """Same actions, same endpoint. Only the label and the question change.
+
+    Both Kindle addresses stay OUT of the published files: /shortcut is
+    unauthenticated and a Kindle address is personal, so each is answered at
+    install time instead of being baked in.
+    """
+    from tools.build_shortcut import VARIANTS
+
+    mine = build(*VARIANTS[""])
+    hers = build(*VARIANTS["anca"])
+
+    assert mine["WFWorkflowName"] == "Download to Calibre"
+    assert hers["WFWorkflowName"] == "Download to Calibre (Anca)"
+
+    def shape(d):
+        return [a["WFWorkflowActionIdentifier"] for a in d["WFWorkflowActions"]]
+
+    assert shape(mine) == shape(hers), "the two must do the same thing"
+
+    prompts = [q["Text"] for q in hers["WFWorkflowImportQuestions"]]
+    assert any("Anca" in p for p in prompts), "hers should name whose Kindle it is"
+
+    for d in (mine, hers):
+        blob = plistlib.dumps(d, fmt=plistlib.FMT_BINARY)
+        assert b"kindle.com" not in blob, "no Kindle address may be published"
+
+
+def test_the_anca_variant_is_served_from_the_same_endpoint(monkeypatch):
+    monkeypatch.setattr(bs_main, "SHORTCUT_ICLOUD_URL", "")
+    client = TestClient(bs_main.app)
+
+    mine = client.get("/shortcut")
+    hers = client.get("/shortcut", params={"for": "anca"})
+
+    assert mine.status_code == 200 and hers.status_code == 200
+    assert mine.content[:4] == b"AEA1" and hers.content[:4] == b"AEA1"
+    assert mine.content != hers.content, "they must be different shortcuts"
+
+
+def test_an_unknown_variant_falls_back_rather_than_erroring(monkeypatch):
+    monkeypatch.setattr(bs_main, "SHORTCUT_ICLOUD_URL", "")
+    client = TestClient(bs_main.app)
+
+    r = client.get("/shortcut", params={"for": "nobody"})
+
+    assert r.status_code == 200
+    assert r.content == client.get("/shortcut").content
 
 
 def test_an_icloud_url_still_wins(monkeypatch):
@@ -206,11 +260,18 @@ def test_the_endpoint_needs_no_api_key(monkeypatch):
     assert client.get("/shortcut").status_code == 200
 
 
-def test_the_committed_file_matches_the_generator():
+@pytest.mark.parametrize("variant,stem", [
+    ("", "download-to-calibre"),
+    ("anca", "download-to-calibre-anca"),
+])
+def test_the_committed_files_match_the_generator(variant, stem):
     """Otherwise an edit to the generator ships nothing, or the reverse."""
-    with open(bs_main.SHORTCUT_FILE, "rb") as fh:
+    from tools.build_shortcut import VARIANTS
+
+    static = os.path.join(os.path.dirname(bs_main.__file__), "static")
+    with open(os.path.join(static, f"{stem}.shortcut"), "rb") as fh:
         committed = plistlib.load(fh)
-    fresh = build()
+    fresh = build(*VARIANTS[variant])
 
     # UUIDs are regenerated on every build, so compare shape without them.
     def strip_uuids(node):
@@ -225,6 +286,16 @@ def test_the_committed_file_matches_the_generator():
         return node
 
     assert strip_uuids(committed) == strip_uuids(fresh), (
-        "re-run: python3 tools/build_shortcut.py "
-        "backend/static/download-to-calibre.shortcut"
+        f"re-run: tools/sign_shortcut.sh (or build_shortcut.py ... {variant})"
     )
+
+
+@pytest.mark.parametrize("stem", ["download-to-calibre", "download-to-calibre-anca"])
+def test_both_variants_ship_a_signed_copy(stem):
+    """An unsigned shortcut cannot be installed on iOS 15 or later."""
+    static = os.path.join(os.path.dirname(bs_main.__file__), "static")
+    signed = os.path.join(static, f"{stem}.signed.shortcut")
+
+    assert os.path.exists(signed), f"{stem} has no signed build; run tools/sign_shortcut.sh"
+    with open(signed, "rb") as fh:
+        assert fh.read(4) == b"AEA1"

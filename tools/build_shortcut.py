@@ -158,7 +158,7 @@ def url_encode(source_uuid: str, source_name: str, out_uuid: str) -> dict:
     }
 
 
-def build() -> dict:
+def build(name: str = "Download to Calibre", who: str = "you") -> dict:
     key_uuid = new_uuid()
     mail_uuid = new_uuid()
     url_uuid = new_uuid()
@@ -213,7 +213,7 @@ def build() -> dict:
         "WFWorkflowClientVersion": "1200.3",
         "WFWorkflowMinimumClientVersion": 900,
         "WFWorkflowMinimumClientVersionString": "900",
-        "WFWorkflowName": "Download to Calibre",
+        "WFWorkflowName": name,
         "WFWorkflowTypes": WORKFLOW_TYPES,
         "WFWorkflowInputContentItemClasses": INPUT_CLASSES,
         "WFWorkflowIcon": {
@@ -233,7 +233,7 @@ def build() -> dict:
                 "ActionIndex": 1,
                 "Category": "Parameter",
                 "ParameterKey": "WFTextActionText",
-                "Text": "Your Kindle address (leave blank to skip emailing)",
+                "Text": f"Kindle address for {who} (leave blank to skip emailing)",
                 "DefaultValue": "",
             },
         ],
@@ -241,14 +241,29 @@ def build() -> dict:
     }
 
 
+# The two shortcuts differ only in their name and in whose Kindle address the
+# import question asks for. Both addresses stay OUT of the published files:
+# /shortcut is unauthenticated, and a Kindle address is personal, so each is
+# filled in at install time instead of being baked in.
+VARIANTS = {
+    "": ("Download to Calibre", "you"),
+    "anca": ("Download to Calibre (Anca)", "Anca"),
+}
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print("usage: build_shortcut.py <out.shortcut> [variant]", file=sys.stderr)
         return 2
     out = sys.argv[1]
+    variant = sys.argv[2] if len(sys.argv) == 3 else ""
+    if variant not in VARIANTS:
+        print(f"unknown variant {variant!r}, want one of {sorted(VARIANTS)}", file=sys.stderr)
+        return 2
+    name, who = VARIANTS[variant]
     with open(out, "wb") as fh:
-        plistlib.dump(build(), fh, fmt=plistlib.FMT_BINARY)
-    print(f"wrote {out}")
+        plistlib.dump(build(name, who), fh, fmt=plistlib.FMT_BINARY)
+    print(f"wrote {out} ({name})")
     return 0
 
 
