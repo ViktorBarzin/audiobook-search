@@ -299,3 +299,31 @@ def test_both_variants_ship_a_signed_copy(stem):
     assert os.path.exists(signed), f"{stem} has no signed build; run tools/sign_shortcut.sh"
     with open(signed, "rb") as fh:
         assert fh.read(4) == b"AEA1"
+
+
+def test_only_a_safari_web_page_is_accepted_as_input():
+    """Running from Safari's share sheet on a book page failed on 2026-09-06:
+
+        Get Details of Safari Web Page failed because Shortcuts couldn't
+        convert from URL to Safari Web Page.
+
+    Accepting WFURLContentItem alongside the page let the share sheet hand over
+    the URL representation, and a URL cannot be converted back into a page.
+    The URL and title coerce from a URL; page contents do not, and they are the
+    one thing this flow exists to collect.
+    """
+    d = build()
+
+    assert d["WFWorkflowInputContentItemClasses"] == ["WFSafariWebPageContentItem"]
+
+
+def test_page_contents_is_read_before_anything_can_coerce_the_input():
+    """It is the detail that cannot be recovered once the item is a URL."""
+    d = build()
+    safari = [
+        a["WFWorkflowActionParameters"]["WFContentItemPropertyName"]
+        for a in d["WFWorkflowActions"]
+        if a["WFWorkflowActionIdentifier"].endswith("properties.safariwebpage")
+    ]
+
+    assert safari[0] == "Page Contents", f"read it first, got order {safari}"

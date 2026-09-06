@@ -39,11 +39,14 @@ ENDPOINT = "https://book-search.viktorbarzin.me/api/download-url"
 
 # "Show in Share Sheet", so the shortcut appears when sharing from Safari.
 WORKFLOW_TYPES = ["ActionExtension"]
-INPUT_CLASSES = [
-    "WFSafariWebPageContentItem",
-    "WFURLContentItem",
-    "WFStringContentItem",
-]
+# ONLY the Safari web page. Accepting WFURLContentItem alongside it made
+# Safari's share sheet hand over the URL representation instead, and Shortcuts
+# cannot convert a URL back into a page: running it from the share sheet on a
+# book page failed with "Get Details of Safari Web Page failed because
+# Shortcuts couldn't convert from URL to Safari Web Page" (2026-09-06). The URL
+# and title coerce from a URL, but page contents genuinely need a rendered
+# page, which is the one thing this flow cannot do without.
+INPUT_CLASSES = ["WFSafariWebPageContentItem"]
 
 
 def new_uuid() -> str:
@@ -171,14 +174,14 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
     actions = [
         text_action(key_uuid),
         text_action(mail_uuid),
+        # Page contents FIRST: it is the detail that cannot be recovered from a
+        # URL, so it is read before any other action has a chance to coerce the
+        # shared item.
+        safari_property("Page Contents", page_uuid),
         safari_property("URL", url_uuid),
         url_encode(url_uuid, "URL", url_enc_uuid),
         safari_property("Name", title_uuid),
         url_encode(title_uuid, "Name", title_enc_uuid),
-        # The page Safari already rendered. Anna's Archive is human-only for
-        # us, so this is the only way the author ever reaches the server, and
-        # it costs no network call because the page is already loaded.
-        safari_property("Page Contents", page_uuid),
         {
             "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
             "WFWorkflowActionParameters": {
