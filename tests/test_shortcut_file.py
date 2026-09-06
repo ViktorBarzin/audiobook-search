@@ -106,8 +106,11 @@ def test_no_secret_is_baked_into_the_published_file(shortcut):
     assert b"X-Api-Key" in blob, "the header name itself is expected"
 
 
-def test_both_values_are_percent_encoded_before_the_query_string(shortcut):
-    """The AA link carries :// ? and &, the title carries spaces and an apostrophe."""
+def test_both_values_are_percent_encoded_before_they_become_headers(shortcut):
+    """The AA link carries :// ? and &, the title spaces and an apostrophe.
+
+    Both now travel as HTTP headers, which cannot carry either raw.
+    """
     actions = shortcut["WFWorkflowActions"]
     encoders = {
         a["WFWorkflowActionParameters"]["UUID"]
@@ -117,33 +120,24 @@ def test_both_values_are_percent_encoded_before_the_query_string(shortcut):
     assert len(encoders) == 2, "the url and the title both need encoding"
 
     request = actions[-1]["WFWorkflowActionParameters"]
-    url_token = request["WFURL"]["Value"]
-    string = url_token["string"]
-    assert string.startswith(ENDPOINT + "?url=")
+    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+    by_name = {i["WFKey"]["Value"]["string"]: i["WFValue"] for i in items}
 
-    # The attachments sitting in ?url= and &title= must be the encoders' output.
-    used = [
-        att["OutputUUID"]
-        for key, att in sorted(
-            url_token["attachmentsByRange"].items(),
-            key=lambda kv: int(kv[0].strip("{}").split(",")[0]),
-        )
-    ]
-    assert used[0] in encoders, "the shared link must go through URL Encode"
-    assert used[1] in encoders, "the title must go through URL Encode"
+    assert by_name["X-Book-Url"]["Value"]["OutputUUID"] in encoders
+    assert by_name["X-Book-Title"]["Value"]["OutputUUID"] in encoders
 
 
-def test_the_request_posts_with_the_key_in_a_header(shortcut):
+def test_the_request_posts_to_a_static_url_with_headers(shortcut):
     request = shortcut["WFWorkflowActions"][-1]
     assert request["WFWorkflowActionIdentifier"] == "is.workflow.actions.downloadurl"
     params = request["WFWorkflowActionParameters"]
+
     assert params["WFHTTPMethod"] == "POST"
+    assert params["WFURL"] == ENDPOINT, "no variables embedded in the url"
     headers = params["WFHTTPHeaders"]
     assert headers["WFSerializationType"] == "WFDictionaryFieldValue"
-    items = headers["Value"]["WFDictionaryFieldValueItems"]
-    assert [i["WFKey"]["Value"]["string"] for i in items] == ["X-Api-Key"]
-    # In a header, not the query string, so it stays out of access logs.
-    assert "key=" not in params["WFURL"]["Value"]["string"]
+    # The page is far too large for a header, so it stays the request body.
+    assert params["WFHTTPBodyType"] == "File"
 
 
 # --- the endpoint that hands it out ---------------------------------------
@@ -327,3 +321,44 @@ def test_page_contents_is_read_before_anything_can_coerce_the_input():
     ]
 
     assert safari[0] == "Page Contents", f"read it first, got order {safari}"
+
+
+def test_no_value_is_embedded_in_a_string(monkeypatch):
+    """The construct that failed live on 2026-09-06.
+
+    An inline attachment inside a WFTextTokenString, described by
+    attachmentsByRange, resolved to nothing: the first real run posted url=,
+    title= and kindle_email= all empty. A whole-value attachment inside a
+    WFDictionaryFieldValue resolved fine, which is how the API key arrived. So
+    the shortcut must carry every value the second way.
+    """
+    d = build()
+    request = d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+
+    assert isinstance(request["WFURL"], str), "the url must be a plain static string"
+    assert request["WFURL"].startswith("https://")
+
+    def has_inline_attachment(node):
+        if isinstance(node, dict):
+            if node.get("WFSerializationType") == "WFTextTokenString":
+                if node["Value"].get("attachmentsByRange"):
+                    return True
+            return any(has_inline_attachment(v) for v in node.values())
+        if isinstance(node, list):
+            return any(has_inline_attachment(v) for v in node)
+        return False
+
+    assert not has_inline_attachment(d["WFWorkflowActions"]), (
+        "no value may be embedded in a string; use a header instead"
+    )
+
+
+def test_every_value_the_server_needs_rides_in_a_header():
+    d = build()
+    request = d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+    names = [i["WFKey"]["Value"]["string"] for i in items]
+
+    assert names == ["X-Api-Key", "X-Book-Url", "X-Book-Title", "X-Kindle-Email"]
+    for item in items:
+        assert item["WFValue"]["WFSerializationType"] == "WFTextTokenAttachment"

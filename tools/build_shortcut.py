@@ -187,25 +187,22 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
             "WFWorkflowActionParameters": {
                 "UUID": new_uuid(),
                 "WFHTTPMethod": "POST",
-                "WFURL": text_token([
-                    ENDPOINT,
-                    "?url=",
-                    action_output(url_enc_uuid, "URL Encoded Text"),
-                    "&title=",
-                    action_output(title_enc_uuid, "URL Encoded Text"),
-                    "&kindle_email=",
-                    action_output(mail_uuid, "Text"),
-                ]),
-                # The key rides in a header, not the query string, so it stays
-                # out of Traefik's access logs and out of Loki.
+                # A STATIC url. Embedding variables in a string did not
+                # work: the first real run on 2026-09-06 posted url=, title=
+                # and kindle_email= all empty, four times over, while the API
+                # key in a header arrived fine. An inline attachment described
+                # by attachmentsByRange resolved to nothing; a whole-value
+                # attachment inside a dictionary resolved correctly. So every
+                # value now rides in a header, which is the shape that works.
+                "WFURL": ENDPOINT,
+                # Percent-encoded, because an HTTP header cannot carry a raw
+                # title with spaces or non-ASCII.
                 "WFHTTPHeaders": dictionary_value([
                     ("X-Api-Key", action_output(key_uuid, "Text")),
+                    ("X-Book-Url", action_output(url_enc_uuid, "URL Encoded Text")),
+                    ("X-Book-Title", action_output(title_enc_uuid, "URL Encoded Text")),
+                    ("X-Kindle-Email", action_output(mail_uuid, "Text")),
                 ]),
-                # The page goes as the raw body. A JSON body would need a
-                # WFDictionaryFieldValue under a key named WFJSONBody in one
-                # action library and WFJSONValues in another; the wrong name
-                # sends nothing and reports no error, and there is no iOS
-                # instrument here to catch that. A raw body needs neither.
                 "WFHTTPBodyType": "File",
                 "WFRequestVariable": action_output(page_uuid, "Page Contents"),
             },

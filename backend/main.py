@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 import httpx
+from urllib.parse import unquote
 
 from backend.scraper import AudioBookBayScraper
 from backend.mam import MAMScraper
@@ -1436,12 +1437,36 @@ async def download_url(request: Request):
     given_title = given_title or qp.get("title") or None
     given_author = given_author or qp.get("author") or None
 
+    # Headers are what the generated iOS Shortcut actually uses. Building a URL
+    # with variables embedded in it did not work: on 2026-09-06 the first real
+    # run posted url=, title= and kindle_email= all empty, four times, while
+    # the API key in a header arrived fine. The difference is the construct, a
+    # whole-value attachment in a dictionary versus an inline attachment
+    # described by attachmentsByRange, so the shortcut now only uses the former.
+    # Values are percent-encoded by the shortcut, since an HTTP header cannot
+    # carry a raw title with spaces or non-ASCII.
+    def _hdr(name: str) -> str | None:
+        raw = request.headers.get(name)
+        return unquote(raw) if raw else None
+
+    url = _hdr("X-Book-Url") or url
+    given_title = _hdr("X-Book-Title") or given_title
+    given_author = _hdr("X-Book-Author") or given_author
+    kindle_email = _hdr("X-Kindle-Email") or kindle_email
+
     logging.info(
         f"download-url: url={url!r} kindle_email={kindle_email!r} "
-        f"title={given_title!r} author={given_author!r}"
+        f"title={given_title!r} author={given_author!r} page={len(given_page or '')}b"
     )
 
     if not url:
+        logging.warning(
+            "download-url got nothing usable: query=%s headers=%s body=%db type=%r",
+            dict(qp),
+            [h for h in ("x-book-url", "x-book-title", "x-kindle-email") if h in request.headers],
+            len(body or b""),
+            content_type,
+        )
         raise HTTPException(status_code=400, detail="No URL provided")
 
     md5 = extract_md5(url)
