@@ -116,11 +116,14 @@ WITH_HEADER = """<!DOCTYPE html><html><head>
 </head><body>
   <div class="text-3xl">Anna’s Archive</div>
   <div>Official domains: <a href="/faq">FAQ</a> and
-    <a href="https://en.wikipedia.org/wiki/Anna%27s_Archive">Wikipedia</a>.</div>
+    <a href="https://en.wikipedia.org/wiki/Anna%27s_Archive">Wikipedia</a>.
+    \u2b50\ufe0f Our code and data are 100% open source.
+    <a href="/about">Learn more\u2026</a></div>
   <div><a href="/">Home</a> <a href="/search">Search</a> <a href="/donate">Donate</a></div>
   <div class="text-xs"><a href="/search?q=dunford">April Dunford/</a></div>
-  <div class="text-3xl font-bold">Obviously Awesome</div>
-  <a href="/search?q=Obviously+Awesome">\U0001f50d</a>
+  <div class="text-3xl font-bold">Obviously Awesome
+    <a href="/search?q=Obviously+Awesome">\U0001f50d</a>
+  </div>
   <div><a href="/search?q=April+Dunford">&nbsp;April Dunford</a></div>
   <div><a href="/search?q=2019">&nbsp;2019</a></div>
   <a href="/slow_download/5b6e6e722084ab2d8fdef68a30fe132b/0/0">Slow download</a>

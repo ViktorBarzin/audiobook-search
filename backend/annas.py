@@ -48,11 +48,21 @@ def _title_anchor(soup, title: str):
     """
     if not title:
         return None
-    best = None
+    want = re.sub(r"\s+", " ", title).strip().lower()
+    if not want:
+        return None
     for tag in soup.find_all(["div", "h1", "h2", "h3", "span"]):
-        if tag.get_text(strip=True) == title:
-            best = tag
-    return best
+        text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip().lower()
+        if not text.startswith(want):
+            continue
+        # The title's own tag holds the title and a search glyph, so it is
+        # barely longer. An outer wrapper holds the author and year too, and a
+        # loose match on it would read the wrong link. Equality alone is too
+        # strict: the glyph means no element's text is exactly the title, which
+        # is why the first attempt at this kept anchoring on the site banner.
+        if len(text) <= len(want) + 8:
+            return tag
+    return None
 
 
 def _author_link_after(title_elem) -> str | None:
