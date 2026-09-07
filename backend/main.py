@@ -759,7 +759,13 @@ def _libgen_queries(title: str, author: str) -> list[str]:
     return forms
 
 
-async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str | None]:
+# A mirror having a bad day should not turn one book into 25 requests.
+FALLBACK_FILE_ATTEMPTS = int(os.getenv("FALLBACK_FILE_ATTEMPTS", "4"))
+
+
+async def _libgen_by_title(
+    title: str, author: str, skip_md5: str | None = None,
+) -> tuple[bytes | None, str | None]:
     """Find the same book on libgen under a different hash.
 
     An md5 shared from Anna's Archive names one FILE. libgen mirrors most books
@@ -771,6 +777,13 @@ async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str |
     Identity is settled by title AND author through the shared matcher, which is
     what keeps this from repeating the fuzzy last-word search that once shelved
     a CISSP study guide as Neuromancer. No confident match means no download.
+
+    skip_md5 is the hash the job already tried. Excluding it matters: on
+    2026-09-07 The Mom Test matched its own AA hash here and went back to the
+    CDN that had just answered 503 three times, while libgen had the book under
+    four other hashes. A file that fails to download is dropped and the matcher
+    runs again on what is left, up to FALLBACK_FILE_ATTEMPTS files, so a mirror
+    with one bad file does not end the job.
     """
     title = _clean_shared_title(title)
     if not libgen_scraper or not title or is_placeholder(title):
@@ -790,29 +803,45 @@ async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str |
             break
         logger.info("No libgen rows for %r, trying a shorter query", query)
 
-    if author:
-        item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
-        match = select_candidate(item, candidates)
-        chosen, how = match.candidate, match.reason
-    else:
-        chosen, how = _pick_on_title_alone(title, candidates), "title_only"
+    if skip_md5:
+        candidates = [c for c in candidates if (c.md5 or "").lower() != skip_md5.lower()]
 
-    if not chosen:
+    item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
+    remaining = list(candidates)
+    for attempt in range(FALLBACK_FILE_ATTEMPTS):
+        if author:
+            match = select_candidate(item, remaining)
+            chosen, how = match.candidate, match.reason
+        else:
+            chosen, how = _pick_on_title_alone(title, remaining), "title_only"
+
+        if not chosen:
+            logger.info(
+                "No confident libgen match for %r by %r (%d candidates)",
+                title, author or "(no author)", len(remaining),
+            )
+            return None, None
+
         logger.info(
-            "No confident libgen match for %r by %r (%d candidates)",
-            title, author or "(no author)", len(candidates),
+            "Falling back to libgen md5 %s for %r by %r (matched on %s, try %d)",
+            chosen.md5, title, author or "(no author)", how, attempt + 1,
         )
-        return None, None
+        try:
+            data, filename = await libgen_scraper.download_file(chosen.md5)
+        except Exception as e:
+            logger.warning(f"LibGen fallback download failed for {chosen.md5}: {e}")
+            data, filename = None, None
+        if data:
+            return data, filename
+        # That file is not being served. The book is still the right one, so
+        # take it out of the running and let the matcher pick again.
+        remaining = [c for c in remaining if c.md5 != chosen.md5]
 
     logger.info(
-        "Falling back to libgen md5 %s for %r by %r (matched on %s)",
-        chosen.md5, title, author or "(no author)", how,
+        "Gave up on %r by %r after %d files", title, author or "(no author)",
+        FALLBACK_FILE_ATTEMPTS,
     )
-    try:
-        return await libgen_scraper.download_file(chosen.md5)
-    except Exception as e:
-        logger.warning(f"LibGen fallback download failed for {chosen.md5}: {e}")
-        return None, None
+    return None, None
 
 
 def _pick_on_title_alone(title: str, candidates: list) -> object | None:
@@ -877,7 +906,7 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
             # libgen has no file for this exact hash. The book may still be
             # there under another one, if the caller told us what it is.
             job["stage_detail"] = "Not on libgen by hash, searching by title..."
-            file_data, filename = await _libgen_by_title(title, author)
+            file_data, filename = await _libgen_by_title(title, author, skip_md5=md5)
         if not file_data or len(file_data) < MIN_EBOOK_SIZE_BYTES:
             # Fall through to the detail's own mirrors rather than giving up.
             file_data = None
