@@ -103,3 +103,43 @@ def test_a_page_with_no_author_anywhere_says_so_in_the_log(scraper, caplog):
 
     logged = " ".join(rec.message for rec in caplog.records)
     assert "Some Book" in logged, "the excerpt around the title should be logged"
+
+
+# The page also carries a site header, and it uses the same class as the book
+# title. Measured live 2026-09-07: the first div.text-3xl on the page is
+# "Anna's Archive", the banner, so walking forward from it read the header's
+# first link and reported the author as "FAQ". The title itself was still
+# right, because a header-shaped title is rejected and the <title> tag fills
+# in, which is exactly how a bogus anchor went unnoticed.
+WITH_HEADER = """<!DOCTYPE html><html><head>
+  <title>Obviously Awesome - Anna’s Archive</title>
+</head><body>
+  <div class="text-3xl">Anna’s Archive</div>
+  <div>Official domains: <a href="/faq">FAQ</a> and
+    <a href="https://en.wikipedia.org/wiki/Anna%27s_Archive">Wikipedia</a>.</div>
+  <div><a href="/">Home</a> <a href="/search">Search</a> <a href="/donate">Donate</a></div>
+  <div class="text-xs"><a href="/search?q=dunford">April Dunford/</a></div>
+  <div class="text-3xl font-bold">Obviously Awesome</div>
+  <a href="/search?q=Obviously+Awesome">\U0001f50d</a>
+  <div><a href="/search?q=April+Dunford">&nbsp;April Dunford</a></div>
+  <div><a href="/search?q=2019">&nbsp;2019</a></div>
+  <a href="/slow_download/5b6e6e722084ab2d8fdef68a30fe132b/0/0">Slow download</a>
+</body></html>"""
+
+
+def test_the_site_header_is_not_the_anchor(scraper):
+    detail = scraper.parse_detail(WITH_HEADER, MD5)
+
+    assert detail.title == "Obviously Awesome"
+    assert detail.author == "April Dunford", "walked from the banner, not the book"
+
+
+def test_site_chrome_is_never_an_author(scraper):
+    """Second net, in case the anchor lands somewhere unexpected again."""
+    no_author = WITH_HEADER.replace(
+        '<div><a href="/search?q=April+Dunford">&nbsp;April Dunford</a></div>', ""
+    )
+
+    detail = scraper.parse_detail(no_author, MD5)
+
+    assert detail.author not in ("FAQ", "Wikipedia", "Home", "Search", "Donate")

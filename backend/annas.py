@@ -25,6 +25,36 @@ _NOT_A_NAME_RE = re.compile(
 )
 
 
+# Navigation and footer links that sit near the top of every page. None of them
+# is ever a person, and one of them ("FAQ") was reported as an author once.
+_SITE_CHROME = {
+    "faq", "wikipedia", "home", "search", "donate", "login", "log in",
+    "account", "about", "contact", "improve metadata", "report file quality",
+    "datasets", "torrents", "codes", "llm data", "mobile app", "security",
+    "copyright claims", "volunteering", "browser verification", "anna's archive",
+    "anna’s archive", "advanced", "metadata", "request", "upload",
+}
+
+
+def _title_anchor(soup, title: str):
+    """The tag that actually holds the book title.
+
+    Not the same as the element the title was read from. The site header uses
+    the same class as the book title, so the first div.text-3xl on the page is
+    the banner, and the title itself then comes from the <title>-tag fallback.
+    Walking forward from the banner reported the header's first link, "FAQ", as
+    the author on 2026-09-07. Matching the resolved title text finds the real
+    one, and the deepest such tag is the title itself rather than a wrapper.
+    """
+    if not title:
+        return None
+    best = None
+    for tag in soup.find_all(["div", "h1", "h2", "h3", "span"]):
+        if tag.get_text(strip=True) == title:
+            best = tag
+    return best
+
+
 def _author_link_after(title_elem) -> str | None:
     """The first link after the title whose text reads like a person's name.
 
@@ -45,7 +75,7 @@ def _author_link_after(title_elem) -> str | None:
         # Breadcrumb path segments end in "/", and a bare glyph is a search icon.
         if text.endswith("/") or not re.search(r"[A-Za-z]{2}", text):
             continue
-        if _NOT_A_NAME_RE.match(text):
+        if _NOT_A_NAME_RE.match(text) or text.lower() in _SITE_CHROME:
             continue
         return text
     return None
@@ -326,8 +356,10 @@ class AnnasArchiveScraper:
             # <title>, and no og:description. The file-path breadcrumb also
             # names the author, but it comes BEFORE the title in the document
             # and its segments end in "/", so walking forward skips it.
-            if not author and title_elem:
-                author = _author_link_after(title_elem)
+            if not author:
+                anchor = _title_anchor(soup, title) or title_elem
+                if anchor:
+                    author = _author_link_after(anchor)
 
             # Fallback 4: Look for structured "Author: Name" label in page text
             if not author:
