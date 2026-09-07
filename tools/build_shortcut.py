@@ -144,23 +144,17 @@ def text_action(out_uuid: str, value: str = "") -> dict:
     }
 
 
-def build(name: str = "Download to Calibre", who: str = "you") -> dict:
+def build(name: str = "Download to Calibre", deliver_to: str = "") -> dict:
     key_uuid = new_uuid()
-    mail_uuid = new_uuid()
-    url_uuid = new_uuid()
-    title_uuid = new_uuid()
-
     page_uuid = new_uuid()
 
     actions = [
         text_action(key_uuid),
-        text_action(mail_uuid),
-        # Page contents FIRST: it is the detail that cannot be recovered from a
-        # URL, so it is read before any other action has a chance to coerce the
-        # shared item.
+        # The page is the only thing the phone actually needs to send. Anna's
+        # Archive names its own md5 in every download link on it, and the title
+        # and the author are on it too, so the server needs neither a URL nor a
+        # title alongside.
         safari_property("Page Contents", page_uuid),
-        safari_property("URL", url_uuid),
-        safari_property("Name", title_uuid),
         {
             "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
             "WFWorkflowActionParameters": {
@@ -174,18 +168,21 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
                 # attachment inside a dictionary resolved correctly. So every
                 # value now rides in a header, which is the shape that works.
                 "WFURL": ENDPOINT,
-                # Raw, straight off the shared page. Percent-encoding these
-                # through a URL Encode action is what broke the second live run
-                # on 2026-09-06: the api key, the Kindle address and the page
-                # body all arrived, and those three reference an action output
-                # directly, while the url and the title went through
-                # is.workflow.actions.urlencode and arrived empty. The endpoint
-                # decodes only values that look encoded, so both shapes work.
+                # ONE attachment, and it is first. Everything after the first
+                # item in this dictionary arrives empty, whatever it
+                # references. Measured live 2026-09-07 with both shortcuts
+                # installed fresh: X-Api-Key resolved while X-Book-Url,
+                # X-Book-Title and X-Kindle-Email did not, and the last of
+                # those read a Text action exactly like the api key does. That
+                # corrects the earlier reading, which blamed the URL Encode
+                # step. Position in the dictionary is what decides.
+                #
+                # So who to email is a literal string naming a recipient and
+                # the server holds the addresses, which also keeps them out of
+                # this file, since /shortcut is served without authentication.
                 "WFHTTPHeaders": dictionary_value([
                     ("X-Api-Key", action_output(key_uuid, "Text")),
-                    ("X-Book-Url", action_output(url_uuid, "URL")),
-                    ("X-Book-Title", action_output(title_uuid, "Name")),
-                    ("X-Kindle-Email", action_output(mail_uuid, "Text")),
+                    ("X-Deliver-To", text_token([deliver_to])),
                 ]),
                 "WFHTTPBodyType": "File",
                 "WFRequestVariable": action_output(page_uuid, "Page Contents"),
@@ -205,19 +202,15 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
             "WFWorkflowIconStartColor": 463140863,
             "WFWorkflowIconGlyphNumber": 59473,
         },
+        # One question. A second one asking for a Kindle address could not
+        # work: its value rode a header that always arrived empty, so setting
+        # it only looked as though it had taken.
         "WFWorkflowImportQuestions": [
             {
                 "ActionIndex": 0,
                 "Category": "Parameter",
                 "ParameterKey": "WFTextActionText",
                 "Text": "Paste your book-search API key",
-                "DefaultValue": "",
-            },
-            {
-                "ActionIndex": 1,
-                "Category": "Parameter",
-                "ParameterKey": "WFTextActionText",
-                "Text": f"Kindle address for {who} (leave blank to skip emailing)",
                 "DefaultValue": "",
             },
         ],
@@ -229,9 +222,11 @@ def build(name: str = "Download to Calibre", who: str = "you") -> dict:
 # import question asks for. Both addresses stay OUT of the published files:
 # /shortcut is unauthenticated, and a Kindle address is personal, so each is
 # filled in at install time instead of being baked in.
+# The second field is the recipient NAME the shortcut sends. The server maps it
+# to an address through KINDLE_RECIPIENTS; an empty name means import only.
 VARIANTS = {
-    "": ("Download to Calibre", "you"),
-    "anca": ("Download to Calibre (Anca)", "Anca"),
+    "": ("Download to Calibre", ""),
+    "anca": ("Download to Calibre (Anca)", "anca"),
 }
 
 
@@ -244,9 +239,9 @@ def main() -> int:
     if variant not in VARIANTS:
         print(f"unknown variant {variant!r}, want one of {sorted(VARIANTS)}", file=sys.stderr)
         return 2
-    name, who = VARIANTS[variant]
+    name, deliver_to = VARIANTS[variant]
     with open(out, "wb") as fh:
-        plistlib.dump(build(name, who), fh, fmt=plistlib.FMT_BINARY)
+        plistlib.dump(build(name, deliver_to), fh, fmt=plistlib.FMT_BINARY)
     print(f"wrote {out} ({name})")
     return 0
 

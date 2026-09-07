@@ -54,6 +54,28 @@ CWA_GID = int(os.getenv("CWA_GID", "1000"))
 # uploaded to Calibre or emailed to a Kindle as a new job's payload.
 MIN_EBOOK_SIZE_BYTES = int(os.getenv("MIN_EBOOK_SIZE_BYTES", "5000"))
 API_KEY = os.getenv("API_KEY", "")
+
+
+def _parse_recipients(raw: str) -> dict[str, str]:
+    """Read KINDLE_RECIPIENTS, "name:address" pairs separated by commas.
+
+    The iOS Shortcut sends a recipient NAME rather than an address, because a
+    shortcut file is served from /shortcut without authentication and an address
+    baked into it would be public. Keeping the addresses here also means one of
+    them changing needs no reinstall.
+    """
+    pairs = {}
+    for chunk in (raw or "").split(","):
+        if ":" not in chunk:
+            continue
+        name, _, address = chunk.partition(":")
+        name, address = name.strip().lower(), address.strip()
+        if name and address:
+            pairs[name] = address
+    return pairs
+
+
+KINDLE_RECIPIENTS = _parse_recipients(os.getenv("KINDLE_RECIPIENTS", ""))
 # A rendered Anna's Archive page is tens of KB. This is generous enough for
 # their markup and small enough that a stray upload cannot make us parse
 # megabytes; over it, the page is ignored and the shared title is used instead.
@@ -1571,6 +1593,18 @@ async def download_url(request: Request):
     given_title = _hdr("X-Book-Title") or given_title
     given_author = _hdr("X-Book-Author") or given_author
     kindle_email = _hdr("X-Kindle-Email") or kindle_email
+    # A named recipient, resolved here. Only the FIRST attachment in a
+    # shortcut's header dictionary resolves, whatever it references, so the
+    # api key is the one variable the shortcut can send and everything else it
+    # sends has to be a literal string. Measured live 2026-09-07 with both
+    # shortcuts installed fresh: X-Kindle-Email arrived empty even though it
+    # read a Text action exactly like the api key does.
+    if not kindle_email:
+        deliver_to = (_hdr("X-Deliver-To") or "").strip().lower()
+        if deliver_to:
+            kindle_email = KINDLE_RECIPIENTS.get(deliver_to)
+            if not kindle_email:
+                logging.info("No Kindle address configured for %r", deliver_to)
 
     logging.info(
         f"download-url: url={url!r} kindle_email={kindle_email!r} "

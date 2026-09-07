@@ -81,7 +81,7 @@ def test_the_import_questions_target_real_string_parameters(shortcut):
     """A question replaces a parameter's whole value, so it must be a string."""
     actions = shortcut["WFWorkflowActions"]
     questions = shortcut["WFWorkflowImportQuestions"]
-    assert len(questions) == 2
+    assert questions, "at least the api key is asked for"
 
     for q in questions:
         action = actions[q["ActionIndex"]]
@@ -119,19 +119,18 @@ def test_no_value_passes_through_a_url_encode_action(shortcut):
     assert "is.workflow.actions.urlencode" not in ids
 
 
-def test_the_url_and_title_headers_read_the_safari_page_directly(shortcut):
-    actions = shortcut["WFWorkflowActions"]
-    by_uuid = {a["WFWorkflowActionParameters"]["UUID"]: a for a in actions}
+def test_the_page_is_the_only_thing_read_off_safari(shortcut):
+    """A URL and a title header were tried and both arrived empty.
 
-    request = actions[-1]["WFWorkflowActionParameters"]
-    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
-    by_name = {i["WFKey"]["Value"]["string"]: i["WFValue"] for i in items}
+    Only the first attachment in the header dictionary resolves, so carrying
+    them was dead weight that also read as though it worked. The page holds the
+    md5, the title and the author anyway.
+    """
+    reads = [a["WFWorkflowActionParameters"]["WFContentItemPropertyName"]
+             for a in shortcut["WFWorkflowActions"]
+             if a["WFWorkflowActionIdentifier"].endswith("properties.safariwebpage")]
 
-    for name in ("X-Book-Url", "X-Book-Title"):
-        source = by_uuid[by_name[name]["Value"]["OutputUUID"]]
-        assert source["WFWorkflowActionIdentifier"] == (
-            "is.workflow.actions.properties.safariwebpage"
-        ), f"{name} should come straight off the shared page"
+    assert reads == ["Page Contents"]
 
 
 def test_the_request_posts_to_a_static_url_with_headers(shortcut):
@@ -192,12 +191,12 @@ def test_the_unsigned_file_is_served_only_if_no_signed_one_exists(monkeypatch, t
     assert plistlib.loads(r.content)["WFWorkflowName"] == "Download to Calibre"
 
 
-def test_the_two_variants_differ_only_in_name_and_prompt():
-    """Same actions, same endpoint. Only the label and the question change.
+def test_the_two_variants_differ_only_in_name_and_recipient():
+    """Same actions, same endpoint. Only the label and X-Deliver-To change.
 
     Both Kindle addresses stay OUT of the published files: /shortcut is
-    unauthenticated and a Kindle address is personal, so each is answered at
-    install time instead of being baked in.
+    unauthenticated and an address is personal, so the file names a recipient
+    and the server holds the address.
     """
     from tools.build_shortcut import VARIANTS
 
@@ -212,8 +211,14 @@ def test_the_two_variants_differ_only_in_name_and_prompt():
 
     assert shape(mine) == shape(hers), "the two must do the same thing"
 
-    prompts = [q["Text"] for q in hers["WFWorkflowImportQuestions"]]
-    assert any("Anca" in p for p in prompts), "hers should name whose Kindle it is"
+    def recipient(d):
+        items = (d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+                 ["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"])
+        by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
+        return by_name["X-Deliver-To"]["WFValue"]["Value"]["string"]
+
+    assert recipient(mine) == "", "his imports and stops"
+    assert recipient(hers) == "anca", "hers names whose Kindle it is"
 
     for d in (mine, hers):
         blob = plistlib.dumps(d, fmt=plistlib.FMT_BINARY)
@@ -360,12 +365,64 @@ def test_no_value_is_embedded_in_a_string(monkeypatch):
     )
 
 
-def test_every_value_the_server_needs_rides_in_a_header():
+def test_the_headers_are_the_api_key_and_the_recipient():
+    """Nothing else travels. The page in the body carries the rest."""
     d = build()
     request = d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
     items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
     names = [i["WFKey"]["Value"]["string"] for i in items]
 
-    assert names == ["X-Api-Key", "X-Book-Url", "X-Book-Title", "X-Kindle-Email"]
-    for item in items:
-        assert item["WFValue"]["WFSerializationType"] == "WFTextTokenAttachment"
+    assert names == ["X-Api-Key", "X-Deliver-To"]
+
+
+def test_only_one_header_carries_a_variable(shortcut):
+    """Everything but the first attachment in the dictionary arrived empty.
+
+    Measured live 2026-09-07 with both shortcuts freshly installed: X-Api-Key
+    is first and resolves, while X-Book-Url, X-Book-Title and X-Kindle-Email
+    all came through empty. That held whether the value read a Safari page
+    property or a Text action, so what decides is position, not kind. The page
+    body is unaffected because it rides WFRequestVariable.
+    """
+    request = shortcut["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+
+    def is_attachment(item):
+        return item["WFValue"].get("WFSerializationType") == "WFTextTokenAttachment"
+
+    assert is_attachment(items[0]), "the first header is the one that resolves"
+    assert not any(is_attachment(i) for i in items[1:]), (
+        "a second attachment in this dictionary silently arrives empty"
+    )
+
+
+def test_the_recipient_is_a_plain_string(shortcut):
+    request = shortcut["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+    by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
+
+    value = by_name["X-Deliver-To"]["WFValue"]["Value"]
+    assert value["string"] == ""
+    assert not value["attachmentsByRange"], "nothing for iOS to resolve"
+
+
+def test_the_anca_variant_names_her(shortcut):
+    from tools.build_shortcut import VARIANTS, build
+
+    anca = build(*VARIANTS["anca"])
+    request = anca["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+    by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
+
+    assert by_name["X-Deliver-To"]["WFValue"]["Value"]["string"] == "anca"
+    assert "kindle.com" not in str(anca), (
+        "the address stays on the server; /shortcut is served without auth"
+    )
+
+
+def test_there_is_only_one_import_question(shortcut):
+    """The Kindle question could not work, so it is gone rather than misleading."""
+    questions = shortcut["WFWorkflowImportQuestions"]
+
+    assert len(questions) == 1
+    assert "API key" in questions[0]["Text"]
