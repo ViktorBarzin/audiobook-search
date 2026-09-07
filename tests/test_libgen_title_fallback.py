@@ -99,12 +99,19 @@ async def test_no_title_means_no_fallback(fallback, monkeypatch):
 
 
 async def test_searches_on_title_and_author(fallback, monkeypatch):
+    """Title and author first. A mirror that answers it is asked nothing else.
+
+    This one returns no rows, so the shorter title-only query follows. See
+    test_long_title_search.py for why: a full subtitle in the query returns
+    zero rows on a book the same mirror has.
+    """
     fake = FakeLibGen(candidates=[], downloadable={})
     monkeypatch.setattr("backend.main.libgen_scraper", fake)
 
     await fallback("Obviously Awesome", "April Dunford")
 
-    assert fake.queries == ["Obviously Awesome April Dunford"]
+    assert fake.queries[0] == "Obviously Awesome April Dunford"
+    assert fake.queries == ["Obviously Awesome April Dunford", "Obviously Awesome"]
 
 
 async def test_nothing_found_is_not_an_error(fallback, monkeypatch):

@@ -721,6 +721,44 @@ def _no_route_message(md5: str, title: str, upstream: str | None = None) -> str:
     )
 
 
+_AUTHOR_QUALIFIER_RE = _re.compile(r"\s*[,;]?\s*\([^)]*\)\s*$")
+
+
+def _clean_shared_author(author: str | None) -> str:
+    """Drop the occupation qualifier Anna's Archive appends to an author.
+
+    Its metadata carries them: "Rob Fitzpatrick, (Entrepreneur)", and the
+    library already holds "Valerie Howard (Writer on Juvenile literature)" from
+    the same source. The surname matcher reads the last token, so a qualifier
+    becomes the surname and no candidate can ever match.
+    """
+    cleaned = _AUTHOR_QUALIFIER_RE.sub("", (author or "").strip()).strip(" ,;")
+    return cleaned or (author or "").strip()
+
+
+def _libgen_queries(title: str, author: str) -> list[str]:
+    """Progressively shorter libgen queries, first one first.
+
+    A whole subtitle in the query returns nothing: The Mom Test found 0 rows on
+    2026-09-07 for its full 110-character title, and 5 rows for "The Mom Test
+    Rob Fitzpatrick" on the same mirror seconds later. Only the search net
+    widens here. Identity is still settled against the full title and the real
+    author, so a shorter query means more rows to reject, never a weaker test.
+    """
+    forms: list[str] = []
+
+    def add(query: str) -> None:
+        query = " ".join(query.split())
+        if query and query not in forms:
+            forms.append(query)
+
+    add(f"{title} {author}")
+    main = title.split(":")[0].strip()
+    add(f"{main} {author}")
+    add(main)
+    return forms
+
+
 async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str | None]:
     """Find the same book on libgen under a different hash.
 
@@ -740,12 +778,17 @@ async def _libgen_by_title(title: str, author: str) -> tuple[bytes | None, str |
     if normalize_title(title) == normalize_title("Unknown"):
         return None, None
 
-    query = f"{title} {author}".strip() if author else title
-    try:
-        candidates = await libgen_scraper.search_candidates(query)
-    except Exception as e:
-        logger.warning(f"LibGen title search failed for {query!r}: {type(e).__name__}: {e}")
-        return None, None
+    author = _clean_shared_author(author)
+    candidates: list = []
+    for query in _libgen_queries(title, author):
+        try:
+            candidates = await libgen_scraper.search_candidates(query)
+        except Exception as e:
+            logger.warning(f"LibGen title search failed for {query!r}: {type(e).__name__}: {e}")
+            return None, None
+        if candidates:
+            break
+        logger.info("No libgen rows for %r, trying a shorter query", query)
 
     if author:
         item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
