@@ -1159,7 +1159,9 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         if await _try_direct_download(job_id, job, md5, title, author, detail):
             job["status"] = "done"
             job["message"] = "Added to Calibre"
-            await _maybe_send_to_kindle(job_id, title)
+            # No send here. The finally block below does it, and a return
+            # inside a try runs finally anyway, which is how one tap put two
+            # copies of the same book on a Kindle on 2026-09-07.
             return
 
         job["stage_detail"] = "Sending to Stacks..."
@@ -1180,7 +1182,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # would otherwise watch it sit on "downloading" forever.
             job["status"] = "done"
             job["message"] = "Added to Calibre"
-            await _maybe_send_to_kindle(job_id, title)
+            # The finally block sends. See the note on the path above.
             return
         else:
             already_downloaded = "already downloaded" in stacks_result.get("message", "").lower()
@@ -1372,6 +1374,14 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
     kindle_email = job.get("kindle_email")
     if not (kindle_email and job.get("book_id") and job.get("status") == "done"):
         return
+    # Once per job, whoever calls. The early-return paths used to call this and
+    # then the finally block called it again, so Anca's Kindle got the same book
+    # twice, two seconds apart. Removing those calls fixed it; this makes a
+    # future one harmless rather than silently doubling the email.
+    if job.get("kindle_attempted"):
+        logger.info("[%s] Kindle send already attempted, not repeating", job_id)
+        return
+    job["kindle_attempted"] = True
     bid = job["book_id"]
     if bid <= 0:
         # A last look at the library, then say so. Returning quietly here is
