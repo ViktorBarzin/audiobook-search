@@ -795,16 +795,21 @@ async def _libgen_by_title(
     candidates: list = []
     for query in _libgen_queries(title, author):
         try:
-            candidates = await libgen_scraper.search_candidates(query)
+            rows = await libgen_scraper.search_candidates(query)
         except Exception as e:
             logger.warning(f"LibGen title search failed for {query!r}: {type(e).__name__}: {e}")
             return None, None
-        if candidates:
+        # Dropping the failed hash BEFORE deciding the query answered. The
+        # full-title query for The Mom Test returned exactly one row, that very
+        # hash, on 2026-09-07, so the loop stopped and the filter then emptied
+        # it. The shorter query that finds the book five times over on the same
+        # mirror was never sent.
+        if skip_md5:
+            rows = [c for c in rows if (c.md5 or "").lower() != skip_md5.lower()]
+        if rows:
+            candidates = rows
             break
-        logger.info("No libgen rows for %r, trying a shorter query", query)
-
-    if skip_md5:
-        candidates = [c for c in candidates if (c.md5 or "").lower() != skip_md5.lower()]
+        logger.info("No usable libgen rows for %r, trying a shorter query", query)
 
     item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
     remaining = list(candidates)
