@@ -5,6 +5,8 @@ of it, so a book Calibre turned away still read as "Added to Calibre". The
 libgen hash route stopped doing that on 2026-09-24; these two now match it.
 """
 
+import pytest
+
 import backend.main as bs_main
 from backend.models import AudiobookDetail
 
@@ -66,3 +68,24 @@ async def test_an_md5_lookup_file_calibre_refuses_is_not_a_success(monkeypatch):
 
     assert ok is False
     assert "did not accept" in job["upload_refused"]
+
+
+@pytest.mark.parametrize("met, code", [
+    ({}, "no_route"),
+    ({"upload_refused": "Calibre-Web did not accept Moby-Dick.pdf."}, "refused"),
+    ({"calibre_down": "Calibre-Web is unreachable (login failed)"}, "calibre_down"),
+])
+def test_a_fetch_that_failed_everywhere_is_named_for_what_it_met(met, code):
+    """Every fallback route ends the same way. Two of the Stacks paths used to
+    call a refused upload "All download methods failed", coded no_route."""
+    job = dict(met)
+
+    bs_main._fetch_failed(job, MD5, "Moby-Dick")
+
+    assert job["status"] == "failed"
+    assert job["code"] == code
+    assert job["stage_detail"] == job["message"]
+    if met:
+        assert job["message"] == next(iter(met.values()))
+    else:
+        assert "libgen has no file for md5" in job["message"]

@@ -233,6 +233,15 @@ def _decide_outcome(job: dict) -> tuple[str, str | None]:
     return "failed", job.get("reason") or job.get("message") or "it never finished"
 
 
+def _and_then(line: str, note: str) -> str:
+    """Add a sentence to a line that may not end with one: a failure line
+    ends with whatever reason the route gave, full stop or not."""
+    if not note:
+        return line
+    line = line.rstrip()
+    return f"{line}{'' if line.endswith(('.', '!', '?')) else '.'} {note}"
+
+
 def _outcome_line(job: dict, markup: bool) -> str:
     """The one line a finished share ends with: on the phone, and in Slack with
     the title in bold."""
@@ -1218,6 +1227,22 @@ def _no_route_message(md5: str, title: str, upstream: str | None = None) -> str:
     )
 
 
+def _fetch_failed(job: dict, md5: str, title: str, upstream: str | None = None) -> None:
+    """Every route failed: name the failure for what the routes met.
+
+    A Calibre that could not be reached or refused the file is the story,
+    not a missing route; the rescue step and the phone both read this code.
+    """
+    job["status"] = "failed"
+    if job.get("calibre_down"):
+        job["code"], job["message"] = "calibre_down", job["calibre_down"]
+    elif job.get("upload_refused"):
+        job["code"], job["message"] = "refused", job["upload_refused"]
+    else:
+        job["code"], job["message"] = "no_route", _no_route_message(md5, title, upstream=upstream)
+    job["stage_detail"] = job["message"]
+
+
 _AUTHOR_QUALIFIER_RE = _re.compile(r"\s*[,;]?\s*\([^)]*\)\s*$")
 
 
@@ -1926,19 +1951,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         if not stacks_ok:
             # Fallback: direct download for libgen mirrors
             if not await _try_direct_download(job_id, job, md5, title, author, detail):
-                job["status"] = "failed"
-                if job.get("calibre_down"):
-                    job["code"] = "calibre_down"
-                    job["message"] = job["calibre_down"]
-                elif job.get("upload_refused"):
-                    job["code"] = "refused"
-                    job["message"] = job["upload_refused"]
-                else:
-                    job["code"] = "no_route"
-                    job["message"] = _no_route_message(
-                        md5, title, upstream=stacks_result.get("error"),
-                    )
-                job["stage_detail"] = job["message"]
+                _fetch_failed(job, md5, title, upstream=stacks_result.get("error"))
                 return
             # _try_direct_download already uploaded via HTTP and set book_id.
             # Settle the job here: a caller polling for "done" (the iOS Shortcut)
@@ -1996,9 +2009,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                     # Stacks re-download failed — try direct download as last resort
                     recovered = await _try_direct_download(job_id, job, md5, title, author, detail)
                     if not recovered:
-                        job["status"] = "done"
-                        job["message"] = "Previously downloaded — not found in Calibre, re-download failed"
-                        job["stage_detail"] = job["message"]
+                        _fetch_failed(job, md5, title)
                         return
                     # _try_direct_download already uploaded via HTTP
                 else:
@@ -2021,10 +2032,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         # _try_direct_download already uploaded via HTTP and set book_id
                         pass
                     else:
-                        job["status"] = "failed"
-                        job["code"] = "no_route"
-                        job["message"] = "All download methods failed"
-                        job["stage_detail"] = job["message"]
+                        _fetch_failed(job, md5, title)
                     return
                 else:
                     # Timeout — but file may have arrived late. Check ingest dir one more time.
@@ -2070,10 +2078,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                                 if await _try_direct_download(job_id, job, md5, title, author, detail):
                                     pass
                                 else:
-                                    job["status"] = "failed"
-                                    job["code"] = "no_route"
-                                    job["message"] = "All download methods failed"
-                                    job["stage_detail"] = job["message"]
+                                    _fetch_failed(job, md5, title)
                         return
 
             # File is in ingest dir — read it, upload via HTTP, clean up
@@ -2174,10 +2179,10 @@ async def _settle_job(job_id: str, title: str | None = None) -> None:
         await _child_settled(job_id, job)
         return
     slack_note, phone_note = await _open_rescue(job_id, job) if _rescue_eligible(job) else ("", "")
-    job["final_text"] = _outcome_line(job, markup=False) + (f" {phone_note}" if phone_note else "")
+    job["final_text"] = _and_then(_outcome_line(job, markup=False), phone_note)
     _mark_finished(job_id)
     _journal_remove(job_id)
-    await _post_slack(_outcome_line(job, markup=True) + (f" {slack_note}" if slack_note else ""))
+    await _post_slack(_and_then(_outcome_line(job, markup=True), slack_note))
 
 
 async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
@@ -2471,7 +2476,7 @@ def _delivered_by_agent(rescue: dict) -> list[dict]:
 
 def _children_note(rescue: dict) -> str:
     delivered = _delivered_by_agent(rescue)
-    return f" A copy did go through: {delivered[-1].get('text', '')}" if delivered else ""
+    return f"A copy did go through: {delivered[-1].get('text', '')}" if delivered else ""
 
 
 async def _child_settled(child_id: str, child: dict) -> None:
@@ -2634,7 +2639,7 @@ async def _close_rescue(parent_id: str, line: str) -> None:
         # A report and the watchdog can both get here; the first one speaks.
         return
     if any(j.get("rescue_of") == parent_id and not j.get("finished") for j in _download_jobs.values()):
-        line += " A copy is still on its way; if it arrives, a line will follow."
+        line = _and_then(line, "A copy is still on its way; if it arrives, a line will follow.")
     rescue.update(state="closed", closed_at=time.time(), result=line)
     _save_rescues()
     parent = _download_jobs.get(parent_id)
@@ -2653,9 +2658,9 @@ async def _watch_agent(parent_id: str, rescue: dict) -> None:
         logger.warning(f"[{parent_id}] Could not ask the agent service about the rescue: {e}")
         r = None
     if r is not None and r.status_code == 404:
-        await _close_rescue(parent_id, (
+        await _close_rescue(parent_id, _and_then(
             f"⚠️ The rescue agent for *{title}* was lost, most likely in a restart "
-            f"of the agent service.{_children_note(rescue)}"))
+            "of the agent service.", _children_note(rescue)))
         return
     try:
         job = r.json() if r is not None and r.status_code < 300 else {}
@@ -2666,18 +2671,18 @@ async def _watch_agent(parent_id: str, rescue: dict) -> None:
         cost = (job.get("summary") or {}).get("cost_usd")
         facts = [status] + ([f"${cost:.2f}"] if isinstance(cost, (int, float)) else [])
         said = _untrusted(_agent_final_text(job), 200)
-        await _close_rescue(parent_id, (
-            f"⚠️ The rescue agent for *{title}* ended without reporting ({', '.join(facts)})."
-            + (f" Its last words: {said}" if said else "") + _children_note(rescue)))
+        line = f"⚠️ The rescue agent for *{title}* ended without reporting ({', '.join(facts)})."
+        line = _and_then(line, f"Its last words: {said}" if said else "")
+        await _close_rescue(parent_id, _and_then(line, _children_note(rescue)))
         return
     # Still queued, or the agent service cannot be asked (down, or a rotated
     # token): past the deadline the rescue closes anyway, so it cannot hold
     # every later rescue off as "another rescue is running".
     if time.time() - (rescue.get("agent_started_at") or 0) > RESCUE_REPORT_DEADLINE_SECONDS:
-        await _close_rescue(parent_id, (
+        await _close_rescue(parent_id, _and_then(
             f"⚠️ The rescue agent for *{title}* did not report within "
-            f"{RESCUE_REPORT_DEADLINE_SECONDS // 60} minutes, so its rescue is closed."
-            + _children_note(rescue)))
+            f"{RESCUE_REPORT_DEADLINE_SECONDS // 60} minutes, so its rescue is closed.",
+            _children_note(rescue)))
 
 
 async def _rescue_tick() -> None:
@@ -3164,9 +3169,7 @@ async def rescue_result(request: Request):
         line = f"\u26a0\ufe0f The agent found no usable copy of *{title}*."
     else:
         line = f"\u26a0\ufe0f The agent could not get *{title}* through."
-    if note:
-        line += f" {note}"
-    await _close_rescue(parent_id, line)
+    await _close_rescue(parent_id, _and_then(line, note))
     return {"status": "ok", "message": line}
 
 

@@ -278,3 +278,15 @@ async def test_the_files_own_title_finds_the_book_when_the_page_title_differs(pi
     await bs_main._process_download("j", MD5, title, "J.R.R. Tolkien", None)
 
     assert pipeline == [(520, ANCA)]
+
+
+@pytest.mark.parametrize("line, joined", [
+    ("⚠️ Sleepy Hollow did not reach Calibre: All download methods failed",
+     "⚠️ Sleepy Hollow did not reach Calibre: All download methods failed. Trying again in 15 minutes."),
+    ("⚠️ It failed.", "⚠️ It failed. Trying again in 15 minutes."),
+    ("✅ Moby-Dick → Calibre (epub, 41 s)", "✅ Moby-Dick → Calibre (epub, 41 s). Trying again in 15 minutes."),
+])
+def test_a_note_after_a_line_starts_a_new_sentence(line, joined):
+    """Live 2026-09-24: "...All download methods failed Trying again in 15 minutes."."""
+    assert bs_main._and_then(line, "Trying again in 15 minutes.") == joined
+    assert bs_main._and_then(line, "") == line
