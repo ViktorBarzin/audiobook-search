@@ -4,6 +4,8 @@ Jobs, rescues and the Kindle send guard persist small files so that a restart ca
 lose them. Every test gets its own directory, an empty guard, no rescues and no waiters.
 """
 
+import asyncio
+
 import pytest
 
 import backend.main as bs_main
@@ -17,4 +19,7 @@ def state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(bs_main, "_kindle_sending", set())
     monkeypatch.setattr(bs_main, "_job_events", {})
     monkeypatch.setattr(bs_main, "_rescues", {})
+    monkeypatch.setattr(bs_main, "_rescues_broken", False)
+    # A lock binds to the first event loop that waits on it; each test has its own.
+    monkeypatch.setattr(bs_main, "_agent_lock", asyncio.Lock())
     return path

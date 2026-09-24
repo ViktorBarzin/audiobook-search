@@ -525,8 +525,13 @@ async def _recover_lost_jobs() -> int:
 async def _report_jobs_lost_on_shutdown() -> None:
     """Called as the pod stops: every job still running is about to die with it."""
     for job_id, job in list(_download_jobs.items()):
-        if job.get("finished") or not job.get("md5") or job.get("rescue_of"):
-            # A rescue's retry is started again by the next pod's rescue loop.
+        if job.get("finished") or not job.get("md5"):
+            continue
+        if job.get("rescue_of"):
+            # The next pod's rescue loop starts a retry again, and an agent
+            # follows its own copies. Marked finished so the cancelled download
+            # settles nothing on its way out, which would close the rescue.
+            job["finished"] = True
             continue
         if job.get("phase") == "sending":
             # Most likely done within the grace period; if not, its journal
@@ -1204,7 +1209,9 @@ def _no_route_message(md5: str, title: str, upstream: str | None = None) -> str:
             "be searched for. Re-share with the book's title to search libgen "
             "by name."
         )
-    detail = f" (upstream: {upstream})" if upstream else ""
+    # Upstream text can quote mirror filenames, and this reason reaches Slack,
+    # the phone and the rescue agent.
+    detail = f" (upstream: {_untrusted(upstream, 160)})" if upstream else ""
     return (
         f"No download route for {title!r}: libgen has no file for md5 {md5} and "
         f"no confident title match, and Anna's Archive is unreachable{detail}."
@@ -1611,7 +1618,9 @@ async def _upload_and_confirm(job: dict, file_data: bytes, filename: str, title:
         return False
     if not hint:
         job["upload_refused"] = (
-            f"Calibre-Web did not accept {filename}. It turns away files it "
+            # libgen names files from uploader metadata, and this reason
+            # reaches Slack, the phone and the rescue agent.
+            f"Calibre-Web did not accept {_untrusted(filename, 100)}. It turns away files it "
             "cannot identify as a book, so try a different copy, ideally an "
             "EPUB; if that fails too, Calibre itself may be down."
         )
@@ -2283,10 +2292,25 @@ RESCUE_AGENT = "book-rescuer"
 # neither, and a better choice of file can fix both, which is the agent's job.
 RESCUE_CODES = ("no_route", "refused")
 _AGENT_TERMINAL = ("completed", "failed", "timeout", "error")
+# The files one agent may send through book-search, as its runbook says.
+RESCUE_AGENT_FILES = 3
+# How long an agent may go without reporting: its own timeout, plus time spent
+# queued, which the agent service does not count against that timeout.
+RESCUE_REPORT_DEADLINE_SECONDS = RESCUE_TIMEOUT_SECONDS + 900
+# An agent start still unconfirmed after this was cut short by a restart.
+RESCUE_START_GRACE_SECONDS = 600
+# A book an agent looked for gets no second agent for this long.
+RESCUE_REPEAT_SECONDS = 7 * 24 * 3600
 
 # Parent job id -> rescue record, mirrored in STATE_DIR/rescues.json so a
 # restart resumes the retry or the watch on the agent.
 _rescues: dict[str, dict] = {}
+# True when rescues.json exists but cannot be read. Rescues stay off and the
+# file is left alone, since an empty table would forget today's paid agents.
+_rescues_broken = False
+# Held from the limit checks until an agent's start is on disk, so retries
+# that fail together cannot each pass the checks before any agent is counted.
+_agent_lock = asyncio.Lock()
 
 
 def _rescues_file() -> str:
@@ -2294,18 +2318,27 @@ def _rescues_file() -> str:
 
 
 def _load_rescues() -> None:
+    global _rescues_broken
     try:
         with open(_rescues_file()) as f:
             saved = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return
+    except (OSError, ValueError) as e:
+        saved = e
     records = saved.get("rescues") if isinstance(saved, dict) else None
-    if isinstance(records, dict):
-        _rescues.update({k: v for k, v in records.items() if isinstance(v, dict)})
+    if not isinstance(records, dict):
+        _rescues_broken = True
+        logger.error(f"Rescues are off: {_rescues_file()} cannot be read ({saved!r:.200})")
+        return
+    _rescues.update({k: v for k, v in records.items() if isinstance(v, dict)})
 
 
-def _save_rescues() -> None:
-    week_ago = time.time() - 7 * 24 * 3600
+def _save_rescues() -> bool:
+    """Write the rescue table. False when it was not written."""
+    if _rescues_broken:
+        return False
+    week_ago = time.time() - RESCUE_REPEAT_SECONDS
     stale = [k for k, r in _rescues.items() if r.get("state") == "closed"
              and (r.get("closed_at") or 0) < week_ago and (r.get("agent_started_at") or 0) < week_ago]
     for key in stale:
@@ -2314,6 +2347,8 @@ def _save_rescues() -> None:
         _write_json_atomic(_rescues_file(), {"rescues": _rescues})
     except OSError as e:
         logger.warning(f"Could not save the rescue state: {e}")
+        return False
+    return True
 
 
 def _rescue_token(parent_id: str) -> str:
@@ -2374,9 +2409,20 @@ async def _sources_down() -> str | None:
     return None
 
 
+def _agent_tried_recently(md5: str | None) -> bool:
+    since = time.time() - RESCUE_REPEAT_SECONDS
+    return any(r.get("md5") == md5 and (r.get("agent_started_at") or 0) > since for r in _rescues.values())
+
+
 async def _open_rescue(job_id: str, job: dict) -> tuple[str, str]:
     """Schedule the free retry. Returns what the share's end line adds, for
     Slack and for the phone, which is told where the result will land."""
+    if _rescues_broken:
+        note = "No retry: book-search could not read its rescue state."
+        return note, note
+    if _agent_tried_recently(job.get("md5")):
+        note = "An agent already looked for this book this week, so there is no retry."
+        return note, note
     down = await _sources_down()
     if down:
         note = f"No retry or agent while {down}; share it again later."
@@ -2391,7 +2437,10 @@ async def _open_rescue(job_id: str, job: dict) -> tuple[str, str]:
         "tried": sorted({job.get("md5"), *(job.get("tried_md5s") or ())} - {None}),
         "children": [],
     }
-    _save_rescues()
+    if not _save_rescues():
+        del _rescues[job_id]
+        note = "No retry: book-search could not save its rescue state."
+        return note, note
     job["held"] = True
     minutes = max(1, round(RESCUE_RETRY_DELAY_SECONDS / 60))
     note = f"Trying again in {minutes} minutes."
@@ -2429,11 +2478,22 @@ async def _child_settled(child_id: str, child: dict) -> None:
     """A retry or an agent's job ended. Its outcome belongs to the parent's rescue."""
     parent_id = child.get("rescue_of")
     rescue = _rescues.get(parent_id)
-    if not rescue or rescue.get("state") == "closed":
+    if not rescue:
+        return
+    # Lines name the book that was shared: an agent's copy carries a title
+    # the agent chose, from a libgen row a stranger wrote.
+    named = {**child, "title": rescue.get("title") or child.get("title")}
+    delivered = child.get("outcome") in ("done", "already_sent")
+    if rescue.get("state") == "closed":
+        if delivered:
+            # The rescue already has its line, but this copy did arrive.
+            await _post_slack(f"{_outcome_line(named, markup=True)}. The rescue agent sent this "
+                              "copy, and it arrived after the rescue had closed.")
         return
     rescue.setdefault("children", []).append({
         "job_id": child_id, "kind": child.get("kind"), "md5": child.get("md5"),
-        "outcome": child.get("outcome"), "text": child.get("final_text"),
+        "outcome": child.get("outcome"), "text": _outcome_line(named, markup=False),
+        "line": _outcome_line(named, markup=True),
     })
     rescue["tried"] = sorted(
         (set(rescue.get("tried") or ()) | {child.get("md5")} | set(child.get("tried_md5s") or ())) - {None}
@@ -2442,8 +2502,8 @@ async def _child_settled(child_id: str, child: dict) -> None:
         _save_rescues()
         return
     title = rescue.get("title") or "The book"
-    if child.get("outcome") in ("done", "already_sent"):
-        await _close_rescue(parent_id, f"{_outcome_line(child, markup=True)}, on a second try")
+    if delivered:
+        await _close_rescue(parent_id, f"{_outcome_line(named, markup=True)}, on a second try")
     elif child.get("code") in RESCUE_CODES:
         await _send_agent(parent_id, rescue, child)
     else:
@@ -2461,21 +2521,32 @@ async def _send_agent(parent_id: str, rescue: dict, child: dict) -> None:
     """After the retry failed too: pay for an agent, if every limit allows it."""
     title = rescue.get("title") or "The book"
     reason = child.get("reason") or "no file worked"
-    why_not = await _sources_down()
-    if not why_not and any(r.get("state") == "agent_running" for k, r in _rescues.items() if k != parent_id):
-        why_not = "another rescue is running"
-    if not why_not and _agents_in_last_day() >= RESCUE_DAILY_CAP:
-        why_not = f"today's {RESCUE_DAILY_CAP} rescues are used up"
-    if why_not:
-        await _close_rescue(parent_id, f"⚠️ *{title}* failed again: {reason}. No agent: {why_not}.")
-        return
-    agent_job = await _dispatch_agent(parent_id, rescue)
-    if not agent_job:
-        await _close_rescue(parent_id, (
-            f"⚠️ *{title}* failed again: {reason}. The rescue agent could not start."))
-        return
-    rescue.update(state="agent_running", agent_job_id=agent_job, agent_started_at=time.time())
-    _save_rescues()
+    async with _agent_lock:
+        why_not = await _sources_down()
+        if not why_not and any(r.get("state") in ("agent_starting", "agent_running")
+                               for k, r in _rescues.items() if k != parent_id):
+            why_not = "another rescue is running"
+        if not why_not and _agents_in_last_day() >= RESCUE_DAILY_CAP:
+            why_not = f"today's {RESCUE_DAILY_CAP} rescues are used up"
+        if not why_not:
+            # On disk before any money is spent, so neither a crash nor a
+            # failed write can keep an agent out of today's count.
+            rescue.update(state="agent_starting", agent_started_at=time.time())
+            if not _save_rescues():
+                rescue.pop("agent_started_at", None)
+                why_not = "book-search could not save its rescue state"
+        if why_not:
+            await _close_rescue(parent_id, f"⚠️ *{title}* failed again: {reason}. No agent: {why_not}.")
+            return
+        # A start that failed still counts against today: a timed-out request
+        # may have started an agent all the same.
+        agent_job = await _dispatch_agent(parent_id, rescue)
+        if not agent_job:
+            await _close_rescue(parent_id, (
+                f"⚠️ *{title}* failed again: {reason}. The rescue agent could not start."))
+            return
+        rescue.update(state="agent_running", agent_job_id=agent_job)
+        _save_rescues()
     await _post_slack(
         f"\U0001f6df *{title}* failed again, so an agent is looking for another copy "
         f"(up to ${RESCUE_BUDGET_USD}). The result will follow here.")
@@ -2559,6 +2630,11 @@ def _agent_final_text(job: dict) -> str:
 async def _close_rescue(parent_id: str, line: str) -> None:
     """End a rescue with its one line in Slack, and let the share expire."""
     rescue = _rescues.setdefault(parent_id, {})
+    if rescue.get("state") == "closed":
+        # A report and the watchdog can both get here; the first one speaks.
+        return
+    if any(j.get("rescue_of") == parent_id and not j.get("finished") for j in _download_jobs.values()):
+        line += " A copy is still on its way; if it arrives, a line will follow."
     rescue.update(state="closed", closed_at=time.time(), result=line)
     _save_rescues()
     parent = _download_jobs.get(parent_id)
@@ -2575,24 +2651,33 @@ async def _watch_agent(parent_id: str, rescue: dict) -> None:
         r = await _agent_call("GET", f"/jobs/{rescue.get('agent_job_id')}")
     except httpx.HTTPError as e:
         logger.warning(f"[{parent_id}] Could not ask the agent service about the rescue: {e}")
-        return
-    if r.status_code == 404:
+        r = None
+    if r is not None and r.status_code == 404:
         await _close_rescue(parent_id, (
             f"⚠️ The rescue agent for *{title}* was lost, most likely in a restart "
             f"of the agent service.{_children_note(rescue)}"))
         return
-    if r.status_code >= 300:
+    try:
+        job = r.json() if r is not None and r.status_code < 300 else {}
+    except ValueError:
+        job = {}
+    status = job.get("status") if isinstance(job, dict) else None
+    if status in _AGENT_TERMINAL:
+        cost = (job.get("summary") or {}).get("cost_usd")
+        facts = [status] + ([f"${cost:.2f}"] if isinstance(cost, (int, float)) else [])
+        said = _untrusted(_agent_final_text(job), 200)
+        await _close_rescue(parent_id, (
+            f"⚠️ The rescue agent for *{title}* ended without reporting ({', '.join(facts)})."
+            + (f" Its last words: {said}" if said else "") + _children_note(rescue)))
         return
-    job = r.json()
-    status = job.get("status")
-    if status not in _AGENT_TERMINAL:
-        return
-    cost = (job.get("summary") or {}).get("cost_usd")
-    facts = [status] + ([f"${cost:.2f}"] if isinstance(cost, (int, float)) else [])
-    said = _untrusted(_agent_final_text(job), 200)
-    await _close_rescue(parent_id, (
-        f"⚠️ The rescue agent for *{title}* ended without reporting ({', '.join(facts)})."
-        + (f" Its last words: {said}" if said else "") + _children_note(rescue)))
+    # Still queued, or the agent service cannot be asked (down, or a rotated
+    # token): past the deadline the rescue closes anyway, so it cannot hold
+    # every later rescue off as "another rescue is running".
+    if time.time() - (rescue.get("agent_started_at") or 0) > RESCUE_REPORT_DEADLINE_SECONDS:
+        await _close_rescue(parent_id, (
+            f"⚠️ The rescue agent for *{title}* did not report within "
+            f"{RESCUE_REPORT_DEADLINE_SECONDS // 60} minutes, so its rescue is closed."
+            + _children_note(rescue)))
 
 
 async def _rescue_tick() -> None:
@@ -2605,6 +2690,13 @@ async def _rescue_tick() -> None:
                 _start_rerun(parent_id, rescue)
             elif state == "rerun_running" and rescue.get("child_job_id") not in _download_jobs:
                 _start_rerun(parent_id, rescue)
+            elif (state == "agent_starting"
+                  and now - (rescue.get("agent_started_at") or 0) > RESCUE_START_GRACE_SECONDS):
+                # The pod stopped between saving the start and hearing back.
+                # The agent may be running; its token no longer works.
+                await _close_rescue(parent_id, (
+                    f"⚠️ The rescue agent for *{rescue.get('title') or 'the book'}* may have "
+                    "started, but book-search lost track of it in a restart."))
             elif state == "agent_running":
                 await _watch_agent(parent_id, rescue)
         except Exception as e:
@@ -2877,8 +2969,10 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
         )
         # Slack keeps the record. On 2026-09-24 a 1.9 KB page 400'd here and
         # nobody knew, because the shortcut then showed no response at all.
+        # The rescue agent reads its own answers, and never writes to Slack.
         warning = _format_empty_share(len(given_page or ""))
-        asyncio.create_task(_post_slack(warning))
+        if not rescue_of:
+            asyncio.create_task(_post_slack(warning))
         return _rejected(
             warning,
             "No book on the shared page. Let the Anna's Archive page "
@@ -2888,9 +2982,10 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
 
     md5 = extract_md5(url)
     if not md5:
-        asyncio.create_task(_post_slack(
-            f"⚠️ A share arrived with a link that names no book: {url[:200]}"
-        ))
+        if not rescue_of:
+            asyncio.create_task(_post_slack(
+                f"⚠️ A share arrived with a link that names no book: {url[:200]}"
+            ))
         return _rejected(
             "\u26a0\ufe0f That link names no book. Share an Anna's Archive book page.",
             "Share an Anna's Archive or libgen book link (or the book's "
@@ -2910,6 +3005,12 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
         }.get(rescue.get("state"), "it is still at work")
         text = (f"\U0001f6df book-search is still working on {rescue.get('title') or 'this book'}: "
                 f"{doing}. The result will be in Slack.")
+        going_to, wanted = _destination(rescue), _destination({"kindle_email": kindle_email})
+        if kindle_email and wanted != going_to:
+            text += f" It is going to {going_to}; share it again once that ends to send it to {wanted}."
+            asyncio.create_task(_post_slack(
+                f"⚠️ *{rescue.get('title') or 'A book'}* was shared for {wanted} while its "
+                f"rescue is still going to {going_to}. Share it again once that ends."))
         known = parent_id if parent_id in _download_jobs else _tombstone(text, "under_rescue", outcome="rejected")
         return {"status": "ok", "job_id": known, "title": rescue.get("title"),
                 "author": rescue.get("author"), "message": text}
@@ -2917,8 +3018,13 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
     # Deduplicate: a share of a book that is still being fetched joins that job.
     # "Still being fetched" means not finished: status reads "done" before the
     # Kindle step runs, and a new job then would email the book a second time.
+    # Never across the rescue line: a person's share joining an agent's job
+    # would get no line of its own, and an agent's share joining a person's
+    # would never count as the rescue's copy. The Kindle guard stops a double send.
     for jid, job in _download_jobs.items():
         if job.get("md5") != md5 or job.get("finished"):
+            continue
+        if bool(job.get("rescue_of")) != bool(rescue_of):
             continue
         if kindle_email and not job.get("kindle_email") and not job.get("kindle_attempted"):
             # Anca's share landed on a Calibre-only job: it takes her Kindle.
@@ -2940,6 +3046,21 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
         text = "\u26a0\ufe0f book-search is still starting. Share it again in a minute."
         job_id = _tombstone(text, "starting", outcome="failed")
         return {"status": "failed", "job_id": job_id, "message": text, "detail": text}
+
+    if rescue_of:
+        # Each of the agent's files can email the recipient, so the runbook's
+        # limits are enforced here too.
+        rescue = _rescues[rescue_of]
+        refusal = None
+        if _delivered_by_agent(rescue):
+            refusal = "A copy already went through for this rescue. Report it as delivered."
+        elif rescue.get("agent_files", 0) >= RESCUE_AGENT_FILES:
+            refusal = f"This rescue has used its {RESCUE_AGENT_FILES} files. Report what happened."
+        if refusal:
+            return JSONResponse(status_code=409, content={
+                "status": "refused", "message": f"\u26a0\ufe0f {refusal}", "detail": refusal})
+        rescue["agent_files"] = rescue.get("agent_files", 0) + 1
+        _save_rescues()
 
     # A page posted by the caller is the best source we have: Anna's Archive is
     # human-only for us, so a phone holding the rendered page knows things this
@@ -2999,8 +3120,11 @@ async def rescue_candidates(request: Request, title: str = "", author: str = "")
             raise HTTPException(status_code=503, detail=f"libgen is unreachable ({type(e).__name__})")
         for row in found:
             rows.setdefault(row.md5, row)
-    return [{"md5": r.md5, "title": r.title, "author": r.author, "ext": r.ext,
-             "language": r.language, "size_bytes": r.size_bytes} for r in rows.values()]
+    # Uploaders write these fields and an agent reads them, so they go out as
+    # plain words: no markup, no line breaks, nothing long.
+    return [{"md5": r.md5, "title": _untrusted(r.title), "author": _untrusted(r.author),
+             "ext": _untrusted(r.ext, 10), "language": _untrusted(r.language, 40),
+             "size_bytes": r.size_bytes} for r in rows.values()]
 
 
 @app.post("/api/rescue-result")
@@ -3028,7 +3152,9 @@ async def rescue_result(request: Request):
     note = _untrusted(str((data or {}).get("note") or ""), 300)
     title = rescue.get("title") or "the book"
     delivered = _delivered_by_agent(rescue)
-    if delivered:
+    if delivered and delivered[-1].get("line"):
+        line = f"{delivered[-1]['line']}, found by the rescue agent"
+    elif delivered:
         line = f"\u2705 The agent got *{title}* through: {delivered[-1].get('text', '').lstrip('\u2705 ')}"
     elif status == "delivered":
         line = f"\u26a0\ufe0f The agent reported *{title}* delivered, but no copy went through book-search."
@@ -3066,7 +3192,9 @@ async def download_status_wait(request: Request):
         return PlainTextResponse(
             "⚠️ book-search no longer knows this share, most likely because it "
             "restarted. Its result, if any, is in Slack.")
-    if not job.get("finished") and job.get("phase") != "converting":
+    # A converting PDF releases the phone at once, to hand over to Slack. The
+    # rescue agent is held instead: every early answer costs it a model turn.
+    if not job.get("finished") and (job.get("phase") != "converting" or job.get("rescue_of")):
         event = _job_events.setdefault(job_id, asyncio.Event())
         try:
             await asyncio.wait_for(event.wait(), timeout=WAIT_HOLD_SECONDS)
