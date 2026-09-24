@@ -2164,12 +2164,11 @@ async def _settle_job(job_id: str, title: str | None = None) -> None:
         _mark_finished(job_id)
         await _child_settled(job_id, job)
         return
-    note = await _open_rescue(job_id, job) if _rescue_eligible(job) else ""
-    suffix = f" {note}" if note else ""
-    job["final_text"] = _outcome_line(job, markup=False) + suffix
+    slack_note, phone_note = await _open_rescue(job_id, job) if _rescue_eligible(job) else ("", "")
+    job["final_text"] = _outcome_line(job, markup=False) + (f" {phone_note}" if phone_note else "")
     _mark_finished(job_id)
     _journal_remove(job_id)
-    await _post_slack(_outcome_line(job, markup=True) + suffix)
+    await _post_slack(_outcome_line(job, markup=True) + (f" {slack_note}" if slack_note else ""))
 
 
 async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
@@ -2375,11 +2374,13 @@ async def _sources_down() -> str | None:
     return None
 
 
-async def _open_rescue(job_id: str, job: dict) -> str:
-    """Schedule the free retry. Returns what the share's end line adds."""
+async def _open_rescue(job_id: str, job: dict) -> tuple[str, str]:
+    """Schedule the free retry. Returns what the share's end line adds, for
+    Slack and for the phone, which is told where the result will land."""
     down = await _sources_down()
     if down:
-        return f"No retry or agent while {down}; share it again later."
+        note = f"No retry or agent while {down}; share it again later."
+        return note, note
     now = time.time()
     _rescues[job_id] = {
         "state": "rerun_scheduled", "opened_at": now,
@@ -2393,7 +2394,8 @@ async def _open_rescue(job_id: str, job: dict) -> str:
     _save_rescues()
     job["held"] = True
     minutes = max(1, round(RESCUE_RETRY_DELAY_SECONDS / 60))
-    return f"Trying again in {minutes} minutes; the result will be in Slack."
+    note = f"Trying again in {minutes} minutes."
+    return note, f"{note} The result will be in Slack."
 
 
 def _start_rerun(parent_id: str, rescue: dict) -> None:
