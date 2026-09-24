@@ -383,6 +383,25 @@ async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
 
 EBOOK_EXTENSIONS = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
 
+# Calibre-Web's upload handler drops each file into the ingest folder as
+# new_<user>_<YYYYMMDD>_<HHMMSS>_<micro>_<name>, or format_<book>_... for an extra
+# format (cps/editbooks.py _get_ingest_path), and imports it from there. Calibre
+# owns the file until the import finishes and removes it itself afterwards.
+# Deleting one mid-import is what lost Remember Me on 2026-09-24.
+_CWA_UPLOAD_RE = _re.compile(r"^(?:new|format)_\d+_\d{8}_\d{6}_\d{6}_")
+
+
+def _is_cwa_upload(filename: str) -> bool:
+    return bool(_CWA_UPLOAD_RE.match(filename)) and filename.lower().endswith(EBOOK_EXTENSIONS)
+
+
+def _cwa_uploads_pending() -> list[str]:
+    """Calibre-Web uploads still in the ingest folder, i.e. not imported yet."""
+    try:
+        return [f for f in os.listdir(CWA_INGEST_PATH) if _is_cwa_upload(f)]
+    except OSError:
+        return []
+
 
 def _invalid_ingest_reason(filename: str, full_path: str) -> str | None:
     """Return a human-readable reason if `filename` looks like a poisoned ingest
@@ -403,8 +422,10 @@ def _ingest_ebook_files(exclude: set[str] | None = None) -> list[str]:
     """List valid ebook files in the ingest directory.
 
     Skips: non-ebook extensions, files in `exclude` (callers snapshot this set
-    before queueing so orphans from prior jobs are ignored), and files
-    rejected by `_invalid_ingest_reason` (MISMATCH, too small).
+    before queueing so orphans from prior jobs are ignored), files rejected by
+    `_invalid_ingest_reason` (MISMATCH, too small), and Calibre-Web's own
+    uploads, which are never a download and which callers would re-upload and
+    delete while Calibre is importing them.
     """
     exclude = exclude or set()
     try:
@@ -413,7 +434,7 @@ def _ingest_ebook_files(exclude: set[str] | None = None) -> list[str]:
         return []
     out = []
     for f in names:
-        if f in exclude:
+        if f in exclude or _is_cwa_upload(f):
             continue
         full = os.path.join(CWA_INGEST_PATH, f)
         if not os.path.isfile(full):
@@ -431,7 +452,8 @@ def _cleanup_unconsumed_ingest_files(job_id: str, pre_existing: set[str]) -> lis
     the job but weren't consumed (uploaded + os.removed) by it. Avoids leaking
     partial downloads or extra files (e.g. when Stacks delivers a duplicate)
     that would poison subsequent jobs. Files present *before* the job started
-    (`pre_existing`) are left alone — they belong to a different job."""
+    (`pre_existing`) are left alone — they belong to a different job, and so
+    are Calibre-Web's own uploads, which Calibre may still be importing."""
     try:
         cur = set(os.listdir(CWA_INGEST_PATH))
     except OSError:
@@ -442,6 +464,9 @@ def _cleanup_unconsumed_ingest_files(job_id: str, pre_existing: set[str]) -> lis
         if not os.path.isfile(full):
             continue
         if not any(f.lower().endswith(e) for e in EBOOK_EXTENSIONS):
+            continue
+        if _is_cwa_upload(f):
+            logger.info(f"[{job_id}] Leaving {f} to Calibre, which is still importing it")
             continue
         try:
             os.remove(full)
@@ -672,6 +697,10 @@ async def health_deep():
 
 CALIBRE_ID_ATTEMPTS = 12
 CALIBRE_ID_INTERVAL = 10
+# How long an id lookup keeps waiting while Calibre still has an upload in the
+# ingest folder. A PDF is converted to EPUB on import, which took minutes on
+# 2026-09-24; CWA's own ingest timeout is 15 minutes.
+CALIBRE_IMPORT_MAX_WAIT = int(os.getenv("CALIBRE_IMPORT_MAX_WAIT", "1200"))
 
 # Anna's Archive builds every page title as "<page title> - <site title>"
 # (allthethings/templates/layouts/index.html), so a title shared from the iOS
@@ -710,14 +739,27 @@ async def _resolve_calibre_id(title: str, author: str) -> int | None:
 
     The Goodreads path already reads metadata.db, matched on title AND author.
     This is the same wait, for the shortcut path.
+
+    While Calibre still has an upload in the ingest folder it is still
+    importing, so those looks do not count against CALIBRE_ID_ATTEMPTS; only
+    CALIBRE_IMPORT_MAX_WAIT bounds them. On 2026-09-24 a PDF was still being
+    converted when the fixed 12 looks ran out, and the Kindle send was skipped.
     """
-    for attempt in range(CALIBRE_ID_ATTEMPTS):
+    deadline = time.monotonic() + CALIBRE_IMPORT_MAX_WAIT
+    idle_looks = 0
+    while True:
         book_id = _calibre_id_for(title, author)
         if book_id:
             return book_id
-        if attempt < CALIBRE_ID_ATTEMPTS - 1:
-            await asyncio.sleep(CALIBRE_ID_INTERVAL)
-    return None
+        if _cwa_uploads_pending():
+            idle_looks = 0
+        else:
+            idle_looks += 1
+            if idle_looks >= CALIBRE_ID_ATTEMPTS:
+                return None
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(CALIBRE_ID_INTERVAL)
 
 
 def _no_route_message(md5: str, title: str, upstream: str | None = None) -> str:
