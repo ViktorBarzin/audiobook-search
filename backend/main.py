@@ -132,20 +132,55 @@ _SMTP_RETRIABLE_EXC = (
 )
 
 
-async def _notify_slack(title: str, author: str, content_type: str, source: str = "", kindle: bool = False):
-    """Send download notification to Slack. Fire-and-forget, never fails the request."""
+async def _post_slack(text: str) -> None:
+    """Post one line to Slack. Never raises: a notification must not fail a job."""
     if not SLACK_WEBHOOK_URL:
         return
     try:
-        emoji = "\U0001f4d6" if content_type == "ebook" else "\U0001f3a7"
-        kindle_tag = " \u2192 Kindle" if kindle else ""
-        text = f"{emoji} *{title}*\nby {author}\n_{content_type}{kindle_tag}_"
-        if source:
-            text += f" | source: {source}"
         async with httpx.AsyncClient(timeout=5) as client:
             await client.post(SLACK_WEBHOOK_URL, json={"text": text})
     except Exception as e:
         logger.warning(f"Slack notification failed: {e}")
+
+
+async def _notify_slack(title: str, author: str, content_type: str, source: str = "", kindle: bool = False):
+    """Send download notification to Slack. Fire-and-forget, never fails the request."""
+    emoji = "\U0001f4d6" if content_type == "ebook" else "\U0001f3a7"
+    kindle_tag = " \u2192 Kindle" if kindle else ""
+    text = f"{emoji} *{title}*\nby {author}\n_{content_type}{kindle_tag}_"
+    if source:
+        text += f" | source: {source}"
+    await _post_slack(text)
+
+
+def _format_share_problem(title: str, author: str, problem: str, kindle: bool) -> str:
+    """The warning a share gets when it ends without doing what it asked.
+
+    The start line ("\u2192 Kindle") is posted when the job begins, so without this
+    a failure after that point is silent. On 2026-09-24 two books never reached
+    Anca's Kindle and nobody knew until Viktor asked.
+    """
+    what = "was not sent to the Kindle" if kindle else "did not reach Calibre"
+    return f"\u26a0\ufe0f *{title}* \u2014 {author} {what}: {problem}"
+
+
+def _format_empty_share(page_bytes: int) -> str:
+    """The warning for a share whose page had no book on it."""
+    size = f"{page_bytes / 1024:.1f} KB" if page_bytes else "empty"
+    return (
+        f"\u26a0\ufe0f A share arrived with no book in it (the page was {size}; a book page "
+        "is usually over 200 KB). Let the Anna's Archive page finish loading, "
+        "then share it again."
+    )
+
+
+def _delivery_problem(job: dict) -> str | None:
+    """Why a finished share did not do what it asked, or None when it did."""
+    if job.get("status") == "failed":
+        return job.get("message") or "the download failed"
+    if job.get("kindle_email") and not job.get("kindle_attempted"):
+        return job.get("message") or "it never reached the Kindle step"
+    return None
 
 
 def _chown_for_cwa(path: str):
@@ -355,12 +390,18 @@ async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
             # Check for success response
             try:
                 resp_json = r.json()
-                if resp_json.get("location") == "/tasks":
-                    logger.info(f"CWA upload: successfully uploaded {filename}")
-                else:
-                    logger.warning(f"CWA upload: unexpected response: {resp_json}")
             except Exception:
+                resp_json = None
                 logger.info(f"CWA upload: uploaded {filename} (non-JSON response)")
+            if resp_json is not None:
+                if resp_json.get("location") != "/tasks":
+                    # Refused: it sends the browser back to "/" with a flashed
+                    # error and queues nothing. Polling OPDS after this is what
+                    # made a job report "Added to Calibre" for a Moby-Dick PDF
+                    # that libmagic did not recognise (2026-09-24).
+                    logger.warning(f"CWA upload: Calibre-Web refused {filename}: {resp_json}")
+                    return None
+                logger.info(f"CWA upload: successfully uploaded {filename}")
 
     except Exception as e:
         logger.exception(f"CWA upload failed for {filename}: {e}")
@@ -856,6 +897,14 @@ async def _libgen_by_title(
         return None, None
 
     author = _clean_shared_author(author)
+    item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
+
+    def choose(rows: list):
+        if author:
+            match = select_candidate(item, rows)
+            return match.candidate, match.reason
+        return _pick_on_title_alone(title, rows), "title_only"
+
     candidates: list = []
     for query in _libgen_queries(title, author):
         try:
@@ -870,19 +919,20 @@ async def _libgen_by_title(
         # mirror was never sent.
         if skip_md5:
             rows = [c for c in rows if (c.md5 or "").lower() != skip_md5.lower()]
-        if rows:
+        # A query has answered only when the matcher accepts one of its rows.
+        # On 2026-09-24 the full title of A Man Called Ove returned a single
+        # companion book by another author; stopping there failed the job while
+        # the shorter query found the novel.
+        if rows and choose(rows)[0]:
             candidates = rows
             break
-        logger.info("No usable libgen rows for %r, trying a shorter query", query)
+        logger.info(
+            "No acceptable libgen rows for %r (%d rows), trying a shorter query", query, len(rows),
+        )
 
-    item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
     remaining = list(candidates)
     for attempt in range(FALLBACK_FILE_ATTEMPTS):
-        if author:
-            match = select_candidate(item, remaining)
-            chosen, how = match.candidate, match.reason
-        else:
-            chosen, how = _pick_on_title_alone(title, remaining), "title_only"
+        chosen, how = choose(remaining)
 
         if not chosen:
             logger.info(
@@ -984,6 +1034,11 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
             filename = filename or f"{author} - {title}.epub"
             book_id = await _upload_to_calibre(file_data, filename)
             if not book_id:
+                job["upload_refused"] = (
+                    f"Calibre-Web did not accept {filename}. It turns away files it "
+                    "cannot identify as a book, so try a different copy, ideally an "
+                    "EPUB; if that fails too, Calibre itself may be down."
+                )
                 return False
             if book_id <= 0:
                 # Upload succeeded but the id is still unknown; the library
@@ -1205,6 +1260,12 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # inside a try runs finally anyway, which is how one tap put two
             # copies of the same book on a Kindle on 2026-09-07.
             return
+        if job.get("upload_refused"):
+            # The file downloaded fine and Calibre turned it down. Stacks would
+            # only fetch the same file again, minutes later.
+            job["status"] = "failed"
+            job["message"] = job["stage_detail"] = job["upload_refused"]
+            return
 
         job["stage_detail"] = "Sending to Stacks..."
         stacks_result = await annas_scraper.download_via_stacks(md5)
@@ -1399,6 +1460,12 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         # `failed` if SMTP exhausts retries makes the iOS Shortcut surface the
         # error instead of declaring success on a Calibre-only outcome.
         await _maybe_send_to_kindle(job_id, title)
+        problem = _delivery_problem(job)
+        if problem:
+            await _post_slack(_format_share_problem(
+                job.get("title") or title, job.get("author") or author,
+                problem, kindle=bool(job.get("kindle_email")),
+            ))
         # Schedule TTL cleanup as a fire-and-forget so it survives early returns
         # too (the previous awaitsleep at function-tail was skipped on early
         # return paths and leaked job state for ~10 minutes).
@@ -1678,10 +1745,20 @@ async def download_url(request: Request):
             len(body or b""),
             content_type,
         )
-        raise HTTPException(status_code=400, detail="No URL provided")
+        # The shortcut does not show this response, so Slack is where it has to
+        # land. On 2026-09-24 a 1.9 KB page 400'd here and nobody knew.
+        asyncio.create_task(_post_slack(_format_empty_share(len(given_page or ""))))
+        raise HTTPException(
+            status_code=400,
+            detail="No book on the shared page. Let the Anna's Archive page "
+                   "finish loading, then share it again.",
+        )
 
     md5 = extract_md5(url)
     if not md5:
+        asyncio.create_task(_post_slack(
+            f"⚠️ A share arrived with a link that names no book: {url[:200]}"
+        ))
         raise HTTPException(
             status_code=400,
             detail="Share an Anna's Archive or libgen book link (or the book's "

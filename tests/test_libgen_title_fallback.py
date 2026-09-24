@@ -192,3 +192,51 @@ async def test_the_failure_message_names_the_book_when_known():
 
     assert "Obviously Awesome" in msg
     assert AA_ONLY_MD5 in msg
+
+
+class QueryAwareLibGen(FakeLibGen):
+    """Answers each query with its own rows, as the live mirror does."""
+
+    def __init__(self, by_query, downloadable):
+        super().__init__(candidates=[], downloadable=downloadable)
+        self.by_query = by_query
+
+    async def search_candidates(self, query):
+        self.queries.append(query)
+        return self.by_query.get(query, [])
+
+
+async def test_a_companion_book_does_not_end_the_search(fallback, monkeypatch):
+    """Live 2026-09-24, A Man Called Ove: A Novel, shared as an AA-only md5.
+
+    The full-title query returned one row, a "Conversation Starters" companion
+    by another author. The matcher rightly refused it, but the loop had already
+    stopped on "this query returned rows", so the job failed while the next,
+    shorter query finds the novel itself.
+    """
+    companion = candidate(
+        "1036cb6035e05499a3c5979a98ccd55f",
+        "Daily A Man Called Ove: A Novel by Fredrik Backman | Conversation Starters",
+        "Daily Books", size=255_000,
+    )
+    novel = candidate(EBOOK_MD5, "A Man Called Ove b l 1317844", "Fredrik Backman", size=602_000)
+    fake = QueryAwareLibGen(
+        by_query={
+            "A Man Called Ove: A Novel Fredrik Backman": [companion],
+            "A Man Called Ove Fredrik Backman": [novel, companion],
+        },
+        downloadable={EBOOK_MD5: EBOOK},
+    )
+    monkeypatch.setattr("backend.main.libgen_scraper", fake)
+
+    data, _ = await fallback(
+        "A Man Called Ove: A Novel", "Fredrik Backman",
+        skip_md5="cab14d02fedc672f7e51682b78e477a4",
+    )
+
+    assert data == EBOOK
+    assert fake.download_calls == [EBOOK_MD5]
+    assert fake.queries == [
+        "A Man Called Ove: A Novel Fredrik Backman",
+        "A Man Called Ove Fredrik Backman",
+    ]
