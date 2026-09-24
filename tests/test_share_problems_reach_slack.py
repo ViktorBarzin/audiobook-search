@@ -5,8 +5,8 @@ The first share posted a 1.9 KB page with no book in it and got a 400 that
 nobody saw, because the shortcut does not show the response. The second posted
 "→ Kindle" to Slack when the job started, then failed later without a word.
 Viktor only found out by asking. The start line stays, since it is what caught
-a wrong pick (the Backman collection) that same morning; what is new is one
-warning line whenever a share ends without doing what it asked.
+a wrong pick (the Backman collection) that same morning. Every share now also
+ends with one line: ✅ when it did what it asked, ⚠️ with the reason when not.
 """
 
 import pytest
@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 import backend.main as bs_main
 from backend.annas import AnnasArchiveScraper
+from tests.fake_library import make_library
 
 
 async def _noop(*a, **k):
@@ -24,9 +25,8 @@ async def _noop(*a, **k):
 def slack(monkeypatch):
     posted = []
 
-    def record(text):
+    async def record(text):
         posted.append(text)
-        return _noop()
 
     monkeypatch.setattr(bs_main, "_post_slack", record)
     return posted
@@ -38,6 +38,7 @@ def client(monkeypatch, slack):
     monkeypatch.setattr(bs_main, "_process_download", _noop)
     monkeypatch.setattr(bs_main, "_notify_slack", _noop)
     monkeypatch.setattr(bs_main, "_detail_best_effort", _noop)
+    monkeypatch.setattr(bs_main, "_ttl_cleanup_job", _noop)
     monkeypatch.setattr(bs_main, "annas_scraper", AnnasArchiveScraper())
     monkeypatch.setattr(bs_main, "_download_jobs", {})
     return TestClient(bs_main.app)
@@ -68,28 +69,40 @@ def test_a_link_that_names_no_book_says_so(client, slack):
     assert "annas-archive.org/search?q=ove" in slack[0]
 
 
-def test_a_problem_line_names_the_book_and_the_reason():
-    line = bs_main._format_share_problem(
-        "Remember Me", "Sophie Kinsella", "Calibre did not import it", kindle=True,
-    )
+def test_a_problem_line_names_the_book_the_recipient_and_the_reason(monkeypatch):
+    monkeypatch.setattr(bs_main, "KINDLE_RECIPIENTS", {"anca": "a@kindle.com"})
+    job = {"title": "Remember Me", "kindle_email": "a@kindle.com",
+           "outcome": "failed", "reason": "Calibre did not import it"}
+
+    line = bs_main._outcome_line(job, markup=True)
 
     assert line.startswith("⚠️")
     assert "*Remember Me*" in line
-    assert "Kindle" in line
+    assert "Anca's Kindle" in line
     assert "Calibre did not import it" in line
+    assert "*" not in bs_main._outcome_line(job, markup=False)
 
 
-@pytest.mark.parametrize("job, problem", [
-    ({"status": "failed", "message": "All download methods failed"}, "All download methods failed"),
+@pytest.mark.parametrize("job, outcome, reason", [
+    ({"status": "failed", "message": "All download methods failed"},
+     "failed", "All download methods failed"),
     ({"status": "done", "kindle_email": "r@kindle.com", "kindle_attempted": True,
-      "message": "Added to Calibre and sent to r@kindle.com"}, None),
+      "kindle_sent": True, "book_id": 507}, "done", None),
     ({"status": "done", "kindle_email": "r@kindle.com",
       "message": "Uploaded — Calibre import may still be processing"},
-     "Uploaded — Calibre import may still be processing"),
-    ({"status": "done", "kindle_email": None, "message": "Added to Calibre"}, None),
+     "failed", "Uploaded — Calibre import may still be processing"),
+    ({"status": "done", "kindle_email": None, "book_id": 507, "message": "Added to Calibre"},
+     "done", None),
+    ({"status": "done", "kindle_email": "r@kindle.com", "kindle_attempted": True,
+      "kindle_sent": False, "kindle_already_sent": "already sent at 07:18", "book_id": 507},
+     "already_sent", None),
 ])
-def test_which_finished_jobs_count_as_a_problem(job, problem):
-    assert bs_main._delivery_problem(job) == problem
+def test_which_finished_jobs_count_as_a_problem(job, outcome, reason):
+    got_outcome, got_reason = bs_main._decide_outcome(job)
+
+    assert got_outcome == outcome
+    if reason:
+        assert got_reason == reason
 
 
 class FailingLibgen:
@@ -114,11 +127,12 @@ async def test_a_job_that_fails_posts_one_warning(monkeypatch, slack):
 
     assert job["status"] == "failed"
     assert len(slack) == 1
+    assert slack[0].startswith("⚠️")
     assert "*A Man Called Ove: A Novel*" in slack[0]
     assert "Kindle" in slack[0]
 
 
-async def test_a_delivered_book_posts_no_warning(monkeypatch, slack):
+async def test_a_delivered_book_posts_one_success_line(monkeypatch, slack, tmp_path):
     class Libgen:
         async def download_file(self, md5):
             return b"PK\x03\x04" + b"x" * 50_000, "Remember Me.epub"
@@ -129,6 +143,9 @@ async def test_a_delivered_book_posts_no_warning(monkeypatch, slack):
     async def sent(book_id, title, email):
         return None
 
+    monkeypatch.setattr(bs_main, "CWA_LIBRARY_PATH", str(make_library(tmp_path, [
+        (511, "Remember Me?", "Sophie Kinsella", {"EPUB": 400_000}),
+    ])))
     monkeypatch.setattr(bs_main, "libgen_scraper", Libgen())
     monkeypatch.setattr(bs_main, "_upload_to_calibre", uploaded)
     monkeypatch.setattr(bs_main, "_send_to_kindle", sent)
@@ -141,4 +158,6 @@ async def test_a_delivered_book_posts_no_warning(monkeypatch, slack):
     await bs_main._process_download("j", md5, "Remember Me?", "Sophie Kinsella", None)
 
     assert "sent to" in job["message"]
-    assert slack == []
+    assert len(slack) == 1
+    assert slack[0].startswith("✅")
+    assert "⚠️" not in slack[0]

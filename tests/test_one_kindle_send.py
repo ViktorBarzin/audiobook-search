@@ -121,7 +121,8 @@ def test_the_download_path_sends_from_one_place_only():
     import inspect
 
     body = inspect.getsource(bs_main._process_download)
+    settle = inspect.getsource(bs_main._settle_job)
 
-    assert body.count("_maybe_send_to_kindle(") == 1, (
-        "delivery belongs in the finally block alone"
-    )
+    assert "_maybe_send_to_kindle(" not in body, "delivery belongs in _settle_job alone"
+    assert body.count("_settle_job(") == 1, "the finally block settles the job, once"
+    assert settle.count("_maybe_send_to_kindle(") == 1

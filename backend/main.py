@@ -1,5 +1,7 @@
 import os
 import asyncio
+import io
+import json
 import logging
 import re as _re
 import smtplib
@@ -7,9 +9,12 @@ import socket
 import sqlite3
 import time
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 import httpx
 from urllib.parse import unquote
@@ -116,6 +121,23 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "Calibre-Web <calibre-web@viktorbarzin.me>")
+# Small files that have to outlive a restart: the journal of running jobs and
+# the Kindle send guard. /stacks-config is an NFS volume this pod already
+# mounts read-write; book-search restarted on every deploy, 11 times over
+# 2026-09-07 and 2026-09-24.
+STATE_DIR = os.getenv("BOOK_SEARCH_STATE_DIR", "/stacks-config/book-search")
+# One wait call holds this long before answering with progress. iOS gives up on
+# "Get Contents of URL" at about 25 s and Traefik at 30 s.
+WAIT_HOLD_SECONDS = float(os.getenv("WAIT_HOLD_SECONDS", "20"))
+# A running job's journal file is touched this often, and one left alone for
+# JOURNAL_STALE_SECONDS belongs to a pod that is gone.
+JOURNAL_HEARTBEAT_SECONDS = 30
+JOURNAL_STALE_SECONDS = int(os.getenv("JOURNAL_STALE_SECONDS", "90"))
+# The same book goes to the same Kindle at most once in this window.
+KINDLE_SEND_GUARD_SECONDS = 24 * 3600
+# Times in messages are Viktor's local time.
+LOCAL_TZ = os.getenv("BOOK_SEARCH_TZ", "Europe/London")
+
 SMTP_MAX_ATTEMPTS = int(os.getenv("SMTP_MAX_ATTEMPTS", "3"))
 SMTP_RETRY_BACKOFF = float(os.getenv("SMTP_RETRY_BACKOFF", "2"))
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "60"))
@@ -138,7 +160,12 @@ async def _post_slack(text: str) -> None:
         return
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(SLACK_WEBHOOK_URL, json={"text": text})
+            r = await client.post(SLACK_WEBHOOK_URL, json={"text": text})
+        # The log is the record of what reached Slack: the webhook cannot be read back.
+        if r.status_code < 400:
+            logger.info("Posted to Slack: %s", text[:300].replace("\n", " "))
+        else:
+            logger.warning(f"Slack refused a notification ({r.status_code}): {text[:120]!r}")
     except Exception as e:
         logger.warning(f"Slack notification failed: {e}")
 
@@ -153,15 +180,96 @@ async def _notify_slack(title: str, author: str, content_type: str, source: str 
     await _post_slack(text)
 
 
-def _format_share_problem(title: str, author: str, problem: str, kindle: bool) -> str:
-    """The warning a share gets when it ends without doing what it asked.
+def _destination(job: dict) -> str:
+    """Where a share was headed, in words: "Anca's Kindle" or "Calibre"."""
+    address = (job.get("kindle_email") or "").strip().lower()
+    if not address:
+        return "Calibre"
+    for name, configured in KINDLE_RECIPIENTS.items():
+        if configured.lower() == address:
+            return f"{name.capitalize()}'s Kindle"
+    return "the Kindle"
 
-    The start line ("\u2192 Kindle") is posted when the job begins, so without this
-    a failure after that point is silent. On 2026-09-24 two books never reached
-    Anca's Kindle and nobody knew until Viktor asked.
+
+def _took(job: dict) -> str:
+    started, ended = job.get("created_at"), job.get("finished_at")
+    if not started or not ended:
+        return ""
+    seconds = max(0, int(ended - started))
+    return f"{seconds} s" if seconds < 120 else f"{seconds // 60} min"
+
+
+def _clock(epoch: float) -> str:
+    """HH:MM in Viktor's time zone, for "already sent at 07:18"."""
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(LOCAL_TZ)
+    except Exception:
+        zone = timezone.utc
+    return datetime.fromtimestamp(epoch, zone).strftime("%H:%M")
+
+
+def _decide_outcome(job: dict) -> tuple[str, str | None]:
+    """How a job whose work is over went: done, already_sent or failed, and why.
+
+    "done" needs the book confirmed in the library and, when a Kindle was asked
+    for, the email sent. On 2026-09-24 a share said "Added to Calibre" for a
+    book Calibre had refused, and another said nothing at all after the start.
     """
-    what = "was not sent to the Kindle" if kindle else "did not reach Calibre"
-    return f"\u26a0\ufe0f *{title}* \u2014 {author} {what}: {problem}"
+    if job.get("outcome") in ("rejected", "lost"):
+        return job["outcome"], job.get("reason")
+    if job.get("status") == "failed":
+        return "failed", job.get("reason") or job.get("message") or "the download failed"
+    if job.get("kindle_already_sent"):
+        return "already_sent", None
+    in_library = (job.get("book_id") or 0) > 0
+    delivered = not job.get("kindle_email") or job.get("kindle_sent")
+    if job.get("status") == "done" and in_library and delivered:
+        return "done", None
+    return "failed", job.get("reason") or job.get("message") or "it never finished"
+
+
+def _outcome_line(job: dict, markup: bool) -> str:
+    """The one line a finished share ends with: on the phone, and in Slack with
+    the title in bold."""
+    title = job.get("title") or "The book"
+    shown = f"*{title}*" if markup else title
+    outcome = job.get("outcome")
+    where = _destination(job)
+    if outcome == "done":
+        details = ", ".join(part for part in (job.get("format"), _took(job)) if part)
+        return f"\u2705 {shown} \u2192 {where}" + (f" ({details})" if details else "")
+    if outcome == "already_sent":
+        when = f" at {job['kindle_sent_at']}" if job.get("kindle_sent_at") else ""
+        return f"\u2705 {shown} was already sent to {where}{when}, so it was not sent again"
+    if outcome == "lost":
+        return f"\u26a0\ufe0f {shown} was lost when book-search restarted. Share it again."
+    if outcome == "rejected":
+        return job.get("reason") or job.get("final_text") or "\u26a0\ufe0f That share was not accepted."
+    reason = job.get("reason") or "it did not finish"
+    if job.get("kindle_email"):
+        return f"\u26a0\ufe0f {shown} was not sent to {where}: {reason}"
+    return f"\u26a0\ufe0f {shown} did not reach Calibre: {reason}"
+
+
+def _progress_line(job: dict, last: bool = False) -> str:
+    """What a job is doing, for a phone that is still waiting.
+
+    Built from the job's phase rather than stage_detail, which can read "Added
+    to Calibre" for twenty minutes while the Kindle step waits on an import.
+    """
+    title = job.get("title") or "the book"
+    phase = job.get("phase")
+    if phase == "converting":
+        return (f"\u23f3 Calibre is converting {title}. That takes a few minutes; "
+                "the result will be in Slack.")
+    if last:
+        return f"\u23f3 Still working on {title}. The result will be in Slack."
+    if phase in ("uploading", "importing"):
+        return f"\u23f3 Adding {title} to Calibre\u2026"
+    if phase == "sending":
+        return f"\u23f3 Emailing {title} to {_destination(job)}\u2026"
+    return f"\u23f3 Fetching {title}\u2026"
 
 
 def _format_empty_share(page_bytes: int) -> str:
@@ -172,15 +280,6 @@ def _format_empty_share(page_bytes: int) -> str:
         "is usually over 200 KB). Let the Anna's Archive page finish loading, "
         "then share it again."
     )
-
-
-def _delivery_problem(job: dict) -> str | None:
-    """Why a finished share did not do what it asked, or None when it did."""
-    if job.get("status") == "failed":
-        return job.get("message") or "the download failed"
-    if job.get("kindle_email") and not job.get("kindle_attempted"):
-        return job.get("message") or "it never reached the Kindle step"
-    return None
 
 
 def _chown_for_cwa(path: str):
@@ -286,9 +385,157 @@ CALIBRE_WEB_URL = os.getenv("CALIBRE_WEB_URL", "http://calibre.ebooks.svc.cluste
 CALIBRE_WEB_USER = os.getenv("CALIBRE_WEB_USER", "admin")
 CALIBRE_WEB_PASS = os.getenv("CALIBRE_WEB_PASS", "")
 
-# In-memory job store for async downloads (ephemeral — no persistence needed)
+# In-memory job store for async downloads. A running job also leaves a journal
+# file (see _journal_write), so a restart that kills it is still reported.
 _download_jobs: dict[str, dict] = {}
-JOB_TTL_SECONDS = 600  # auto-cleanup after 10 minutes
+# A finished job stays readable this long, so a phone that asks late still
+# gets its answer.
+JOB_TTL_SECONDS = 1800
+# Phones waiting on a job. Kept apart from the job, whose dict is returned as
+# JSON by /api/download-status/{job_id}.
+_job_events: dict[str, asyncio.Event] = {}
+
+
+def _write_json_atomic(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+    with open(temp, "w") as f:
+        json.dump(data, f)
+    os.replace(temp, path)
+
+
+def _journal_file(job_id: str) -> str:
+    return os.path.join(STATE_DIR, "jobs", f"{job_id}.json")
+
+
+def _journal_write(job_id: str, job: dict) -> None:
+    """Note a running job on disk. Never raises: a job must not fail over this."""
+    entry = {k: job.get(k) for k in ("title", "author", "md5", "kindle_email", "created_at")}
+    entry.update(job_id=job_id, pod=socket.gethostname())
+    try:
+        _write_json_atomic(_journal_file(job_id), entry)
+    except OSError as e:
+        logger.warning(f"[{job_id}] Could not write the job journal: {e}")
+
+
+def _journal_remove(job_id: str) -> None:
+    try:
+        os.remove(_journal_file(job_id))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"[{job_id}] Could not remove the job journal entry: {e}")
+
+
+def _journal_heartbeat() -> None:
+    """Touch every running job's entry, so no other pod takes it for lost."""
+    now = time.time()
+    for job_id, job in list(_download_jobs.items()):
+        if job.get("finished") or not job.get("md5"):
+            continue
+        try:
+            os.utime(_journal_file(job_id), (now, now))
+        except OSError:
+            pass
+
+
+def _mark_finished(job_id: str) -> None:
+    """Settle a job for anyone asking, and wake a phone that is waiting on it."""
+    job = _download_jobs.get(job_id)
+    if job is not None:
+        job["finished"] = True
+        job.setdefault("finished_at", time.time())
+    event = _job_events.get(job_id)
+    if event is not None:
+        event.set()
+
+
+def _tombstone(text: str, code: str, outcome: str = "rejected", **fields) -> str:
+    """A job that is over before it starts, so a share that was turned away
+    still has an id whose waits repeat the real reason."""
+    job_id = fields.pop("job_id", None) or uuid.uuid4().hex[:12]
+    now = time.time()
+    job = {"status": "failed", "title": "", "author": "", "md5": None,
+           "kindle_email": None, "created_at": now}
+    job.update(fields)
+    job.update(outcome=outcome, code=code, reason=text or None, finished=True, finished_at=now)
+    job["final_text"] = text or _outcome_line(job, markup=False)
+    job["message"] = job["stage_detail"] = job["final_text"]
+    _download_jobs[job_id] = job
+    asyncio.create_task(_ttl_cleanup_job(job_id))
+    return job_id
+
+
+async def _recover_lost_jobs() -> int:
+    """Report the jobs a pod that is gone left behind: one Slack line each.
+
+    An entry counts as abandoned once nothing has touched it for
+    JOURNAL_STALE_SECONDS; during a rolling update the old pod keeps its own
+    entries fresh until it stops. Renaming the file first claims it, so two
+    pods never both report one job.
+    """
+    folder = os.path.join(STATE_DIR, "jobs")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    reported = 0
+    now = time.time()
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        job_id = name[: -len(".json")]
+        mine = _download_jobs.get(job_id)
+        if mine is not None and not mine.get("finished"):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            if now - os.path.getmtime(path) < JOURNAL_STALE_SECONDS:
+                continue
+            claimed = f"{path}.{uuid.uuid4().hex[:6]}.claimed"
+            os.rename(path, claimed)
+        except OSError:
+            continue
+        try:
+            with open(claimed) as f:
+                entry = json.load(f)
+        except (OSError, ValueError):
+            entry = {}
+        finally:
+            try:
+                os.remove(claimed)
+            except OSError:
+                pass
+        _tombstone("", "lost_restart", outcome="lost", job_id=job_id,
+                   title=entry.get("title") or "", author=entry.get("author") or "",
+                   md5=None, kindle_email=entry.get("kindle_email"))
+        logger.warning(f"[{job_id}] Found a job lost in a restart: {entry.get('title')!r}")
+        await _post_slack(_outcome_line(_download_jobs[job_id], markup=True))
+        reported += 1
+    return reported
+
+
+async def _report_jobs_lost_on_shutdown() -> None:
+    """Called as the pod stops: every job still running is about to die with it."""
+    for job_id, job in list(_download_jobs.items()):
+        if job.get("finished") or not job.get("md5"):
+            continue
+        job["outcome"] = "lost"
+        job["code"] = "lost_restart"
+        job["final_text"] = _outcome_line(job, markup=False)
+        _mark_finished(job_id)
+        _journal_remove(job_id)
+        await _post_slack(_outcome_line(job, markup=True))
+
+
+async def _periodic_journal():
+    while True:
+        try:
+            _journal_heartbeat()
+            await _recover_lost_jobs()
+        except Exception as e:
+            logger.warning(f"Job journal sweep failed: {e}")
+        await asyncio.sleep(JOURNAL_HEARTBEAT_SECONDS)
 
 
 def _build_search_terms(title: str) -> list[str]:
@@ -667,7 +914,13 @@ async def lifespan(app: FastAPI):
     sync_task = asyncio.create_task(_periodic_sync())
     perm_task = asyncio.create_task(_periodic_fix_ingest_permissions())
     lib_perm_task = asyncio.create_task(_periodic_fix_library_permissions())
+    _load_kindle_sends()
+    journal_task = asyncio.create_task(_periodic_journal())
     yield
+    journal_task.cancel()
+    # Jobs still running die with this process. Saying so now beats leaving the
+    # next pod to notice their journal entries going stale.
+    await _report_jobs_lost_on_shutdown()
     sync_task.cancel()
     perm_task.cancel()
     lib_perm_task.cancel()
@@ -768,7 +1021,73 @@ def _clean_shared_title(shared: str | None) -> str:
     return cleaned.strip()
 
 
-async def _resolve_calibre_id(title: str, author: str) -> int | None:
+def _searchable_title(title: str | None) -> bool:
+    """A title worth looking up. "Unknown" is what a bare md5 share carries."""
+    if not title or is_placeholder(title):
+        return False
+    return normalize_title(title) not in ("", "unknown")
+
+
+def _ebook_meta(data: bytes, filename: str) -> tuple[str, str] | None:
+    """The title and author an EPUB names for itself, or None.
+
+    Calibre files an EPUB under its own OPF title, which can differ from the
+    Anna's Archive page title the job carries ("The Hobbit" against "The
+    Hobbit, or There and Back Again"). Knowing both lets the library lookup
+    find the book either way.
+    """
+    if not data or not data.startswith(b"PK"):
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as epub:
+            def small(name):
+                if epub.getinfo(name).file_size > 1_000_000:
+                    raise ValueError(f"{name} is too large to be metadata")
+                return epub.read(name)
+
+            container = ET.fromstring(small("META-INF/container.xml"))
+            opf_path = next((el.get("full-path") for el in container.iter()
+                             if el.tag.endswith("rootfile") and el.get("full-path")), None)
+            if not opf_path:
+                return None
+            opf = ET.fromstring(small(opf_path))
+    except Exception:
+        return None
+    title = next((el.text.strip() for el in opf.iter()
+                  if el.tag.endswith("}title") and el.text and el.text.strip()), None)
+    if not title:
+        return None
+    author = next((el.text.strip() for el in opf.iter()
+                   if el.tag.endswith("}creator") and el.text and el.text.strip()), "")
+    return title, author
+
+
+async def _confirm_calibre_id(job: dict, title: str, author: str, hint: int | None) -> int | None:
+    """The library's id for a book just uploaded. The OPDS id is only a hint.
+
+    _upload_to_calibre searches OPDS with terms taken from the file name, and
+    for a libgen file the first term is the author ("Sophie Kinsella"), so it
+    can answer with another book by the same author. A hint is kept only when
+    the library row it names is the book this job fetched, or when there is
+    nothing to check it against: no library mounted, or no usable title.
+    """
+    also = [tuple(job["file_meta"])] if job.get("file_meta") else []
+    if not hint or hint <= 0:
+        return await _resolve_calibre_id(title, author, also=also)
+    if not os.path.exists(os.path.join(CWA_LIBRARY_PATH, "metadata.db")):
+        return hint
+    names = [(t, a) for t, a in [(title, author), *also] if _searchable_title(t)]
+    row = _calibre_book(hint)
+    if not names or (row and any(_same_book(row[0], row[1], t, a) for t, a in names)):
+        return hint
+    logger.warning(
+        "OPDS named book %s (%r) for %r; finding the right one in the library",
+        hint, row[0] if row else None, title,
+    )
+    return await _resolve_calibre_id(title, author, also=also)
+
+
+async def _resolve_calibre_id(title: str, author: str, also=()) -> int | None:
     """Ask the library database for a freshly imported book's id.
 
     _upload_to_calibre gets the id from an OPDS poll that stops at the first
@@ -785,13 +1104,20 @@ async def _resolve_calibre_id(title: str, author: str) -> int | None:
     importing, so those looks do not count against CALIBRE_ID_ATTEMPTS; only
     CALIBRE_IMPORT_MAX_WAIT bounds them. On 2026-09-24 a PDF was still being
     converted when the fixed 12 looks ran out, and the Kindle send was skipped.
+
+    `also` holds more (title, author) pairs to try, such as the ones the EPUB
+    names for itself, which is what Calibre files it under.
     """
+    names = [(t, a) for t, a in [(title, author), *also] if _searchable_title(t)]
+    if not names:
+        return None
     deadline = time.monotonic() + CALIBRE_IMPORT_MAX_WAIT
     idle_looks = 0
     while True:
-        book_id = _calibre_id_for(title, author)
-        if book_id:
-            return book_id
+        for name_title, name_author in names:
+            book_id = _calibre_id_for(name_title, name_author)
+            if book_id:
+                return book_id
         if _cwa_uploads_pending():
             idle_looks = 0
         else:
@@ -1032,20 +1358,8 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
 
         if file_data:
             filename = filename or f"{author} - {title}.epub"
-            book_id = await _upload_to_calibre(file_data, filename)
-            if not book_id:
-                job["upload_refused"] = (
-                    f"Calibre-Web did not accept {filename}. It turns away files it "
-                    "cannot identify as a book, so try a different copy, ideally an "
-                    "EPUB; if that fails too, Calibre itself may be down."
-                )
+            if not await _upload_and_confirm(job, file_data, filename, title, author):
                 return False
-            if book_id <= 0:
-                # Upload succeeded but the id is still unknown; the library
-                # settles it. Without this the Kindle send skips in silence.
-                job["stage_detail"] = "Uploaded, waiting for Calibre to import..."
-                book_id = await _resolve_calibre_id(title, author) or book_id
-            job["book_id"] = book_id
             job["stage_detail"] = f"Downloaded {filename} ({len(file_data)} bytes)"
             logger.info(f"Fetched {md5} from libgen by hash: {filename}")
             return True
@@ -1090,12 +1404,10 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
                 filename = f"{author} - {title}{ext}"
             job["status"] = "downloaded"
             job["filename"] = filename
-            job["stage_detail"] = "Uploading to Calibre..."
             logger.info(f"[{job_id}] Direct download got {filename} from {dl_url}, uploading to CWA")
-            book_id = await _upload_to_calibre(file_data, filename)
-            if book_id is not None:
-                job["book_id"] = book_id
-            return True
+            # Every mirror serves the same md5, so a file Calibre refuses from
+            # one would be refused from the next as well.
+            return await _upload_and_confirm(job, file_data, filename, title, author)
         except Exception as e:
             logger.warning(f"[{job_id}] Direct download attempt {idx+1}/{len(urls_to_try)} failed for {dl_url}: {e}")
             continue
@@ -1111,16 +1423,48 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
                 filename = f"{author} - {title}{ext}"
             job["status"] = "downloaded"
             job["filename"] = filename
-            job["stage_detail"] = "Uploading to Calibre..."
             logger.info(f"[{job_id}] LibGen MD5 lookup got {filename}, uploading to CWA")
-            book_id = await _upload_to_calibre(file_data, filename)
-            if book_id is not None:
-                job["book_id"] = book_id
-            return True
+            return await _upload_and_confirm(job, file_data, filename, title, author)
     except Exception as e:
         logger.warning(f"[{job_id}] LibGen MD5 lookup failed for {md5}: {e}")
 
     return False
+
+
+async def _upload_and_confirm(job: dict, file_data: bytes, filename: str, title: str, author: str) -> bool:
+    """Upload a file to Calibre-Web and find the book in the library.
+
+    Returns False only when Calibre-Web turns the file away, with the reason in
+    job["upload_refused"]. An accepted upload returns True whether or not the
+    library shows the book yet; job["book_id"] is set only once it does.
+    """
+    job["phase"] = "uploading"
+    job["stage_detail"] = "Uploading to Calibre..."
+    job["format"] = "pdf" if file_data[:4] == b"%PDF" else (os.path.splitext(filename)[1].lstrip(".").lower() or "epub")
+    job["file_meta"] = _ebook_meta(file_data, filename)
+    hint = await _upload_to_calibre(file_data, filename)
+    if not hint:
+        job["upload_refused"] = (
+            f"Calibre-Web did not accept {filename}. It turns away files it "
+            "cannot identify as a book, so try a different copy, ideally an "
+            "EPUB; if that fails too, Calibre itself may be down."
+        )
+        return False
+    # Calibre converts a PDF on import, which took minutes on 2026-09-24. A
+    # phone that is still waiting is told to stop and read Slack instead.
+    job["phase"] = "converting" if job["format"] == "pdf" else "importing"
+    job["stage_detail"] = "Uploaded, waiting for Calibre to import..."
+    book_id = await _confirm_calibre_id(job, title, author, hint)
+    job["book_id"] = book_id
+    if not book_id:
+        job["code"] = "calibre_id"
+        job["reason"] = "Calibre took the file, but the book never showed up in the library"
+    elif not _searchable_title(job.get("title")):
+        # A bare md5 share arrives as "Unknown"; the library knows better.
+        row = _calibre_book(book_id)
+        if row and row[0]:
+            job["title"], job["author"] = row[0], row[1] or job.get("author")
+    return True
 
 
 async def _cwa_login(client: httpx.AsyncClient) -> bool:
@@ -1170,8 +1514,113 @@ def _smtp_send_with_retry(msg, max_attempts: int = SMTP_MAX_ATTEMPTS) -> None:
     raise last_exc
 
 
+class AlreadySent(str):
+    """What _send_to_kindle returns when the send guard holds a repeat back.
+
+    A str, so a caller that only knows "None means sent" still sees a reason;
+    but not an error: nothing failed, the book already went. The callers that
+    matter check for it and report a skip, never a failure, and never start a
+    rescue over it.
+    """
+
+    at = ""
+
+
+# Guard key -> {"at": epoch, "title", "book_id"}, mirrored in STATE_DIR/sends.json.
+_kindle_sends: dict[str, dict] = {}
+# Guard keys with an email in flight right now.
+_kindle_sending: set[str] = set()
+
+
+def _sends_file() -> str:
+    return os.path.join(STATE_DIR, "sends.json")
+
+
+def _load_kindle_sends() -> None:
+    """Merge the guard file into memory, keeping the newer entry per book.
+
+    Read before every check: during a rolling update two pods run, and the
+    other one may have sent since this one last looked.
+    """
+    try:
+        with open(_sends_file()) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(saved, dict):
+        return
+    for key, entry in saved.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("at"), (int, float)):
+            continue
+        if entry["at"] > _kindle_sends.get(key, {}).get("at", 0):
+            _kindle_sends[key] = entry
+
+
+def _guard_key(book_id: int, title: str, kindle_email: str) -> str:
+    """The book, not the file: a rescued EPUB and the original PDF are one book.
+
+    Title and author come from the library row when there is one, so every
+    path that sends names the book the same way whatever title it was handed.
+    """
+    row = _calibre_book(book_id)
+    book_title, book_author = row if row and row[0] else (title, "")
+    return "|".join((normalize_title(book_title), author_surname(book_author),
+                     kindle_email.strip().lower()))
+
+
+def _held_by_guard(key: str, kindle_email: str) -> "AlreadySent | None":
+    where = _destination({"kindle_email": kindle_email})
+    _load_kindle_sends()
+    entry = _kindle_sends.get(key)
+    if entry and time.time() - entry["at"] < KINDLE_SEND_GUARD_SECONDS:
+        held = AlreadySent(f"already sent to {where} at {_clock(entry['at'])}")
+        held.at = _clock(entry["at"])
+        return held
+    return None
+
+
+def _remember_send(key: str, book_id: int, title: str) -> None:
+    _load_kindle_sends()
+    now = time.time()
+    _kindle_sends[key] = {"at": now, "title": title, "book_id": book_id}
+    for old in [k for k, v in _kindle_sends.items() if now - v["at"] >= KINDLE_SEND_GUARD_SECONDS]:
+        del _kindle_sends[old]
+    try:
+        _write_json_atomic(_sends_file(), _kindle_sends)
+    except OSError as e:
+        logger.warning(f"Could not save the Kindle send guard: {e}")
+
+
 async def _send_to_kindle(book_id: int, title: str, kindle_email: str,
                           formats: tuple[str, ...] = ("epub", "pdf")) -> str | None:
+    """Email a book to a Kindle, once.
+
+    Returns None when sent, an error string when the send failed, and an
+    AlreadySent when this book reached this address in the last 24 hours. All
+    three Kindle paths come through here (the shortcut's finally block,
+    /api/send-to-kindle and the Goodreads ingest), so the guard covers them all.
+    """
+    key = _guard_key(book_id, title, kindle_email)
+    # Another send of this book is in flight: wait for it, then decide. Its
+    # failure must leave this one free to go.
+    while key in _kindle_sending:
+        await asyncio.sleep(1)
+    held = _held_by_guard(key, kindle_email)
+    if held:
+        logger.info(f"Not sending {title!r} to {kindle_email}: {held}")
+        return held
+    _kindle_sending.add(key)
+    try:
+        error = await _email_book(book_id, title, kindle_email, formats)
+        if error is None:
+            _remember_send(key, book_id, title)
+        return error
+    finally:
+        _kindle_sending.discard(key)
+
+
+async def _email_book(book_id: int, title: str, kindle_email: str,
+                      formats: tuple[str, ...]) -> str | None:
     """Send book to Kindle email. Returns None on success, error string on failure.
 
     SMTP send retries up to SMTP_MAX_ATTEMPTS times with exponential backoff —
@@ -1252,10 +1701,12 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         # it left jobs waiting on a path that could never finish while libgen had
         # the file all along.
         job["status"] = "downloading"
+        job["phase"] = "fetching"
         job["stage_detail"] = "Fetching from libgen..."
         if await _try_direct_download(job_id, job, md5, title, author, detail):
             job["status"] = "done"
-            job["message"] = "Added to Calibre"
+            job["message"] = ("Added to Calibre" if job.get("book_id")
+                              else "Uploaded to Calibre, but it has not shown up in the library")
             # No send here. The finally block below does it, and a return
             # inside a try runs finally anyway, which is how one tap put two
             # copies of the same book on a Kindle on 2026-09-07.
@@ -1264,6 +1715,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # The file downloaded fine and Calibre turned it down. Stacks would
             # only fetch the same file again, minutes later.
             job["status"] = "failed"
+            job["code"] = "refused"
             job["message"] = job["stage_detail"] = job["upload_refused"]
             return
 
@@ -1275,9 +1727,14 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # Fallback: direct download for libgen mirrors
             if not await _try_direct_download(job_id, job, md5, title, author, detail):
                 job["status"] = "failed"
-                job["message"] = _no_route_message(
-                    md5, title, upstream=stacks_result.get("error"),
-                )
+                if job.get("upload_refused"):
+                    job["code"] = "refused"
+                    job["message"] = job["upload_refused"]
+                else:
+                    job["code"] = "no_route"
+                    job["message"] = _no_route_message(
+                        md5, title, upstream=stacks_result.get("error"),
+                    )
                 job["stage_detail"] = job["message"]
                 return
             # _try_direct_download already uploaded via HTTP and set book_id.
@@ -1362,6 +1819,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         pass
                     else:
                         job["status"] = "failed"
+                        job["code"] = "no_route"
                         job["message"] = "All download methods failed"
                         job["stage_detail"] = job["message"]
                     return
@@ -1410,6 +1868,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                                     pass
                                 else:
                                     job["status"] = "failed"
+                                    job["code"] = "no_route"
                                     job["message"] = "All download methods failed"
                                     job["stage_detail"] = job["message"]
                         return
@@ -1444,6 +1903,7 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
 
     except Exception as e:
         job["status"] = "failed"
+        job["code"] = "unexpected"
         job["message"] = f"Unexpected error: {e}"
         job["stage_detail"] = job["message"]
         logger.exception(f"[{job_id}] Download failed for {md5}")
@@ -1454,22 +1914,49 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
         # poison the next job (this is exactly how the wrong-book-emailed bug
         # manifested before the snapshot was added).
         _cleanup_unconsumed_ingest_files(job_id, pre_existing)
-        # Kindle send always runs after download finishes (success OR failure):
-        # the early `return` paths above set status before exiting, so this is
-        # the single point where Kindle delivery happens. Marking the job
-        # `failed` if SMTP exhausts retries makes the iOS Shortcut surface the
-        # error instead of declaring success on a Calibre-only outcome.
+        # The Kindle send, the outcome and the Slack line all happen in
+        # _settle_job, the single point where a share ends: the early `return`
+        # paths above set status before exiting and still arrive here.
+        try:
+            await _settle_job(job_id, title)
+        except Exception:
+            logger.exception(f"[{job_id}] Settling the job failed")
+            _mark_finished(job_id)
+        finally:
+            # Fire-and-forget, so it survives early returns too (the previous
+            # awaited sleep at function-tail was skipped on early return paths
+            # and leaked job state for ~10 minutes).
+            asyncio.create_task(_ttl_cleanup_job(job_id))
+
+
+async def _settle_job(job_id: str, title: str | None = None) -> None:
+    """End a share with one answer.
+
+    The order is the point. The Kindle step runs inside its own guard, so an
+    exception there still ends the job. Then the outcome is decided once, the
+    job is marked finished (which answers a waiting phone at once), and only
+    after that is Slack told, so a slow webhook never delays the phone.
+    """
+    job = _download_jobs.get(job_id)
+    if job is None:
+        return
+    title = title or job.get("title") or ""
+    try:
         await _maybe_send_to_kindle(job_id, title)
-        problem = _delivery_problem(job)
-        if problem:
-            await _post_slack(_format_share_problem(
-                job.get("title") or title, job.get("author") or author,
-                problem, kindle=bool(job.get("kindle_email")),
-            ))
-        # Schedule TTL cleanup as a fire-and-forget so it survives early returns
-        # too (the previous awaitsleep at function-tail was skipped on early
-        # return paths and leaked job state for ~10 minutes).
-        asyncio.create_task(_ttl_cleanup_job(job_id))
+    except Exception as e:
+        logger.exception(f"[{job_id}] Kindle step failed")
+        job["status"] = "failed"
+        job["code"] = "unexpected"
+        job["reason"] = f"the Kindle step failed unexpectedly ({type(e).__name__})"
+        job["message"] = job["stage_detail"] = f"Unexpected error in the Kindle step: {e}"
+    job["outcome"], reason = _decide_outcome(job)
+    if reason:
+        job["reason"] = reason
+    job["finished_at"] = time.time()
+    job["final_text"] = _outcome_line(job, markup=False)
+    _mark_finished(job_id)
+    _journal_remove(job_id)
+    await _post_slack(_outcome_line(job, markup=True))
 
 
 async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
@@ -1481,7 +1968,7 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
     if not job:
         return
     kindle_email = job.get("kindle_email")
-    if not (kindle_email and job.get("book_id") and job.get("status") == "done"):
+    if not (kindle_email and job.get("status") == "done"):
         return
     # Once per job, whoever calls. The early-return paths used to call this and
     # then the finally block called it again, so Anca's Kindle got the same book
@@ -1491,14 +1978,23 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
         logger.info("[%s] Kindle send already attempted, not repeating", job_id)
         return
     job["kindle_attempted"] = True
-    bid = job["book_id"]
+    bid = job.get("book_id") or 0
     if bid <= 0:
         # A last look at the library, then say so. Returning quietly here is
         # what made a job report "Added to Calibre" while the Kindle got
         # nothing — the caller had no way to tell delivery had not happened.
-        bid = await _resolve_calibre_id(job.get("title") or title, job.get("author") or "")
-        if not bid or bid <= 0:
+        # Skipped when the upload step already looked and gave up.
+        if job.get("code") != "calibre_id":
+            job["phase"] = "importing"
+            also = [tuple(job["file_meta"])] if job.get("file_meta") else []
+            bid = await _resolve_calibre_id(
+                job.get("title") or title, job.get("author") or "", also=also,
+            ) or 0
+        if bid <= 0:
             job["status"] = "failed"
+            job["code"] = "calibre_id"
+            job["reason"] = ("it reached Calibre but could not be found in the library, "
+                             "so it was not emailed. Send it from Calibre by hand")
             job["message"] = (
                 "Added to Calibre but could not identify the book in the library, "
                 "so it was not sent to the Kindle. Send it by hand from Calibre."
@@ -1510,23 +2006,37 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
             )
             return
         job["book_id"] = bid
+    job["phase"] = "sending"
     job["stage_detail"] = "Sending to Kindle..."
     err = await _send_to_kindle(bid, title, kindle_email)
-    if err:
+    if isinstance(err, AlreadySent):
+        # Not a failure: the book is already on that Kindle.
+        job["kindle_already_sent"] = True
+        job["kindle_sent_at"] = err.at
+        job["message"] = f"Added to Calibre; {err}, so not sending it twice"
+    elif err:
         job["status"] = "failed"
+        job["code"] = "kindle_smtp"
         job["kindle_error"] = err
+        job["reason"] = f"the email did not go through ({err})"
         job["message"] = f"Added to Calibre but failed to send to Kindle after retries: {err}"
-        job["stage_detail"] = job["message"]
     else:
+        job["kindle_sent"] = True
         job["message"] = f"Added to Calibre and sent to {kindle_email}"
-        job["stage_detail"] = job["message"]
+    job["stage_detail"] = job["message"]
 
 
 async def _ttl_cleanup_job(job_id: str) -> None:
     """Drop the job from the in-memory state after JOB_TTL_SECONDS so /api/download-status
-    eventually 404s and the dict doesn't grow without bound."""
+    eventually 404s and the dict doesn't grow without bound.
+
+    A job marked `held` stays until the hold is lifted.
+    """
     await asyncio.sleep(JOB_TTL_SECONDS)
+    while (_download_jobs.get(job_id) or {}).get("held"):
+        await asyncio.sleep(60)
     _download_jobs.pop(job_id, None)
+    _job_events.pop(job_id, None)
 
 
 # A share from a phone can arrive in several shapes: an Anna's Archive book page,
@@ -1620,9 +2130,36 @@ async def _detail_best_effort(md5: str):
 
 @app.post("/api/download-url")
 async def download_url(request: Request):
-    """iOS Shortcut endpoint - accept an AA URL, kick off async download, return job_id."""
-    _verify_api_key(request)
+    """iOS Shortcut endpoint - accept an AA URL, kick off async download, return job_id.
 
+    Every answer carries a `message` the phone can show, and every answer past
+    the key check carries a job id the phone can wait on. None is a 5xx on
+    purpose: the ingress error-pages middleware replaces a 5xx body with HTML.
+    """
+    if not API_KEY or request.headers.get("X-Api-Key", "") != API_KEY:
+        return JSONResponse(status_code=401, content={
+            "detail": "Invalid API key",
+            "message": "\u26a0\ufe0f Wrong API key. Reinstall the shortcut with the current key.",
+        })
+    try:
+        return await _accept_share(request)
+    except Exception as e:
+        logger.exception("download-url could not take a share")
+        text = (f"\u26a0\ufe0f book-search could not take this share ({type(e).__name__}). "
+                "Share it again in a minute.")
+        job_id = _tombstone(text, "unexpected", outcome="failed")
+        return {"status": "failed", "job_id": job_id, "message": text, "detail": text}
+
+
+def _rejected(message: str, detail: str, code: str) -> JSONResponse:
+    """A share turned away: a 400 whose job id the phone's waits can follow."""
+    job_id = _tombstone(message, code)
+    return JSONResponse(status_code=400, content={
+        "status": "rejected", "job_id": job_id, "message": message, "detail": detail,
+    })
+
+
+async def _accept_share(request: Request):
     # Parse body flexibly — iOS Shortcuts may send plain text or JSON
     body = await request.body()
     content_type = request.headers.get("content-type", "")
@@ -1745,13 +2282,15 @@ async def download_url(request: Request):
             len(body or b""),
             content_type,
         )
-        # The shortcut does not show this response, so Slack is where it has to
-        # land. On 2026-09-24 a 1.9 KB page 400'd here and nobody knew.
-        asyncio.create_task(_post_slack(_format_empty_share(len(given_page or ""))))
-        raise HTTPException(
-            status_code=400,
-            detail="No book on the shared page. Let the Anna's Archive page "
-                   "finish loading, then share it again.",
+        # Slack keeps the record. On 2026-09-24 a 1.9 KB page 400'd here and
+        # nobody knew, because the shortcut then showed no response at all.
+        warning = _format_empty_share(len(given_page or ""))
+        asyncio.create_task(_post_slack(warning))
+        return _rejected(
+            warning,
+            "No book on the shared page. Let the Anna's Archive page "
+            "finish loading, then share it again.",
+            "no_book_on_page",
         )
 
     md5 = extract_md5(url)
@@ -1759,19 +2298,34 @@ async def download_url(request: Request):
         asyncio.create_task(_post_slack(
             f"⚠️ A share arrived with a link that names no book: {url[:200]}"
         ))
-        raise HTTPException(
-            status_code=400,
-            detail="Share an Anna's Archive or libgen book link (or the book's "
-                   f"md5). Nothing book-shaped in: {url[:200]}",
+        return _rejected(
+            "\u26a0\ufe0f That link names no book. Share an Anna's Archive book page.",
+            "Share an Anna's Archive or libgen book link (or the book's "
+            f"md5). Nothing book-shaped in: {url[:200]}",
+            "no_book_in_link",
         )
 
-    # Deduplicate: if an active job exists for this MD5, return it
+    # Deduplicate: a share of a book that is still being fetched joins that job.
+    # "Still being fetched" means not finished: status reads "done" before the
+    # Kindle step runs, and a new job then would email the book a second time.
     for jid, job in _download_jobs.items():
-        if job["md5"] == md5 and job["status"] not in ("done", "failed"):
-            return {"status": "ok", "job_id": jid, "title": job["title"], "author": job["author"]}
+        if job.get("md5") != md5 or job.get("finished"):
+            continue
+        if kindle_email and not job.get("kindle_email") and not job.get("kindle_attempted"):
+            # Anca's share landed on a Calibre-only job: it takes her Kindle.
+            job["kindle_email"] = kindle_email
+            _journal_write(jid, job)
+        message = f"\U0001f4d6 Already on it: {job['title']} \u2192 {_destination(job)}"
+        wanted = _destination({"kindle_email": kindle_email})
+        if kindle_email and wanted != _destination(job):
+            message += f". Share it again once it finishes to send it to {wanted}."
+        return {"status": "ok", "job_id": jid, "title": job["title"],
+                "author": job["author"], "message": message}
 
     if not annas_scraper:
-        raise HTTPException(status_code=503, detail="Anna's Archive scraper not available")
+        text = "\u26a0\ufe0f book-search is still starting. Share it again in a minute."
+        job_id = _tombstone(text, "starting", outcome="failed")
+        return {"status": "failed", "job_id": job_id, "message": text, "detail": text}
 
     # A page posted by the caller is the best source we have: Anna's Archive is
     # human-only for us, so a phone holding the rendered page knows things this
@@ -1787,8 +2341,9 @@ async def download_url(request: Request):
     author = (detail.author if detail else None) or given_author or "Unknown Author"
 
     job_id = uuid.uuid4().hex[:12]
-    _download_jobs[job_id] = {
+    job = {
         "status": "queued",
+        "phase": "queued",
         "stage_detail": "Starting download...",
         "title": title,
         "author": author,
@@ -1797,12 +2352,49 @@ async def download_url(request: Request):
         "download_url": url,
         "kindle_email": kindle_email,
         "created_at": time.time(),
+        "finished": False,
     }
+    _download_jobs[job_id] = job
+    _journal_write(job_id, job)
 
     asyncio.create_task(_process_download(job_id, md5, title, author, detail))
     asyncio.create_task(_notify_slack(title, author, "ebook", "shortcut", kindle=bool(kindle_email)))
 
-    return {"status": "ok", "job_id": job_id, "title": title, "author": author}
+    return {"status": "ok", "job_id": job_id, "title": title, "author": author,
+            "message": f"\U0001f4d6 Queued: {title} \u2192 {_destination(job)}"}
+
+
+@app.get("/api/download-status/wait")
+async def download_status_wait(request: Request):
+    """Wait up to WAIT_HOLD_SECONDS for a share's answer, then say where it is.
+
+    Declared before /api/download-status/{job_id}, or "wait" would be read as
+    a job id. The id rides in the X-Job-Id header: only the first variable in
+    a shortcut's header dictionary resolves, and a variable inside a URL does
+    not. ?job_id= works too, for anyone testing by hand. The answer is always
+    200 plain text, because the shortcut shows whatever it last received.
+    A literal X-Last-Wait header on the shortcut's final ask makes an
+    unfinished answer point at Slack, where the result will land.
+    """
+    job_id = (request.headers.get("X-Job-Id") or request.query_params.get("job_id") or "").strip()
+    if not job_id:
+        return PlainTextResponse(
+            "⚠️ There is no share to follow: book-search did not take this one. "
+            "The first message says why.")
+    job = _download_jobs.get(job_id)
+    if job is None:
+        return PlainTextResponse(
+            "⚠️ book-search no longer knows this share, most likely because it "
+            "restarted. Its result, if any, is in Slack.")
+    if not job.get("finished") and job.get("phase") != "converting":
+        event = _job_events.setdefault(job_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=WAIT_HOLD_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    if job.get("finished"):
+        return PlainTextResponse(job.get("final_text") or _outcome_line(job, markup=False))
+    return PlainTextResponse(_progress_line(job, last=bool(request.headers.get("X-Last-Wait"))))
 
 
 @app.get("/api/download-status/{job_id}")
@@ -1816,12 +2408,23 @@ async def download_status(job_id: str):
 
 @app.post("/api/send-to-kindle")
 async def send_to_kindle(request: Request):
-    """Send a book from Calibre to a Kindle email address."""
+    """Send a book from Calibre to a Kindle email address.
+
+    Only configured recipients: KINDLE_RECIPIENTS (by address, or by name in
+    `deliver_to`) and the Goodreads address. A repeat within 24 hours is a 409.
+    """
     _verify_api_key(request)
     data = await request.json()
-    kindle_email = data.get("kindle_email")
+    kindle_email = (data.get("kindle_email") or "").strip()
+    deliver_to = (data.get("deliver_to") or "").strip().lower()
+    if not kindle_email and deliver_to:
+        kindle_email = KINDLE_RECIPIENTS.get(deliver_to, "")
     if not kindle_email:
-        raise HTTPException(status_code=400, detail="kindle_email is required")
+        raise HTTPException(status_code=400, detail="kindle_email (or a known deliver_to) is required")
+    allowed = {a.lower() for a in KINDLE_RECIPIENTS.values()} | {GOODREADS_KINDLE_EMAIL.lower()}
+    allowed.discard("")
+    if kindle_email.lower() not in allowed:
+        raise HTTPException(status_code=400, detail="kindle_email is not one of the configured recipients")
 
     book_id = data.get("book_id")
     title = data.get("title", "Book")
@@ -1840,6 +2443,8 @@ async def send_to_kindle(request: Request):
         raise HTTPException(status_code=400, detail="book_id is required (provide book_id or job_id of a completed download)")
 
     err = await _send_to_kindle(book_id, title, kindle_email)
+    if isinstance(err, AlreadySent):
+        raise HTTPException(status_code=409, detail=f"Not sent: {err}")
     if err:
         raise HTTPException(status_code=500, detail=f"Failed to send: {err}")
     return {"status": "ok", "message": f"Sent to {kindle_email}"}
@@ -1970,10 +2575,15 @@ async def goodreads_ingest(request: Request):
         formats = _calibre_formats_for(book_id)
         fmt, kindle_skipped = choose_kindle_format(formats, sizes=formats)
         if fmt:
-            kindle_error = await _send_to_kindle(
+            result = await _send_to_kindle(
                 book_id, title, GOODREADS_KINDLE_EMAIL, formats=(fmt,),
             )
-            kindle_sent = kindle_error is None
+            if isinstance(result, AlreadySent):
+                # Delivered before, by this path or another: a skip, not a failure.
+                kindle_skipped = str(result)
+            else:
+                kindle_error = result
+                kindle_sent = result is None
             if kindle_error:
                 logger.warning(
                     f"Kindle send failed for book {book_id} ({title!r}): {kindle_error}"
@@ -2667,12 +3277,14 @@ def _calibre_id_for(title: str, author: str) -> int | None:
     if not os.path.exists(db):
         return None
 
-    wanted = normalize_title(title)
-    if not wanted:
+    if not normalize_title(title):
         return None
-    surname = author_surname(author)
 
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as e:
+        logger.warning(f"Calibre id lookup failed for {title!r}: {e}")
+        return None
     try:
         rows = conn.execute(
             "SELECT b.id, b.title, ("
@@ -2687,16 +3299,51 @@ def _calibre_id_for(title: str, author: str) -> int | None:
         conn.close()
 
     for book_id, book_title, book_author in rows:
-        if normalize_title(book_title) != wanted:
-            continue
-        # The author must agree too. Titles alone let a shared surname through:
-        # searching for Neuromancer once matched a CISSP guide co-authored by a
-        # different Gibson, which then reached Anca's shelf.
-        if surname and book_author and surname not in normalize_author(book_author).split():
-            continue
-        return book_id
+        if _same_book(book_title, book_author, title, author):
+            return book_id
 
     return None
+
+
+def _same_book(book_title: str, book_author: str | None, title: str, author: str | None) -> bool:
+    """Does a library row hold this title and author?
+
+    The author must agree too. Titles alone let a shared surname through:
+    searching for Neuromancer once matched a CISSP guide co-authored by a
+    different Gibson, which then reached Anca's shelf. "Unknown Author", what a
+    share with no author carries, is no author at all.
+    """
+    if normalize_title(book_title) != normalize_title(title):
+        return False
+    wanted = "" if normalize_author(author) in ("unknown author", "unknown") else author
+    surname = author_surname(wanted)
+    if surname and book_author and surname not in normalize_author(book_author).split():
+        return False
+    return True
+
+
+def _calibre_book(book_id: int | None) -> tuple[str, str] | None:
+    """(title, authors) of one library row, or None."""
+    db = os.path.join(CWA_LIBRARY_PATH, "metadata.db")
+    if not book_id or book_id <= 0 or not os.path.exists(db):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT b.title, ("
+            "  SELECT group_concat(a.name, ' & ') FROM authors a"
+            "  JOIN books_authors_link l ON l.author = a.id WHERE l.book = b.id"
+            ") FROM books b WHERE b.id = ?", (book_id,),
+        ).fetchone()
+    except sqlite3.Error as e:
+        logger.warning(f"Calibre row lookup failed for book {book_id}: {e}")
+        return None
+    finally:
+        conn.close()
+    return (row[0] or "", row[1] or "") if row else None
 
 
 async def _check_calibre_duplicate(title: str, author: str):
