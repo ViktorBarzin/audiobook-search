@@ -290,3 +290,72 @@ def test_a_note_after_a_line_starts_a_new_sentence(line, joined):
     """Live 2026-09-24: "...All download methods failed Trying again in 15 minutes."."""
     assert bs_main._and_then(line, "Trying again in 15 minutes.") == joined
     assert bs_main._and_then(line, "") == line
+
+
+@pytest.mark.parametrize("kindle", [ANCA, None])
+async def test_a_book_stacks_already_fetched_is_found_in_the_library(monkeypatch, tmp_path, kindle):
+    """Stacks remembers the md5 and the OPDS check misses the book, but it is in
+    the library. It must be found there, not re-downloaded or failed as having
+    no route (which would also open a paid rescue)."""
+    posted = []
+
+    async def record(text):
+        posted.append(text)
+
+    monkeypatch.setattr(bs_main, "_post_slack", record)
+    monkeypatch.setattr(bs_main, "KINDLE_RECIPIENTS", {"anca": ANCA})
+    ingest = tmp_path / "ingest"
+    ingest.mkdir()
+    monkeypatch.setattr(bs_main, "CWA_INGEST_PATH", str(ingest))
+    monkeypatch.setattr(bs_main, "CWA_LIBRARY_PATH", str(make_library(tmp_path / "lib", [
+        (507, "Remember Me?", "Sophie Kinsella", {"EPUB": 400_000}),
+    ])))
+    monkeypatch.setattr(bs_main, "CALIBRE_ID_INTERVAL", 0)
+    monkeypatch.setattr(bs_main, "CALIBRE_ID_ATTEMPTS", 2)
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(bs_main, "_ttl_cleanup_job", _noop)
+    monkeypatch.setattr(bs_main, "API_KEY", "k")
+    monkeypatch.setattr(bs_main, "CLAUDE_AGENT_URL", "http://agent.test")
+    monkeypatch.setattr(bs_main, "CLAUDE_AGENT_TOKEN", "t")
+    monkeypatch.setattr(bs_main, "_sources_down", _noop)
+    redownloads = []
+
+    async def no_direct(*a, **k):
+        return False
+
+    monkeypatch.setattr(bs_main, "_try_direct_download", no_direct)
+
+    class Annas:
+        async def download_via_stacks(self, md5):
+            return {"success": True, "message": "Already downloaded"}
+
+        async def stacks_force_redownload(self, md5):
+            redownloads.append(md5)
+            return {"success": False, "error": "stacks said no"}
+
+    monkeypatch.setattr(bs_main, "annas_scraper", Annas())
+
+    async def opds_miss(title, timeout=120):
+        return None
+
+    monkeypatch.setattr(bs_main, "_wait_for_calibre", opds_miss)
+    sends = []
+
+    async def send(book_id, title, email):
+        sends.append((book_id, email))
+
+    monkeypatch.setattr(bs_main, "_send_to_kindle", send)
+    md5 = "d7191a16e9bc05c7afcf0a0c53600089"
+    job = {"status": "queued", "title": "Remember Me?", "author": "Sophie Kinsella", "md5": md5,
+           "message": "", "kindle_email": kindle, "created_at": 0}
+    monkeypatch.setattr(bs_main, "_download_jobs", {"j": job})
+
+    await bs_main._process_download("j", md5, "Remember Me?", "Sophie Kinsella", None)
+
+    assert job["outcome"] == "done"
+    assert sends == ([(507, ANCA)] if kindle else [])
+    assert redownloads == [], "no second download of a book the library has"
+    assert "j" not in bs_main._rescues

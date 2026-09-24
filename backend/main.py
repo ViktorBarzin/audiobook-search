@@ -1989,9 +1989,16 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                         job["stage_detail"] = job["message"]
                     return
 
-                # No file in ingest — quick OPDS check (maybe already imported)
+                # No file in ingest — maybe already imported. The library answers
+                # that reliably; the OPDS search after it leads with the author
+                # and can name another of their books, so it is only a fallback.
                 job["status"] = "importing"
                 job["stage_detail"] = "Checking Calibre..."
+                book_id = await _resolve_calibre_id(title, author)
+                if book_id:
+                    job.update(book_id=book_id, book_id_confirmed=True, status="done",
+                               message="Already in Calibre", stage_detail="Already in Calibre")
+                    return
                 book_id = await _wait_for_calibre(title, timeout=15)
                 if book_id is not None:
                     job["book_id"] = book_id
@@ -2176,6 +2183,7 @@ async def _settle_job(job_id: str, title: str | None = None) -> None:
         # Slack, and never opens a rescue of its own.
         job["final_text"] = _outcome_line(job, markup=False)
         _mark_finished(job_id)
+        _journal_remove(job_id)  # children are not journaled; this makes sure
         await _child_settled(job_id, job)
         return
     slack_note, phone_note = await _open_rescue(job_id, job) if _rescue_eligible(job) else ("", "")
@@ -2543,10 +2551,12 @@ async def _send_agent(parent_id: str, rescue: dict, child: dict) -> None:
         if why_not:
             await _close_rescue(parent_id, f"⚠️ *{title}* failed again: {reason}. No agent: {why_not}.")
             return
-        # A start that failed still counts against today: a timed-out request
-        # may have started an agent all the same.
-        agent_job = await _dispatch_agent(parent_id, rescue)
+        agent_job, maybe_started = await _dispatch_agent(parent_id, rescue)
         if not agent_job:
+            if not maybe_started:
+                # Nothing ran: no slot used today, no "already looked" this week.
+                # A timed-out request keeps its count, since it may have run.
+                rescue.pop("agent_started_at", None)
             await _close_rescue(parent_id, (
                 f"⚠️ *{title}* failed again: {reason}. The rescue agent could not start."))
             return
@@ -2585,8 +2595,13 @@ def _rescue_prompt(parent_id: str, rescue: dict) -> str:
     ])
 
 
-async def _dispatch_agent(parent_id: str, rescue: dict) -> str | None:
-    """Start the agent on claude-agent-service. Returns its job id, or None."""
+async def _dispatch_agent(parent_id: str, rescue: dict) -> tuple[str | None, bool]:
+    """Start the agent on claude-agent-service.
+
+    Returns its job id, or None and whether an agent may have started anyway:
+    a refusal or a connection that never opened started nothing, while a
+    request that timed out, or an accepted one with no readable id, may have.
+    """
     request = {
         "prompt": _rescue_prompt(parent_id, rescue), "agent": RESCUE_AGENT,
         "max_budget_usd": RESCUE_BUDGET_USD, "timeout_seconds": RESCUE_TIMEOUT_SECONDS,
@@ -2597,19 +2612,20 @@ async def _dispatch_agent(parent_id: str, rescue: dict) -> str | None:
             r = await _agent_call("POST", "/execute", request)
         except httpx.HTTPError as e:
             logger.warning(f"[{parent_id}] The rescue agent could not start: {type(e).__name__}: {e}")
-            return None
+            return None, not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
         if r.status_code == 429:  # the agent service's queue is full
             await asyncio.sleep(RESCUE_BUSY_RETRY_SECONDS)
             continue
         if r.status_code >= 300:
             logger.warning(f"[{parent_id}] The agent service refused the rescue: {r.status_code} {r.text[:200]}")
-            return None
+            return None, False
         try:
-            return r.json().get("job_id")
+            job_id = r.json().get("job_id")
         except ValueError:
-            return None
+            job_id = None
+        return job_id, not job_id
     logger.warning(f"[{parent_id}] The agent service stayed busy; no rescue")
-    return None
+    return None, False
 
 
 def _agent_final_text(job: dict) -> str:
@@ -3029,7 +3045,7 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
     for jid, job in _download_jobs.items():
         if job.get("md5") != md5 or job.get("finished"):
             continue
-        if bool(job.get("rescue_of")) != bool(rescue_of):
+        if job.get("rescue_of") != rescue_of:
             continue
         if kindle_email and not job.get("kindle_email") and not job.get("kindle_attempted"):
             # Anca's share landed on a Calibre-only job: it takes her Kindle.
@@ -3079,6 +3095,12 @@ async def _accept_share(request: Request, rescue_of: str | None = None):
     given_title = _clean_shared_title(given_title) or None
     title = (detail.title if detail else None) or given_title or "Unknown"
     author = (detail.author if detail else None) or given_author or "Unknown Author"
+    if rescue_of:
+        # The agent's copy is the shared book. Its own name would come from the
+        # agent or a page, and its answers go back to the agent; this is the
+        # name the prompt used, scrubbed the same way.
+        title = _untrusted(_rescues[rescue_of].get("title")) or title
+        author = _untrusted(_rescues[rescue_of].get("author")) or author
 
     job_id = uuid.uuid4().hex[:12]
     job = {
@@ -3170,7 +3192,7 @@ async def rescue_result(request: Request):
     else:
         line = f"\u26a0\ufe0f The agent could not get *{title}* through."
     await _close_rescue(parent_id, _and_then(line, note))
-    return {"status": "ok", "message": line}
+    return {"status": "ok", "message": _rescues[parent_id].get("result") or line}
 
 
 @app.get("/api/download-status/wait")

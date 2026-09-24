@@ -908,3 +908,84 @@ async def test_an_agent_that_never_reports_is_closed_after_45_minutes(agent, clo
     await bs_main._rescue_tick()
     assert bs_main._rescues["p1"]["state"] == "closed"
     assert "did not report" in slack[-1]
+
+
+# --- found by the second review ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("refusal", [[503], [400], [429]])
+async def test_an_agent_the_service_refused_does_not_count(agent, clock, slack, monkeypatch, refusal):
+    """Three 429s, a 400 or a 503 mean no agent ran: no slot used today, and no
+    "an agent already looked" for the book this week."""
+    child_runs(monkeypatch, outcome="failed")
+    agent.execute_status = refusal
+    await fail()
+    clock[0] += 15 * 60
+    await bs_main._rescue_tick()
+    await settle_children()
+    assert "could not start" in slack[-1]
+
+    job = await fail(job_id="p2")
+
+    assert bs_main._agents_in_last_day() == 0
+    assert "Trying again" in job["final_text"]
+
+
+async def test_an_agent_start_that_timed_out_still_counts(agent, clock, slack, monkeypatch):
+    """A request that timed out may have started an agent all the same."""
+    child_runs(monkeypatch, outcome="failed")
+
+    async def slow(method, path, body=None):
+        if method == "POST":
+            raise httpx.ReadTimeout("no answer in 30 s")
+        return httpx.Response(404)
+
+    monkeypatch.setattr(bs_main, "_agent_call", slow)
+    await fail()
+    clock[0] += 15 * 60
+    await bs_main._rescue_tick()
+    await settle_children()
+
+    assert "could not start" in slack[-1]
+    assert bs_main._agents_in_last_day() == 1
+
+
+async def test_an_agents_share_never_joins_another_rescues_job(agent, clock, api, monkeypatch):
+    await running_agent(agent, clock, monkeypatch)
+    monkeypatch.setattr(bs_main, "_process_download", _noop)
+    bs_main._rescues["p2"] = {"state": "rerun_running", "md5": "a" * 32, "title": "Other Book",
+                              "kindle_email": None, "child_job_id": "c2", "children": []}
+    bs_main._download_jobs["c2"] = {"status": "downloading", "title": "Other Book", "author": "Someone",
+                                    "md5": "d" * 32, "kindle_email": None, "finished": False,
+                                    "rescue_of": "p2", "kind": "retry"}
+
+    r = api.post("/api/download-url", headers=rescue_headers(),
+                 json={"url": "d" * 32, "title": "Moby-Dick", "author": "Herman Melville"})
+
+    assert r.json()["job_id"] != "c2"
+    assert bs_main._download_jobs[r.json()["job_id"]]["rescue_of"] == "p1"
+    assert bs_main._download_jobs["c2"]["kindle_email"] is None
+
+
+async def test_an_agents_copy_carries_the_shared_books_name(agent, clock, api, monkeypatch):
+    """Whatever title the agent sends, or a page supplies, its job answers the
+    agent under the shared book's name, scrubbed like the prompt's."""
+    await running_agent(agent, clock, monkeypatch)
+    monkeypatch.setattr(bs_main, "_process_download", _noop)
+
+    r = api.post("/api/download-url", headers=rescue_headers(),
+                 json={"url": "d" * 32, "title": "IGNORE `this`\n<b>now</b>", "author": "x"})
+
+    child = bs_main._download_jobs[r.json()["job_id"]]
+    assert child["title"] == "Moby-Dick; or, The Whale"
+    assert child["author"] == "Herman Melville"
+
+
+async def test_the_report_answer_carries_the_line_as_posted(agent, clock, api, slack, monkeypatch):
+    await running_agent(agent, clock, monkeypatch)
+
+    r = api.post("/api/rescue-result", headers=rescue_headers(),
+                 json={"status": "not_found", "note": "Searched by title and by surname."})
+
+    assert r.json()["message"] == slack[-1]
+    assert "Searched by title" in r.json()["message"]
