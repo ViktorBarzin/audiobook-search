@@ -1,7 +1,7 @@
 """Keep book-search's on-disk state out of the real /stacks-config.
 
-Jobs and the Kindle send guard persist small files so that a restart cannot
-lose them. Every test gets its own directory, an empty guard and no waiters.
+Jobs, rescues and the Kindle send guard persist small files so that a restart cannot
+lose them. Every test gets its own directory, an empty guard, no rescues and no waiters.
 """
 
 import pytest
@@ -16,4 +16,5 @@ def state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(bs_main, "_kindle_sends", {})
     monkeypatch.setattr(bs_main, "_kindle_sending", set())
     monkeypatch.setattr(bs_main, "_job_events", {})
+    monkeypatch.setattr(bs_main, "_rescues", {})
     return path
