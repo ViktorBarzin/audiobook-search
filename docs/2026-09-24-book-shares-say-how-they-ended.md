@@ -1,6 +1,6 @@
 # Book shares that always say how they ended
 
-**Status:** steps 1 to 4 live; step 5 (the new shortcut) waits on the London Mac · **Date:** 2026-09-24 · **Owner:** Viktor
+**Status:** steps 1 to 4 live; step 5 (the new shortcut) waits on the London Mac · **Date:** 2026-09-24 · **Owner:** Viktor ·
 **Repos:** `book-search`, `infra` (`stacks/ebooks`, `.claude/agents/book-rescuer.md`) · **Namespace:** `ebooks`
 
 ## Why
@@ -43,30 +43,20 @@ Decisions the plan added:
 ## How a share ends
 
 ```mermaid
-sequenceDiagram
-  participant P as iPhone shortcut
-  participant B as book-search
-  participant C as Calibre-Web
-  participant A as rescue agent
-  participant S as Slack
-  P->>B: POST /api/download-url (the page)
-  B-->>P: {job_id, message: "📖 Queued: title → Anca's Kindle"}
-  B->>C: download, upload, confirm in metadata.db, email
-  loop up to 6 × ≤20 s
-    P->>B: GET /api/download-status/wait (X-Job-Id)
-    B-->>P: "⏳ …" or the final line
-  end
-  B->>S: one line: ✅ or ⚠️ with the reason
-  opt no_route or refused, sources up
-    B->>B: free retry after 15 minutes (quiet child job)
-    opt still failing, under the daily cap, none running
-      B->>A: POST /execute (book-rescuer, $5, 30 min)
-      A->>B: /api/candidates, then POST /api/download-url (X-Rescue-Of)
-      A->>B: POST /api/rescue-result
-    end
-    B->>S: one line with the rescue's result
-  end
+flowchart TD
+  A["Phone shares a page<br/>reply: 📖 Queued"] --> B["book-search fetches it<br/>EPUB before PDF<br/>next file if refused"]
+  B --> C["One ✅ or ⚠️ line<br/>on phone and Slack"]
+  C -->|"⚠️ no_route or refused"| D["Free retry<br/>15 minutes later"]
+  D -->|"fails the same way"| E["book-rescuer agent<br/>$5 cap, 2 a day"]
+  E --> F["Report line in Slack<br/>checked by book-search"]
 ```
+
+While a share runs, the phone asks `GET /api/download-status/wait` up to six
+times, 20 seconds each, and shows the last answer: a progress line, or the ✅
+or ⚠️ line as soon as there is one. A retry that works ends with `✅ … on a
+second try`. Nothing is retried while libgen or Calibre is down, for a book an
+agent looked for in the past week, or once today's two agents are used; the
+line says which.
 
 ## What is live
 
@@ -80,8 +70,9 @@ sequenceDiagram
 - `GET /api/download-status/wait` holds up to 20 s and always answers `200`
   in plain text. The job id rides in `X-Job-Id`, since a shortcut resolves only
   its first variable header; `?job_id=` works for anyone testing by hand. A PDF
-  that Calibre is converting hands the phone over at once, and a literal
-  `X-Last-Wait` header on the final ask points an unfinished answer at Slack.
+  that Calibre is converting hands the phone over at once (the rescue agent is
+  held instead), and a literal `X-Last-Wait` header on the final ask points an
+  unfinished answer at Slack.
 - Every `/api/download-url` reply carries a `message`. A rejected share becomes
   a finished job whose waits repeat the real reason, and an internal error
   answers `200`, because the ingress error-pages middleware replaces 5xx
@@ -139,25 +130,35 @@ sequenceDiagram
 
 - Only `no_route` (no file for the hash, no confident title match) and
   `refused` (Calibre refused every file) qualify, for a share with a usable
-  title.
+  title and a book no agent looked for in the past 7 days.
 - Before anything is paid for, a breaker checks that libgen and Calibre-Web
   answer; if either does not, the end line says so and nothing is scheduled.
   Otherwise a free retry runs 15 minutes later as a quiet child job.
 - If the retry fails the same way and the breaker passes again: at most two
-  agents in any 24 hours and one at a time. The request is `book-rescuer`,
-  `max_budget_usd` 5, 30 minutes, with a fixed-form prompt: failure code, md5s,
-  recipient name, routes tried, and a title and author scrubbed to 120
-  characters and labelled untrusted.
+  agents in any 24 hours and one at a time. The checks and the agent's start
+  run under one lock, and the start is saved to disk before the request goes
+  out, so retries that fail together start one agent and a crash cannot keep
+  one out of the count. The request is `book-rescuer`, `max_budget_usd` 5, 30
+  minutes, with a fixed-form prompt: failure code, md5s, recipient name, routes
+  tried, and a title and author scrubbed to 120 characters and labelled
+  untrusted.
 - The agent's own shares carry `X-Rescue-Of` and a token (an HMAC of the job
   id) in place of the API key. They go to the original share's recipient, post
-  nothing and start no rescue. It lists libgen rows through `/api/candidates`
-  and reports on `/api/rescue-result`; neither path is on the public ingress.
-- The report line rests on what went through book-search: a claimed success
-  with no delivered copy is posted as such. A watchdog polls the
-  agent's job every minute and reports one that ends without a word, with its
-  cost, or one the agent service lost.
+  nothing, start no rescue and never join a person's job; there are at most
+  three per rescue, and none after one went through. It lists libgen rows
+  through `/api/candidates`, which reduces the uploader-written fields to plain
+  words, and reports on `/api/rescue-result`; neither path is on the public
+  ingress.
+- The report line names the book that was shared and rests on what went
+  through book-search: a claimed success with no delivered copy is posted as
+  such, and a copy that arrives after the rescue closed still gets its line. A
+  watchdog polls the agent's job every minute and reports one that ends
+  without a word, with its cost, or one the agent service lost. A rescue whose
+  agent has not reported 45 minutes after it started closes anyway.
 - A share of a book under rescue gets the rescue's status. State lives in
-  `/stacks-config/book-search/rescues.json` and resumes after a restart.
+  `/stacks-config/book-search/rescues.json` and resumes after a restart; a pod
+  that stops during a retry leaves it for the next pod. If that file exists
+  but cannot be read, rescues stay off and the file is left for a person.
 
 ### Configuration
 
@@ -166,6 +167,11 @@ In `infra/stacks/ebooks/main.tf`: a single-property ExternalSecret
 `CLAUDE_AGENT_URL`, `CLAUDE_AGENT_TOKEN` (optional), `RESCUE_DAILY_CAP=2`, and a
 `smoke` recipient mapped to `spam@viktorbarzin.me` for tests. The agent's
 runbook is `infra/.claude/agents/book-rescuer.md`.
+
+The Deployment uses the `Recreate` strategy. The rescue table, the send guard
+and the job journal each expect one writer, and during a rolling update both
+pods acted on them. The deploy that switched strategy measured about 6 s
+between the old pod stopping and the new one starting.
 
 ## Checked on the live system
 
@@ -180,8 +186,18 @@ runbook is `infra/.claude/agents/book-rescuer.md`.
 | Kindle share of a PDF | `✅ Treasure Island → Smoke's Kindle (epub instead of the pdf, 34 s)`, answered on the second wait |
 | a file Calibre refuses | the Moby-Dick PDF was refused; the next file hit three 503s from its CDN and the share ended `refused` |
 | right book | OPDS named book 307 for *The Yellow Wallpaper*; the library lookup found 515 instead |
+| rescue, end to end | a Calibre-only share of *Sleepy Hollow* under a hash libgen lacks ended `no_route`; the retry 15 minutes later failed the same way; the agent found an EPUB of *The Legend of Sleepy Hollow*, Calibre had it in 25 s, and the agent reported 64 s after it started, for $0.72, using only the four runbook calls |
+| Recreate deploy | about 6 s between the old pod stopping and the new one starting |
 
 Test books were deleted afterwards by the id each job recorded.
+
+Two independent reviews read step 4 before it went live. The first found
+eleven issues, five of them major: retries failing together could start
+three agents where one was allowed, a pod stopping mid-retry closed the
+rescue with a false line, a rolling update ran two rescue loops against one
+state file, uploader-written text reached the agent, and the agent file had
+to land before the service that calls it. The second review, of the fixes,
+found four minor issues. All of them are fixed, and each code fix has a test.
 
 ## Not done yet
 
