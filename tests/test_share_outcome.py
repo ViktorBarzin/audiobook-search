@@ -190,6 +190,22 @@ async def test_an_opds_id_for_another_book_by_the_author_is_not_sent(pipeline, m
     assert job["book_id"] == 498
 
 
+async def test_the_kindle_step_confirms_an_id_no_upload_step_checked(pipeline, monkeypatch, tmp_path):
+    """The Stacks routes still take their id straight from an OPDS search."""
+    lib = make_library(tmp_path / "stacks", [
+        (263, "CISSP Official Study Guide", "Mike Chapple & Darril Gibson", {"PDF": 9_000_000}),
+        (498, "Neuromancer", "William Gibson", {"EPUB": 300_000}),
+    ])
+    monkeypatch.setattr(bs_main, "CWA_LIBRARY_PATH", str(lib))
+    job = {"status": "done", "title": "Neuromancer", "author": "William Gibson",
+           "md5": MD5, "book_id": 263, "kindle_email": ANCA, "message": "Added to Calibre"}
+    monkeypatch.setattr(bs_main, "_download_jobs", {"j": job})
+
+    await bs_main._settle_job("j")
+
+    assert pipeline == [(498, ANCA)]
+
+
 async def test_an_upload_the_library_never_shows_is_not_reported_as_added(pipeline, slack, monkeypatch, tmp_path):
     lib = make_library(tmp_path / "other", [
         (263, "CISSP Official Study Guide", "Mike Chapple & Darril Gibson", {"PDF": 9_000_000}),

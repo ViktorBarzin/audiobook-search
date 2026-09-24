@@ -1456,6 +1456,7 @@ async def _upload_and_confirm(job: dict, file_data: bytes, filename: str, title:
     job["stage_detail"] = "Uploaded, waiting for Calibre to import..."
     book_id = await _confirm_calibre_id(job, title, author, hint)
     job["book_id"] = book_id
+    job["book_id_confirmed"] = bool(book_id)
     if not book_id:
         job["code"] = "calibre_id"
         job["reason"] = "Calibre took the file, but the book never showed up in the library"
@@ -1979,12 +1980,18 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
         return
     job["kindle_attempted"] = True
     bid = job.get("book_id") or 0
+    looked = job.get("code") == "calibre_id"  # the upload step looked and gave up
+    if bid > 0 and not job.get("book_id_confirmed"):
+        # An id no upload step checked, such as one the Stacks routes took
+        # straight from an OPDS search. Confirm it before emailing anything.
+        bid = await _confirm_calibre_id(job, job.get("title") or title,
+                                        job.get("author") or "", bid) or 0
+        looked = True
     if bid <= 0:
         # A last look at the library, then say so. Returning quietly here is
         # what made a job report "Added to Calibre" while the Kindle got
         # nothing — the caller had no way to tell delivery had not happened.
-        # Skipped when the upload step already looked and gave up.
-        if job.get("code") != "calibre_id":
+        if not looked:
             job["phase"] = "importing"
             also = [tuple(job["file_meta"])] if job.get("file_meta") else []
             bid = await _resolve_calibre_id(
