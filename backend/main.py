@@ -8,6 +8,7 @@ import smtplib
 import socket
 import sqlite3
 import time
+import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
@@ -520,6 +521,10 @@ async def _report_jobs_lost_on_shutdown() -> None:
     for job_id, job in list(_download_jobs.items()):
         if job.get("finished") or not job.get("md5"):
             continue
+        if job.get("phase") == "sending":
+            # Most likely done within the grace period; if not, its journal
+            # entry goes stale and the next pod reports it.
+            continue
         job["outcome"] = "lost"
         job["code"] = "lost_restart"
         job["final_text"] = _outcome_line(job, markup=False)
@@ -1028,6 +1033,23 @@ def _searchable_title(title: str | None) -> bool:
     return normalize_title(title) not in ("", "unknown")
 
 
+def _real_author(author: str | None) -> str:
+    """The author, or "" for the placeholder a share with no author carries."""
+    return "" if normalize_author(author) in ("", "unknown", "unknown author") else (author or "")
+
+
+def _name_pairs(title: str, author: str, also=()) -> list[tuple[str, str]]:
+    """The (title, author) pairs worth looking a book up by.
+
+    A pair that names an author outranks one that does not: a share with only
+    the title "Principles" must not settle on Carnap's book when the EPUB
+    itself names Ray Dalio.
+    """
+    pairs = [(t, a or "") for t, a in [(title, author), *also] if _searchable_title(t)]
+    with_author = [(t, a) for t, a in pairs if _real_author(a)]
+    return with_author or pairs
+
+
 def _ebook_meta(data: bytes, filename: str) -> tuple[str, str] | None:
     """The title and author an EPUB names for itself, or None.
 
@@ -1072,22 +1094,33 @@ async def _confirm_calibre_id(job: dict, title: str, author: str, hint: int | No
     nothing to check it against: no library mounted, or no usable title.
     """
     also = [tuple(job["file_meta"])] if job.get("file_meta") else []
+    newer_than = job.get("library_max_id")
     if not hint or hint <= 0:
-        return await _resolve_calibre_id(title, author, also=also)
+        return await _resolve_calibre_id(title, author, also=also, newer_than=newer_than)
     if not os.path.exists(os.path.join(CWA_LIBRARY_PATH, "metadata.db")):
         return hint
-    names = [(t, a) for t, a in [(title, author), *also] if _searchable_title(t)]
+    added_since = newer_than is not None and hint > newer_than
+    names = _name_pairs(title, author, also)
+    if not names:
+        # Nothing names the book. Only a row the upload added can be it.
+        return hint if added_since else None
     row = _calibre_book(hint)
-    if not names or (row and any(_same_book(row[0], row[1], t, a) for t, a in names)):
+
+    def vouches(t: str, a: str) -> bool:
+        if not row or not _same_book(row[0], row[1], t, a):
+            return False
+        return bool(_real_author(a)) or added_since
+
+    if any(vouches(t, a) for t, a in names):
         return hint
     logger.warning(
         "OPDS named book %s (%r) for %r; finding the right one in the library",
         hint, row[0] if row else None, title,
     )
-    return await _resolve_calibre_id(title, author, also=also)
+    return await _resolve_calibre_id(title, author, also=also, newer_than=newer_than)
 
 
-async def _resolve_calibre_id(title: str, author: str, also=()) -> int | None:
+async def _resolve_calibre_id(title: str, author: str, also=(), newer_than: int | None = None) -> int | None:
     """Ask the library database for a freshly imported book's id.
 
     _upload_to_calibre gets the id from an OPDS poll that stops at the first
@@ -1106,16 +1139,23 @@ async def _resolve_calibre_id(title: str, author: str, also=()) -> int | None:
     converted when the fixed 12 looks ran out, and the Kindle send was skipped.
 
     `also` holds more (title, author) pairs to try, such as the ones the EPUB
-    names for itself, which is what Calibre files it under.
+    names for itself, which is what Calibre files it under. A pair with no
+    author only matches a row numbered above `newer_than`, the library's
+    highest id before the upload, and never when that is unknown: a title
+    alone cannot tell two books apart, but "added just now" can.
     """
-    names = [(t, a) for t, a in [(title, author), *also] if _searchable_title(t)]
+    names = _name_pairs(title, author, also)
+    names = [(t, a) for t, a in names if _real_author(a) or newer_than is not None]
     if not names:
         return None
     deadline = time.monotonic() + CALIBRE_IMPORT_MAX_WAIT
     idle_looks = 0
     while True:
         for name_title, name_author in names:
-            book_id = _calibre_id_for(name_title, name_author)
+            if _real_author(name_author):
+                book_id = _calibre_id_for(name_title, name_author)
+            else:
+                book_id = _calibre_id_for(name_title, name_author, newer_than=newer_than)
             if book_id:
                 return book_id
         if _cwa_uploads_pending():
@@ -1442,6 +1482,7 @@ async def _upload_and_confirm(job: dict, file_data: bytes, filename: str, title:
     job["stage_detail"] = "Uploading to Calibre..."
     job["format"] = "pdf" if file_data[:4] == b"%PDF" else (os.path.splitext(filename)[1].lstrip(".").lower() or "epub")
     job["file_meta"] = _ebook_meta(file_data, filename)
+    job["library_max_id"] = _calibre_max_id()
     hint = await _upload_to_calibre(file_data, filename)
     if not hint:
         job["upload_refused"] = (
@@ -1528,6 +1569,7 @@ class AlreadySent(str):
 
 
 # Guard key -> {"at": epoch, "title", "book_id"}, mirrored in STATE_DIR/sends.json.
+# Every send is stored under two keys (see _guard_keys).
 _kindle_sends: dict[str, dict] = {}
 # Guard keys with an email in flight right now.
 _kindle_sending: set[str] = set()
@@ -1557,33 +1599,50 @@ def _load_kindle_sends() -> None:
             _kindle_sends[key] = entry
 
 
-def _guard_key(book_id: int, title: str, kindle_email: str) -> str:
-    """The book, not the file: a rescued EPUB and the original PDF are one book.
+def _guard_text(text: str | None) -> str:
+    """Blind to case and punctuation, but keeping every letter in any script,
+    and the subtitle. normalize_title drops both, which made two different
+    Bulgarian books, or two Sapiens subtitles, one book to the guard."""
+    folded = unicodedata.normalize("NFKC", text or "").casefold()
+    return " ".join(_re.findall(r"\w+", folded))
 
-    Title and author come from the library row when there is one, so every
-    path that sends names the book the same way whatever title it was handed.
+
+def _guard_keys(book_id: int, title: str, kindle_email: str) -> list[str]:
+    """The keys a send is held and stored under.
+
+    One names the library row, which holds even when the row cannot be read.
+    The other names the book, so a rescued EPUB and the original PDF of one
+    novel are one book: title and author from the library row when there is
+    one, so every path names the book the same way whatever it was handed.
     """
+    address = kindle_email.strip().lower()
+    keys = [f"id:{book_id}|{address}"] if book_id and book_id > 0 else []
     row = _calibre_book(book_id)
     book_title, book_author = row if row and row[0] else (title, "")
-    return "|".join((normalize_title(book_title), author_surname(book_author),
-                     kindle_email.strip().lower()))
+    name = _guard_text(book_title)
+    if name:
+        surname = (_guard_text(book_author).split() or [""])[-1]
+        keys.append(f"book:{name}|{surname}|{address}")
+    return keys
 
 
-def _held_by_guard(key: str, kindle_email: str) -> "AlreadySent | None":
+def _held_by_guard(keys: list[str], kindle_email: str) -> "AlreadySent | None":
     where = _destination({"kindle_email": kindle_email})
     _load_kindle_sends()
-    entry = _kindle_sends.get(key)
-    if entry and time.time() - entry["at"] < KINDLE_SEND_GUARD_SECONDS:
-        held = AlreadySent(f"already sent to {where} at {_clock(entry['at'])}")
-        held.at = _clock(entry["at"])
+    recent = [_kindle_sends[k]["at"] for k in keys
+              if k in _kindle_sends and time.time() - _kindle_sends[k]["at"] < KINDLE_SEND_GUARD_SECONDS]
+    if recent:
+        held = AlreadySent(f"already sent to {where} at {_clock(max(recent))}")
+        held.at = _clock(max(recent))
         return held
     return None
 
 
-def _remember_send(key: str, book_id: int, title: str) -> None:
+def _remember_send(keys: list[str], book_id: int, title: str) -> None:
     _load_kindle_sends()
     now = time.time()
-    _kindle_sends[key] = {"at": now, "title": title, "book_id": book_id}
+    for key in keys:
+        _kindle_sends[key] = {"at": now, "title": title, "book_id": book_id}
     for old in [k for k, v in _kindle_sends.items() if now - v["at"] >= KINDLE_SEND_GUARD_SECONDS]:
         del _kindle_sends[old]
     try:
@@ -1601,23 +1660,23 @@ async def _send_to_kindle(book_id: int, title: str, kindle_email: str,
     three Kindle paths come through here (the shortcut's finally block,
     /api/send-to-kindle and the Goodreads ingest), so the guard covers them all.
     """
-    key = _guard_key(book_id, title, kindle_email)
+    keys = _guard_keys(book_id, title, kindle_email)
     # Another send of this book is in flight: wait for it, then decide. Its
     # failure must leave this one free to go.
-    while key in _kindle_sending:
+    while any(key in _kindle_sending for key in keys):
         await asyncio.sleep(1)
-    held = _held_by_guard(key, kindle_email)
+    held = _held_by_guard(keys, kindle_email)
     if held:
         logger.info(f"Not sending {title!r} to {kindle_email}: {held}")
         return held
-    _kindle_sending.add(key)
+    _kindle_sending.update(keys)
     try:
         error = await _email_book(book_id, title, kindle_email, formats)
         if error is None:
-            _remember_send(key, book_id, title)
+            _remember_send(keys, book_id, title)
         return error
     finally:
-        _kindle_sending.discard(key)
+        _kindle_sending.difference_update(keys)
 
 
 async def _email_book(book_id: int, title: str, kindle_email: str,
@@ -1939,9 +1998,12 @@ async def _settle_job(job_id: str, title: str | None = None) -> None:
     after that is Slack told, so a slow webhook never delays the phone.
     """
     job = _download_jobs.get(job_id)
-    if job is None:
+    if job is None or job.get("finished"):
+        # Already answered, e.g. reported lost while the pod was stopping.
         return
-    title = title or job.get("title") or ""
+    # The job's own title first: a bare md5 share starts as "Unknown" and
+    # learns its real name from the library.
+    title = job.get("title") or title or ""
     try:
         await _maybe_send_to_kindle(job_id, title)
     except Exception as e:
@@ -1996,6 +2058,7 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
             also = [tuple(job["file_meta"])] if job.get("file_meta") else []
             bid = await _resolve_calibre_id(
                 job.get("title") or title, job.get("author") or "", also=also,
+                newer_than=job.get("library_max_id"),
             ) or 0
         if bid <= 0:
             job["status"] = "failed"
@@ -2012,7 +2075,8 @@ async def _maybe_send_to_kindle(job_id: str, title: str) -> None:
                 job_id, title, kindle_email,
             )
             return
-        job["book_id"] = bid
+    job["book_id"] = bid
+    job["book_id_confirmed"] = True
     job["phase"] = "sending"
     job["stage_detail"] = "Sending to Kindle..."
     err = await _send_to_kindle(bid, title, kindle_email)
@@ -2155,6 +2219,8 @@ async def download_url(request: Request):
         text = (f"\u26a0\ufe0f book-search could not take this share ({type(e).__name__}). "
                 "Share it again in a minute.")
         job_id = _tombstone(text, "unexpected", outcome="failed")
+        # Today's shortcut never reads this reply, so Slack has to hear it too.
+        asyncio.create_task(_post_slack(text))
         return {"status": "failed", "job_id": job_id, "message": text, "detail": text}
 
 
@@ -2326,6 +2392,11 @@ async def _accept_share(request: Request):
         wanted = _destination({"kindle_email": kindle_email})
         if kindle_email and wanted != _destination(job):
             message += f". Share it again once it finishes to send it to {wanted}."
+            # This share gets no line of its own otherwise: the job's end line
+            # names only the first recipient.
+            asyncio.create_task(_post_slack(
+                f"\u26a0\ufe0f *{job['title']}* was shared for {wanted} while it is still "
+                f"going to {_destination(job)}. Share it again once that finishes."))
         return {"status": "ok", "job_id": jid, "title": job["title"],
                 "author": job["author"], "message": message}
 
@@ -3271,7 +3342,7 @@ def _calibre_formats_for(book_id: int) -> dict[str, int]:
     return {r[0]: (r[1] or 0) for r in rows if r and r[0]}
 
 
-def _calibre_id_for(title: str, author: str) -> int | None:
+def _calibre_id_for(title: str, author: str, newer_than: int | None = None) -> int | None:
     """Find a book's Calibre id by title, newest first.
 
     _upload_to_calibre polls OPDS for the id and gives up after ~60s, returning
@@ -3306,10 +3377,29 @@ def _calibre_id_for(title: str, author: str) -> int | None:
         conn.close()
 
     for book_id, book_title, book_author in rows:
+        if newer_than is not None and book_id <= newer_than:
+            continue
         if _same_book(book_title, book_author, title, author):
             return book_id
 
     return None
+
+
+def _calibre_max_id() -> int | None:
+    """The library's highest book id, or None when it cannot be read."""
+    db = os.path.join(CWA_LIBRARY_PATH, "metadata.db")
+    if not os.path.exists(db):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        return conn.execute("SELECT COALESCE(MAX(id), 0) FROM books").fetchone()[0]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
 
 
 def _same_book(book_title: str, book_author: str | None, title: str, author: str | None) -> bool:
