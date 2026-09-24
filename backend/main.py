@@ -27,6 +27,7 @@ from backend.openlib import OpenLibraryScraper
 from backend.goodreads.matcher import (
     ShelfItem,
     _is_usable,
+    is_english,
     _rank,
     _titles_agree,
     author_surname,
@@ -237,7 +238,10 @@ def _outcome_line(job: dict, markup: bool) -> str:
     outcome = job.get("outcome")
     where = _destination(job)
     if outcome == "done":
-        details = ", ".join(part for part in (job.get("format"), _took(job)) if part)
+        fmt = job.get("format")
+        if fmt and job.get("swapped_from"):
+            fmt = f"{fmt} instead of the {job['swapped_from']}"
+        details = ", ".join(part for part in (fmt, _took(job)) if part)
         return f"\u2705 {shown} \u2192 {where}" + (f" ({details})" if details else "")
     if outcome == "already_sent":
         when = f" at {job['kindle_sent_at']}" if job.get("kindle_sent_at") else ""
@@ -606,32 +610,47 @@ async def _wait_for_calibre(title: str, timeout: int = 120) -> int | None:
     return None
 
 
+class CalibreUnreachable(Exception):
+    """Calibre-Web could not take any upload: down, erroring, or refusing our login.
+
+    Kept apart from a refusal of one file because another file cannot help.
+    A job that sees this stops downloading and starts no rescue.
+    """
+
+
 async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
-    """Upload book to CWA via HTTP. Returns Calibre book ID or None on failure."""
+    """Upload book to CWA via HTTP.
+
+    Returns -1 when Calibre-Web accepted the file, None when it refused this
+    file, and raises CalibreUnreachable when it could not take any file at all.
+    The id is for the caller to find in the library (_confirm_calibre_id).
+    This used to poll OPDS for up to 60 s for one, with a search whose first
+    term is the author, and on 2026-09-24 that search named Bill Perkins's Die
+    with Zero for The Yellow Wallpaper.
+    """
     import re
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             if not await _cwa_login(client):
-                logger.warning("CWA upload: login failed")
-                return None
+                raise CalibreUnreachable("its login failed")
 
             # GET / → extract fresh CSRF token for upload
             r = await client.get(f"{CALIBRE_WEB_URL}/")
             if r.status_code != 200:
-                logger.warning(f"CWA upload: GET / returned {r.status_code}")
-                return None
+                raise CalibreUnreachable(f"its home page answered {r.status_code}")
             m = re.search(r'name="csrf_token"\s+value="([^"]+)"', r.text)
             if not m:
-                logger.warning("CWA upload: no CSRF token on /")
-                return None
+                raise CalibreUnreachable("its home page carried no CSRF token")
             csrf = m.group(1)
 
             # POST /upload with multipart form
             files = {"btn-upload": (filename, file_data)}
             data = {"csrf_token": csrf}
             r = await client.post(f"{CALIBRE_WEB_URL}/upload", data=data, files=files)
+            if r.status_code >= 500:
+                raise CalibreUnreachable(f"its upload answered {r.status_code}")
             if r.status_code != 200:
-                logger.warning(f"CWA upload: /upload returned {r.status_code}")
+                logger.warning(f"CWA upload: /upload returned {r.status_code} for {filename}")
                 return None
 
             # Check for success response
@@ -650,23 +669,17 @@ async def _upload_to_calibre(file_data: bytes, filename: str) -> int | None:
                     return None
                 logger.info(f"CWA upload: successfully uploaded {filename}")
 
+    except CalibreUnreachable as e:
+        logger.warning(f"CWA upload: Calibre-Web unreachable for {filename}: {e}")
+        raise
+    except httpx.HTTPError as e:
+        logger.warning(f"CWA upload: Calibre-Web unreachable for {filename}: {type(e).__name__}: {e}")
+        raise CalibreUnreachable(f"{type(e).__name__}") from e
     except Exception as e:
         logger.exception(f"CWA upload failed for {filename}: {e}")
         return None
 
-    # Poll OPDS to get the new book_id
-    search_terms = _build_search_terms(filename.rsplit('.', 1)[0])
-    if not search_terms:
-        search_terms = [filename.rsplit('.', 1)[0][:30]]
-    async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
-        for attempt in range(20):  # ~60s
-            for term in search_terms:
-                book_id = await _opds_search(client, term)
-                if book_id is not None:
-                    return book_id
-            await asyncio.sleep(3)
-    logger.warning(f"CWA upload: OPDS polling timed out for {filename}")
-    return -1  # uploaded but couldn't find ID
+    return -1
 
 
 EBOOK_EXTENSIONS = ('.epub', '.pdf', '.mobi', '.azw3', '.djvu', '.cbz', '.cbr', '.fb2')
@@ -1192,12 +1205,14 @@ def _libgen_queries(title: str, author: str) -> list[str]:
 
 # A mirror having a bad day should not turn one book into 25 requests.
 FALLBACK_FILE_ATTEMPTS = int(os.getenv("FALLBACK_FILE_ATTEMPTS", "4"))
+# Files of one book offered to Calibre before a share gives up on refusals.
+FALLBACK_UPLOAD_ATTEMPTS = int(os.getenv("FALLBACK_UPLOAD_ATTEMPTS", "3"))
 
 
-async def _libgen_by_title(
-    title: str, author: str, skip_md5: str | None = None,
-) -> tuple[bytes | None, str | None]:
-    """Find the same book on libgen under a different hash.
+async def _libgen_find_file(
+    title: str, author: str, skip=frozenset(), want=None,
+) -> tuple[bytes | None, str | None, str | None]:
+    """Find the same book on libgen under a different hash: (data, filename, md5).
 
     An md5 shared from Anna's Archive names one FILE. libgen mirrors most books
     many times over, but not always that exact file: Obviously Awesome (April
@@ -1209,21 +1224,25 @@ async def _libgen_by_title(
     what keeps this from repeating the fuzzy last-word search that once shelved
     a CISSP study guide as Neuromancer. No confident match means no download.
 
-    skip_md5 is the hash the job already tried. Excluding it matters: on
+    `skip` holds the hashes already tried or refused. Excluding them matters: on
     2026-09-07 The Mom Test matched its own AA hash here and went back to the
     CDN that had just answered 503 three times, while libgen had the book under
     four other hashes. A file that fails to download is dropped and the matcher
     runs again on what is left, up to FALLBACK_FILE_ATTEMPTS files, so a mirror
     with one bad file does not end the job.
+
+    `want` narrows the rows the matcher may choose from, such as "not a PDF,
+    small enough to email" when a Kindle share looks for an EPUB.
     """
     title = _clean_shared_title(title)
     if not libgen_scraper or not title or is_placeholder(title):
-        return None, None
+        return None, None, None
     if normalize_title(title) == normalize_title("Unknown"):
-        return None, None
+        return None, None, None
 
     author = _clean_shared_author(author)
     item = ShelfItem(book_id="", title=title, author=author, isbn=None, added_at=None)
+    skip = {m.lower() for m in skip if m}
 
     def choose(rows: list):
         if author:
@@ -1237,14 +1256,14 @@ async def _libgen_by_title(
             rows = await libgen_scraper.search_candidates(query)
         except Exception as e:
             logger.warning(f"LibGen title search failed for {query!r}: {type(e).__name__}: {e}")
-            return None, None
-        # Dropping the failed hash BEFORE deciding the query answered. The
+            return None, None, None
+        # Dropping the tried hashes BEFORE deciding the query answered. The
         # full-title query for The Mom Test returned exactly one row, that very
         # hash, on 2026-09-07, so the loop stopped and the filter then emptied
         # it. The shorter query that finds the book five times over on the same
         # mirror was never sent.
-        if skip_md5:
-            rows = [c for c in rows if (c.md5 or "").lower() != skip_md5.lower()]
+        rows = [c for c in rows
+                if (c.md5 or "").lower() not in skip and (want is None or want(c))]
         # A query has answered only when the matcher accepts one of its rows.
         # On 2026-09-24 the full title of A Man Called Ove returned a single
         # companion book by another author; stopping there failed the job while
@@ -1265,7 +1284,7 @@ async def _libgen_by_title(
                 "No confident libgen match for %r by %r (%d candidates)",
                 title, author or "(no author)", len(remaining),
             )
-            return None, None
+            return None, None, None
 
         logger.info(
             "Falling back to libgen md5 %s for %r by %r (matched on %s, try %d)",
@@ -1277,7 +1296,7 @@ async def _libgen_by_title(
             logger.warning(f"LibGen fallback download failed for {chosen.md5}: {e}")
             data, filename = None, None
         if data:
-            return data, filename
+            return data, filename, chosen.md5
         # That file is not being served. The book is still the right one, so
         # take it out of the running and let the matcher pick again.
         remaining = [c for c in remaining if c.md5 != chosen.md5]
@@ -1286,7 +1305,53 @@ async def _libgen_by_title(
         "Gave up on %r by %r after %d files", title, author or "(no author)",
         FALLBACK_FILE_ATTEMPTS,
     )
-    return None, None
+    return None, None, None
+
+
+async def _libgen_by_title(
+    title: str, author: str, skip_md5: str | None = None,
+) -> tuple[bytes | None, str | None]:
+    """_libgen_find_file for a caller that needs only the file."""
+    data, filename, _ = await _libgen_find_file(title, author, skip={skip_md5} if skip_md5 else set())
+    return data, filename
+
+
+async def _libgen_row_for(title: str, author: str, md5: str):
+    """libgen's own row for one file, found by searching for its book, or None."""
+    for query in _libgen_queries(_clean_shared_title(title), _clean_shared_author(author)):
+        try:
+            rows = await libgen_scraper.search_candidates(query)
+        except Exception:
+            return None
+        for row in rows:
+            if (row.md5 or "").lower() == md5.lower():
+                return row
+    return None
+
+
+async def _reflowable_instead(
+    title: str, author: str, pdf_md5: str,
+) -> tuple[bytes | None, str | None, str | None]:
+    """An EPUB (or AZW3/MOBI) of the same book for a Kindle, or nothing.
+
+    A PDF keeps its page layout on a six-inch screen, so it arrives as pages to
+    pinch and pan; two of the three shares on 2026-09-24 were PDFs. The swap
+    needs the shared file's language: only an English original is swapped,
+    since the matcher offers English files only, and a PDF whose language
+    libgen does not state is kept rather than risk another translation.
+    """
+    if not libgen_scraper or not _searchable_title(title):
+        return None, None, None
+    original = await _libgen_row_for(title, author, pdf_md5)
+    if not original or not is_english(original.language):
+        logger.info("Keeping the PDF of %r: its language is %r", title,
+                    original.language if original else "not listed")
+        return None, None, None
+
+    def reflowable(row) -> bool:
+        return (row.ext or "").lower() != "pdf" and (row.size_bytes or 0) <= MAX_BOOK_BYTES
+
+    return await _libgen_find_file(title, author, skip={pdf_md5}, want=reflowable)
 
 
 def _pick_on_title_alone(title: str, candidates: list) -> object | None:
@@ -1347,22 +1412,20 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
         except Exception as e:
             logger.warning(f"LibGen md5 download failed for {md5}: {e}")
             file_data, filename = None, None
+        used_md5 = md5
         if not file_data:
             # libgen has no file for this exact hash. The book may still be
             # there under another one, if the caller told us what it is.
             job["stage_detail"] = "Not on libgen by hash, searching by title..."
-            file_data, filename = await _libgen_by_title(title, author, skip_md5=md5)
+            file_data, filename, used_md5 = await _libgen_find_file(title, author, skip={md5})
         if not file_data or len(file_data) < MIN_EBOOK_SIZE_BYTES:
             # Fall through to the detail's own mirrors rather than giving up.
             file_data = None
 
         if file_data:
             filename = filename or f"{author} - {title}.epub"
-            if not await _upload_and_confirm(job, file_data, filename, title, author):
-                return False
-            job["stage_detail"] = f"Downloaded {filename} ({len(file_data)} bytes)"
-            logger.info(f"Fetched {md5} from libgen by hash: {filename}")
-            return True
+            logger.info(f"Fetched {used_md5} from libgen: {filename}")
+            return await _upload_best_file(job, md5, used_md5, file_data, filename, title, author)
 
     if not detail:
         return False
@@ -1431,18 +1494,73 @@ async def _try_direct_download(job_id: str, job: dict, md5: str, title: str, aut
     return False
 
 
+def _is_pdf(data: bytes, filename: str = "") -> bool:
+    # Calibre-Web sniffs with libmagic, but some libgen PDFs carry stray bytes
+    # before %PDF (a Moby-Dick copy on 2026-09-24), so the name counts too.
+    return data[:4] == b"%PDF" or filename.lower().endswith(".pdf")
+
+
+async def _upload_best_file(job: dict, shared_md5: str, md5: str, file_data: bytes,
+                            filename: str, title: str, author: str) -> bool:
+    """Get one file of this book into Calibre, trying the known fixes first.
+
+    For a Kindle share of a PDF, an EPUB of the same book goes first and the
+    PDF stays as the fallback. When Calibre-Web refuses a file, the next file
+    of the same book is tried, up to FALLBACK_UPLOAD_ATTEMPTS uploads; a
+    refusal says something about that file, not about the book. When Calibre
+    is unreachable, nothing more is tried.
+    """
+    tried = {shared_md5, md5}
+    queue = [(file_data, filename, md5)]
+    swapped_md5 = None
+    if job.get("kindle_email") and _is_pdf(file_data, filename):
+        job["stage_detail"] = "Looking for an EPUB to send instead of the PDF..."
+        epub, epub_name, epub_md5 = await _reflowable_instead(title, author, md5)
+        if epub and len(epub) >= MIN_EBOOK_SIZE_BYTES:
+            logger.info("Sending an EPUB of %r (%s) instead of the PDF %s", title, epub_md5, md5)
+            queue.insert(0, (epub, epub_name or f"{author} - {title}.epub", epub_md5))
+            tried.add(epub_md5)
+            swapped_md5 = epub_md5
+
+    for _ in range(FALLBACK_UPLOAD_ATTEMPTS):
+        if not queue:
+            job["stage_detail"] = "Calibre refused that file, trying another copy of the book..."
+            more, more_name, more_md5 = await _libgen_find_file(title, author, skip=tried)
+            if not more or len(more) < MIN_EBOOK_SIZE_BYTES:
+                break
+            tried.add(more_md5)
+            queue.append((more, more_name or f"{author} - {title}.epub", more_md5))
+        data, name, file_md5 = queue.pop(0)
+        if await _upload_and_confirm(job, data, name, title, author):
+            job.pop("upload_refused", None)
+            if file_md5 == swapped_md5:
+                job["swapped_from"] = "pdf"
+            job["stage_detail"] = f"Downloaded {name} ({len(data)} bytes)"
+            return True
+        if job.get("calibre_down"):
+            return False
+        logger.info("Calibre refused %s (%s)", name, file_md5)
+    return False
+
+
 async def _upload_and_confirm(job: dict, file_data: bytes, filename: str, title: str, author: str) -> bool:
     """Upload a file to Calibre-Web and find the book in the library.
 
-    Returns False only when Calibre-Web turns the file away, with the reason in
-    job["upload_refused"]. An accepted upload returns True whether or not the
+    Returns False when Calibre-Web turns the file away, with the reason in
+    job["upload_refused"], or cannot take any file, with the reason in
+    job["calibre_down"]. An accepted upload returns True whether or not the
     library shows the book yet; job["book_id"] is set only once it does.
     """
     job["phase"] = "uploading"
     job["stage_detail"] = "Uploading to Calibre..."
     job["format"] = "pdf" if file_data[:4] == b"%PDF" else (os.path.splitext(filename)[1].lstrip(".").lower() or "epub")
     job["file_meta"] = _ebook_meta(file_data, filename)
-    hint = await _upload_to_calibre(file_data, filename)
+    try:
+        hint = await _upload_to_calibre(file_data, filename)
+    except CalibreUnreachable as e:
+        job["calibre_down"] = (f"Calibre-Web is unreachable ({e}), so nothing could be "
+                               "added. Share it again once Calibre is back")
+        return False
     if not hint:
         job["upload_refused"] = (
             f"Calibre-Web did not accept {filename}. It turns away files it "
@@ -1712,9 +1830,15 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # inside a try runs finally anyway, which is how one tap put two
             # copies of the same book on a Kindle on 2026-09-07.
             return
+        if job.get("calibre_down"):
+            # No other file or route can help while Calibre cannot take one.
+            job["status"] = "failed"
+            job["code"] = "calibre_down"
+            job["message"] = job["stage_detail"] = job["calibre_down"]
+            return
         if job.get("upload_refused"):
-            # The file downloaded fine and Calibre turned it down. Stacks would
-            # only fetch the same file again, minutes later.
+            # The files downloaded fine and Calibre turned them down. Stacks
+            # would only fetch the same file again, minutes later.
             job["status"] = "failed"
             job["code"] = "refused"
             job["message"] = job["stage_detail"] = job["upload_refused"]
@@ -1728,7 +1852,10 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
             # Fallback: direct download for libgen mirrors
             if not await _try_direct_download(job_id, job, md5, title, author, detail):
                 job["status"] = "failed"
-                if job.get("upload_refused"):
+                if job.get("calibre_down"):
+                    job["code"] = "calibre_down"
+                    job["message"] = job["calibre_down"]
+                elif job.get("upload_refused"):
                     job["code"] = "refused"
                     job["message"] = job["upload_refused"]
                 else:
@@ -1902,6 +2029,13 @@ async def _process_download(job_id: str, md5: str, title: str, author: str, deta
                 job["message"] = "Uploaded — Calibre import may still be processing"
                 job["stage_detail"] = job["message"]
 
+    except CalibreUnreachable as e:
+        # From the Stacks routes, which call _upload_to_calibre directly.
+        job["status"] = "failed"
+        job["code"] = "calibre_down"
+        job["message"] = job["stage_detail"] = (
+            f"Calibre-Web is unreachable ({e}), so nothing could be added. "
+            "Share it again once Calibre is back")
     except Exception as e:
         job["status"] = "failed"
         job["code"] = "unexpected"
@@ -2530,7 +2664,10 @@ async def goodreads_ingest(request: Request):
             detail=f"downloaded file is only {len(file_data)} bytes — refusing to import",
         )
 
-    uploaded = await _upload_to_calibre(file_data, filename)
+    try:
+        uploaded = await _upload_to_calibre(file_data, filename)
+    except CalibreUnreachable as e:
+        raise HTTPException(status_code=502, detail=f"Calibre is unreachable: {e}")
     if not uploaded:
         raise HTTPException(status_code=502, detail="Calibre upload failed")
 

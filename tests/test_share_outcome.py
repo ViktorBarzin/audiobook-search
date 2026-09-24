@@ -114,11 +114,11 @@ async def test_a_failed_share_says_why_on_the_phone_and_in_slack(pipeline, slack
         async def download_file(self, md5):
             return None, None
 
-    async def no_title_match(title, author, skip_md5=None):
-        return None, None
+    async def no_title_match(title, author, skip=frozenset(), want=None):
+        return None, None, None
 
     monkeypatch.setattr(bs_main, "libgen_scraper", Nothing())
-    monkeypatch.setattr(bs_main, "_libgen_by_title", no_title_match)
+    monkeypatch.setattr(bs_main, "_libgen_find_file", no_title_match)
     monkeypatch.setattr(bs_main, "annas_scraper", None)
     job = register(monkeypatch)
 

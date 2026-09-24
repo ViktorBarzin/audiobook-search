@@ -111,11 +111,11 @@ class FailingLibgen:
 
 
 async def test_a_job_that_fails_posts_one_warning(monkeypatch, slack):
-    async def no_title_match(title, author, skip_md5=None):
-        return None, None
+    async def no_title_match(title, author, skip=frozenset(), want=None):
+        return None, None, None
 
     monkeypatch.setattr(bs_main, "libgen_scraper", FailingLibgen())
-    monkeypatch.setattr(bs_main, "_libgen_by_title", no_title_match)
+    monkeypatch.setattr(bs_main, "_libgen_find_file", no_title_match)
     monkeypatch.setattr(bs_main, "annas_scraper", None)
     monkeypatch.setattr(bs_main, "_ttl_cleanup_job", _noop)
     md5 = "cab14d02fedc672f7e51682b78e477a4"
