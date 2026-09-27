@@ -57,6 +57,18 @@ async def test_the_text_search_asks_for_fiction_and_non_fiction():
     assert sorted(topics) == ["f", "l"]
 
 
+async def test_the_web_ui_search_asks_for_fiction_too():
+    """The interactive search had the same gap: a novel typed into the UI
+    found nothing on libgen while the pipeline, fixed, found 14 copies."""
+    scraper = LibGenScraper()
+    scraper.client = RecordingClient()
+
+    await scraper._search_li("the sword of kaigen", "https://libgen.li")
+
+    topics = scraper.client.params[0]["topics[]"]
+    assert sorted(topics) == ["f", "l"]
+
+
 # --------------------------------------------------------------------------- #
 # Rows carry publisher and year, which the Claude check reads                  #
 # --------------------------------------------------------------------------- #

@@ -337,7 +337,8 @@ class LibGenScraper:
                 "req": query,
                 "columns[]": ["t", "a"],
                 "objects[]": "f",
-                "topics[]": "l",
+                # Fiction too, as in search_candidates: l alone hid novels.
+                "topics[]": ["l", "f"],
                 "res": "25",
             },
         )
