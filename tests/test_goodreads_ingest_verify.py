@@ -159,6 +159,43 @@ def test_a_file_it_cannot_read_relies_on_the_record_check(endpoint, monkeypatch)
     assert [c[0] for c in verifier.calls] == ["record"]
 
 
+def test_a_shelf_timeout_does_not_stop_the_kindle_send(endpoint, monkeypatch):
+    """Calibre-Web took over 30 s to answer while it processed Release Me on
+    2026-09-27. The timeout escaped, the endpoint answered 500 after the import,
+    and the book never went to the Kindle; a retry would then find it already
+    in Calibre and skip the send for good."""
+    import httpx
+
+    post, state = endpoint
+    sent = []
+
+    async def shelf_times_out(client, shelf_id, book_id):
+        raise httpx.ReadTimeout("calibre-web is busy")
+
+    async def logged_in(client):
+        return True
+
+    async def send(book_id, title, address, formats=None):
+        sent.append((book_id, address, formats))
+        return None
+
+    monkeypatch.setattr(bs_main, "GOODREADS_SHELF_ID", 6)
+    monkeypatch.setattr(bs_main, "_cwa_login", logged_in)
+    monkeypatch.setattr(bs_main, "_add_to_shelf", shelf_times_out)
+    monkeypatch.setattr(bs_main, "GOODREADS_KINDLE_EMAIL", "anca@kindle.com")
+    monkeypatch.setattr(bs_main, "_calibre_formats_for", lambda book_id: {"EPUB": 900_000})
+    monkeypatch.setattr(bs_main, "_send_to_kindle", send)
+
+    r = post(FakeVerifier())
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert "ReadTimeout" in body["shelf_error"]
+    assert body["kindle_sent"] is True
+    assert sent == [(700, "anca@kindle.com", ("epub",))]
+
+
 def test_without_a_verify_block_the_endpoint_behaves_as_before(endpoint):
     """Hand-run ingests and old pollers send no verify block and get no check."""
     post, state = endpoint

@@ -3429,11 +3429,18 @@ async def goodreads_ingest(request: Request):
 
     shelf_error = None
     if shelf_id and book_id > 0:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            if await _cwa_login(client):
-                shelf_error = await _add_to_shelf(client, shelf_id, book_id)
-            else:
-                shelf_error = "CWA login failed"
+        # The book is already imported, so a slow or failing shelf step must not
+        # end the request: Calibre-Web timed out for 30 s while it processed
+        # Release Me (2026-09-27), the 500 skipped the Kindle send, and a retry
+        # would have found the book already in Calibre and never sent it.
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                if await _cwa_login(client):
+                    shelf_error = await _add_to_shelf(client, shelf_id, book_id)
+                else:
+                    shelf_error = "CWA login failed"
+        except httpx.HTTPError as e:
+            shelf_error = f"{type(e).__name__}: {e}"
         if shelf_error:
             logger.warning(f"Shelf add failed for book {book_id}: {shelf_error}")
 
