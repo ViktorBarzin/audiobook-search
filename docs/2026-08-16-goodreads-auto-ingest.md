@@ -10,8 +10,8 @@ downloaded, imported into Calibre, placed on a shelf owned by her calibre-web ac
 sent to her Kindle, with nobody in the loop. She does nothing differently; she keeps using
 Goodreads exactly as she does today.
 
-Scope boundaries: there is no human review or approval step (the Claude check added on
-2026-09-27 takes that role), and the existing interactive book-search UI behaves exactly as
+Scope boundaries: there is no human review or approval step (since 2026-09-27 a Claude
+check confirms each pick instead), and the existing interactive book-search UI behaves exactly as
 it does today. Kindle sending started manual and became automatic on 2026-08-21; see
 [Kindle forwarding](#kindle-forwarding) and the [2026-09-27 review](#review-2026-09-27).
 
@@ -192,7 +192,7 @@ Applied per item; anything not clearing the bar is recorded and skipped.
    [the 2026-09-27 review](#review-2026-09-27).
 
 The title search covers both of libgen's collections, `topics[]=l` (main) and `f` (fiction).
-Until 2026-09-27 it asked for `l` alone, which hid most novels.
+Until 2026-09-27 it asked for `l` alone, which left most novels out of the results.
 
 Everything downstream of the match reuses existing code: `/download` with `source=libgen`,
 `_publish_ingest_file()`, the CWA HTTP upload, `_wait_for_calibre()` for the `book_id`, then
@@ -462,7 +462,7 @@ downloads held in memory only, and every pick was checked by hand:
 28 | picks accepted, all correct
 1 | wrong pick caught by Claude
 2 | picks held up by LibGen download errors
-67% | of English books now arrive (was 42%)
+67% | of English books now arrive (42% on the August sample)
 ```
 
 The caught pick was *Medea*: the matcher accepted "Medea: SparkNotes Literature Guide"
@@ -473,8 +473,35 @@ are retried on a later cycle. Of the 19 skipped items, 5 are Romanian titles, 8 
 LibGen, and 6 are omnibus editions or much-translated classics the strict title rule
 declines, as it did before.
 
-**Open questions.** The retries of the eight missed books are the first live runs of the
-Claude check; their outcome is recorded below once they finish.
+**Live retry.** The eight English misses were set back to pending and the deployed poller
+took them through the whole path. Every delivery below is confirmed by Brevo's event log:
+
+| Book | Outcome |
+|---|---|
+| *My Dark Desire* | Calibre 519, her shelf, delivered to her Kindle |
+| *The Sword of Kaigen* | Calibre 520, delivered |
+| *The Viceroys* | Calibre 521, delivered |
+| *The Midnight Train* | Calibre 522, delivered |
+| *Romanov* | Calibre 523, delivered on the second cycle, after LibGen's mirror answered 503 on the first |
+| *Release Me* | Calibre 524, delivered after a hand repair of the fault described below |
+| *Epilogue of Kings* | Correct miss: not on LibGen |
+| *May We Feed the King* | Correct miss after three empty rounds |
+
+Two further faults surfaced during the retry and were fixed the same day:
+
+- **A broken download deferred the whole book.** LibGen's mirror cut *Release Me*'s file off
+  at 2 of 2.8 MB on every attempt and answered 503 for *Romanov*'s, while other copies were
+  on offer. A failed download now moves on to the next confident candidate, and the book waits
+  only when no file arrived.
+- **A slow shelf step skipped the Kindle send.** Calibre-Web took over 30 s to answer while it
+  processed *Release Me*; the timeout escaped after the import, the endpoint answered 500, and
+  the book was never sent. A retry would then have recorded it as already held and never sent
+  it either. A shelf failure is now reported like any other shelf error and the Kindle step
+  still runs. *Release Me* itself was shelved and sent by hand once.
+
+A deploy restarts both pods, and a book in flight at that moment loses one of its three
+attempts to the dropped connection. Two books did during
+this rollout, and their counters were set back by hand.
 
 ## Known limitations
 
@@ -482,8 +509,8 @@ These follow from decisions above and are recorded so they are not surprises lat
 
 - **New releases are usually missed.** Books published within the last few months are often
   absent from LibGen; one attempt per book means a title that appears later is not picked up.
-  *May We Feed the King*, which she shelved on 9 August, was first recorded as an example of
-  this; the 2026-09-27 review found the fiction-collection gap may explain it instead.
+  *May We Feed the King*, which she shelved on 9 August, remains an example: it was still
+  absent from LibGen after three rounds on 2026-09-27.
 - **Romanian and French titles are skipped** under the English-only rule; two of her last 25
   additions fall into this group.
 - **A pdf-only book is delivered as a pdf** to Calibre and her shelf, and is not sent to her
