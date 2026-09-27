@@ -66,6 +66,9 @@ class ShelfItem:
     author: str
     isbn: str | None
     added_at: datetime | None
+    # Read by the Claude check, which compares meaning rather than strings.
+    description: str | None = None
+    published: str | None = None
 
 
 @dataclass
@@ -79,6 +82,8 @@ class Candidate:
     language: str | None
     size_bytes: int | None
     source: str
+    publisher: str | None = None
+    year: str | None = None
 
 
 @dataclass
@@ -164,6 +169,9 @@ def _is_noise_token(token: str) -> bool:
     """
     if token.isdigit():
         return True
+    # An ISBN-10 whose check digit is X ('006341905x') is still an ISBN.
+    if re.fullmatch(r"\d{9}x", token):
+        return True
     if re.fullmatch(r"\d+(st|nd|rd|th)", token):
         return True
     if len(token) == 1:
@@ -195,20 +203,62 @@ def _titles_agree(wanted: str, offered: str | None) -> bool:
     return all(_is_noise_token(t) for t in right_tokens[len(left_tokens):])
 
 
-def _is_usable(candidate: Candidate) -> bool:
+def _language_known(candidate: Candidate) -> bool:
+    return bool(_fold(candidate.language or ""))
+
+
+def _is_usable(candidate: Candidate, allow_unknown_language: bool = False) -> bool:
+    """Format, size and language all acceptable.
+
+    A blank language is unknown rather than foreign: libgen leaves the field
+    empty on many English files (The Midnight Train, 2026-09-08). The Goodreads
+    ranking passes allow_unknown_language and then accepts such a file only on a
+    full title and author match, never on an ISBN hit alone. Other callers (the
+    share path's title-only pick) keep requiring English.
+    """
     if candidate.ext.lower() not in FORMAT_PREFERENCE:
         return False
-    if not is_english(candidate.language):
+    if allow_unknown_language and not _language_known(candidate):
+        pass
+    elif not is_english(candidate.language):
         return False
     if candidate.size_bytes is not None and candidate.size_bytes < MIN_SIZE_BYTES:
         return False
     return True
 
 
-def _rank(candidate: Candidate) -> tuple[int, int]:
-    """Best format first, then the largest file within that format."""
+def _rank(candidate: Candidate) -> tuple[int, int, int]:
+    """Named English before unknown, then best format, then the largest file."""
+    unknown = 0 if is_english(candidate.language) else 1
     fmt = FORMAT_PREFERENCE.index(candidate.ext.lower())
-    return (fmt, -(candidate.size_bytes or 0))
+    return (unknown, fmt, -(candidate.size_bytes or 0))
+
+
+def rank_candidates(
+    item: ShelfItem,
+    candidates: list[Candidate],
+    isbn_matched_md5s: set[str] | None = None,
+) -> list[tuple[Candidate, str]]:
+    """Every candidate confidently this book, best first, with why it qualified.
+
+    ISBN hits lead because the identifier settles identity; they must name
+    English, since no title reasoning backs them up. Title-and-author matches
+    follow. The poller walks this list when Claude refuses the first pick.
+    """
+    if is_placeholder(item.title):
+        return []
+    isbn_md5s = isbn_matched_md5s or set()
+    usable = [c for c in candidates if _is_usable(c, allow_unknown_language=True)]
+
+    by_isbn = sorted((c for c in usable if c.md5 in isbn_md5s and is_english(c.language)),
+                     key=_rank)
+    confident = sorted(
+        (c for c in usable
+         if c not in by_isbn
+         and _titles_agree(item.title, c.title) and _authors_agree(item.author, c.author)),
+        key=_rank,
+    )
+    return [(c, "isbn") for c in by_isbn] + [(c, "title_author") for c in confident]
 
 
 def select_candidate(
@@ -227,23 +277,16 @@ def select_candidate(
     if not candidates:
         return MatchResult(None, "not_found")
 
-    usable = [c for c in candidates if _is_usable(c)]
-    if not usable:
-        # Distinguish 'exists but not in English' from 'nothing usable at all',
-        # because only the first is worth reporting as a near-miss.
-        if any(c for c in candidates if not is_english(c.language)):
-            return MatchResult(None, "no_english_edition")
-        return MatchResult(None, "no_confident_match")
+    ranked = rank_candidates(item, candidates, isbn_matched_md5s)
+    if ranked:
+        candidate, reason = ranked[0]
+        return MatchResult(candidate, reason)
 
-    by_isbn = [c for c in usable if c.md5 in (isbn_matched_md5s or set())]
-    if by_isbn:
-        return MatchResult(sorted(by_isbn, key=_rank)[0], "isbn")
-
-    confident = [
-        c for c in usable
-        if _titles_agree(item.title, c.title) and _authors_agree(item.author, c.author)
-    ]
-    if confident:
-        return MatchResult(sorted(confident, key=_rank)[0], "title_author")
-
+    # Distinguish 'exists but not in English' from 'nothing usable at all',
+    # because only the first is worth reporting as a near-miss. Only a language
+    # libgen actually names counts as foreign.
+    if not any(_is_usable(c, allow_unknown_language=True) for c in candidates) and any(
+        _language_known(c) and not is_english(c.language) for c in candidates
+    ):
+        return MatchResult(None, "no_english_edition")
     return MatchResult(None, "no_confident_match")

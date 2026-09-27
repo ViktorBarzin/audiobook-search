@@ -39,6 +39,13 @@ from backend.goodreads.matcher import (
     normalize_title,
     select_candidate,
 )
+from backend.goodreads.verify import (
+    ClaudeVerifier,
+    VerifierUnavailable,
+    extract_evidence,
+    offered_from,
+    wanted_from,
+)
 from backend.kindle import MAX_BOOK_BYTES, choose_kindle_format
 from backend.models import AudiobookResult, AudiobookDetail
 from backend.dedupe import find_duplicate, find_inflight_duplicate, is_same_book
@@ -2293,6 +2300,9 @@ async def _ttl_cleanup_job(job_id: str) -> None:
 
 CLAUDE_AGENT_URL = os.getenv("CLAUDE_AGENT_URL", "").rstrip("/")
 CLAUDE_AGENT_TOKEN = os.getenv("CLAUDE_AGENT_TOKEN", "")
+# Second opinion on every Goodreads pick, before and after download. The same
+# service and token as the rescue agent, over its quick chat endpoint.
+goodreads_verifier = ClaudeVerifier(CLAUDE_AGENT_URL, CLAUDE_AGENT_TOKEN)
 RESCUE_DAILY_CAP = int(os.getenv("RESCUE_DAILY_CAP", "2"))
 RESCUE_RETRY_DELAY_SECONDS = int(os.getenv("RESCUE_RETRY_DELAY_SECONDS", "900"))
 RESCUE_BUDGET_USD = 5
@@ -3341,9 +3351,42 @@ async def goodreads_ingest(request: Request):
             return {"status": "duplicate", "message": str(e.detail)}
         raise
 
+    # A poller asking for the Claude check sends what Goodreads and libgen say
+    # about the book. Without that block (hand-run ingests) nothing is checked.
+    verify = data.get("verify")
+    wanted = offered = None
+    if isinstance(verify, dict):
+        if not goodreads_verifier.configured:
+            raise HTTPException(status_code=503,
+                                detail="Claude check unavailable: CLAUDE_AGENT_URL/TOKEN unset")
+        wanted = wanted_from(title, author, verify)
+        offered = offered_from(verify)
+        try:
+            verdict = await goodreads_verifier.check_record(wanted, offered)
+        except VerifierUnavailable as e:
+            raise HTTPException(status_code=503, detail=f"Claude check unavailable: {e}")
+        if not verdict.ok:
+            logger.info(f"Claude refused the record for {title!r} ({md5}): {verdict.reason}")
+            return {"status": "rejected", "stage": "record", "reason": verdict.reason}
+
     file_data, filename = await libgen_scraper.download_file(md5)
     if not file_data:
         raise HTTPException(status_code=502, detail=f"download failed for md5 {md5}")
+
+    if wanted is not None:
+        ext = (filename or "").rsplit(".", 1)[-1] if "." in (filename or "") else offered.ext
+        evidence = extract_evidence(file_data, ext)
+        if evidence is not None:
+            try:
+                verdict = await goodreads_verifier.check_file(wanted, offered, evidence)
+            except VerifierUnavailable as e:
+                raise HTTPException(status_code=503, detail=f"Claude check unavailable: {e}")
+            if not verdict.ok:
+                logger.info(f"Claude refused the file for {title!r} ({md5}): {verdict.reason}")
+                return {"status": "rejected", "stage": "file", "reason": verdict.reason}
+        else:
+            logger.info(f"No readable contents in the {ext} for {title!r}; "
+                        f"relying on the record check")
 
     reason = _invalid_ingest_reason(filename or "", "")
     if not filename or (reason and "size" not in reason):

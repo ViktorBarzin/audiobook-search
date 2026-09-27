@@ -22,6 +22,7 @@ class Outcome(str, Enum):
     OWNED = "owned"              # already in the Calibre library
     NOT_FOUND = "not_found"      # no source had it
     NO_MATCH = "no_match"        # candidates existed, none confidently hers
+    REJECTED = "rejected"        # confident candidates, all refused by the Claude check
     SKIPPED = "skipped"          # placeholder for an unpublished book
     ERROR = "error"
 

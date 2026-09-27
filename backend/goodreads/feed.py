@@ -10,6 +10,7 @@ addition, so a normal poll never needs to walk pagination.
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from dataclasses import dataclass, field
@@ -57,6 +58,14 @@ def _tag(name: str, blob: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _plain_text(value: str) -> str:
+    """Goodreads descriptions carry HTML, sometimes escaped; keep the words."""
+    text = html.unescape(value or "")
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _parse_added(value: str) -> datetime | None:
     if not value:
         return None
@@ -80,6 +89,8 @@ def parse_items(xml: str) -> list[ShelfItem]:
             author=_tag("author_name", blob),
             isbn=_tag("isbn", blob) or None,
             added_at=_parse_added(_tag("user_date_added", blob)),
+            description=_plain_text(_tag("book_description", blob)) or None,
+            published=_tag("book_published", blob) or None,
         ))
     return items
 

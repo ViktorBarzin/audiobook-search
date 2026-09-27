@@ -6,7 +6,7 @@ import pytest
 
 from backend.goodreads.matcher import Candidate, ShelfItem
 from backend.goodreads.store import MemorySeenStore
-from backend.goodreads.sync import GoodreadsSync, Outcome
+from backend.goodreads.sync import MAX_ATTEMPTS, GoodreadsSync, Outcome
 
 
 def shelf_item(book_id, title="Strange Houses", author="Uketsu", isbn="006343315X"):
@@ -40,7 +40,7 @@ class FakeIngest:
         self.calls = []
         self.result = result or {"status": "ok", "book_id": 501}
 
-    async def __call__(self, *, md5, title, author):
+    async def __call__(self, *, md5, title, author, details=None):
         self.calls.append(md5)
         return dict(self.result)
 
@@ -103,13 +103,18 @@ async def test_second_run_downloads_only_genuinely_new_items():
 # --------------------------------------------------------------------------- #
 
 async def test_a_missed_book_is_never_retried():
-    """One attempt per book: a miss is recorded and not searched again."""
+    """A miss is recorded and not searched again.
+
+    An empty libgen answer takes MAX_ATTEMPTS cycles to become final, because
+    libgen serves the same empty page for a blip as for a real absence.
+    """
     store = MemorySeenStore()
     store.mark_seeded(["0"])
     item = shelf_item("9", title="May We Feed the King", author="Rebecca Perry")
     sync, source, ingest, _, _ = build([item], candidates=[], store=store)
 
-    await sync.process([item])
+    for _ in range(MAX_ATTEMPTS):
+        await sync.process([item])
     assert sync.store.outcome("9") == Outcome.NOT_FOUND
     calls_after_first_attempt = len(source.text_calls)
 
@@ -197,7 +202,8 @@ async def test_reports_success_and_miss_once_each():
         source=SelectiveSource(), ingest=FakeIngest(), store=store,
         notify=(notifier := FakeNotifier()), downloads_enabled=True,
     )
-    await sync.process([found, missing])
+    for _ in range(MAX_ATTEMPTS):
+        await sync.process([found, missing])
 
     assert len(notifier.messages) == 2
     assert any("Strange Houses" in m for m in notifier.messages)
@@ -383,6 +389,7 @@ async def test_an_unavailable_fallback_leaves_the_primary_result_alone():
     sync = GoodreadsSync(source=FakeSource([]), ingest=FakeIngest(), store=store,
                          notify=FakeNotifier(), downloads_enabled=True,
                          fallback_source=Blocked())
-    await sync.process([item])
+    for _ in range(MAX_ATTEMPTS):
+        await sync.process([item])
 
     assert sync.store.outcome("73") == Outcome.NOT_FOUND

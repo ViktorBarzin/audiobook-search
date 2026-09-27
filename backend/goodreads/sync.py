@@ -14,10 +14,12 @@ import re
 from dataclasses import dataclass, field
 
 from backend.goodreads.matcher import (
+    Candidate,
     ShelfItem,
     author_surname,
     is_placeholder,
     normalize_title,
+    rank_candidates,
     select_candidate,
 )
 from backend.goodreads.sources import SourceUnavailable
@@ -44,6 +46,10 @@ MAX_PER_CYCLE = 10
 # they still must not retry forever — libgen closed a connection mid-download on
 # 2026-08-16 and an unbounded retry would have hammered it every two minutes.
 MAX_ATTEMPTS = 3
+
+# How many confident candidates a book may try when the Claude check refuses
+# one. Each refusal after download costs a fetch, so the list stays short.
+MAX_CANDIDATES = 3
 
 
 # Anna's Archive can't be searched automatically — it only answers a human in a
@@ -74,6 +80,39 @@ def format_miss(item: ShelfItem, reason: str) -> str:
     if item.isbn:
         lines.append(f"ISBN {item.isbn}")
     return "\n".join(lines)
+
+
+def format_rejected(item: ShelfItem, reasons: list[str]) -> str:
+    """Every confident candidate was refused by the Claude check.
+
+    Worded differently from a plain miss on purpose: libgen had something, and
+    Claude's reason says what was wrong with it.
+    """
+    count = len(reasons)
+    noun = "candidate" if count == 1 else f"all {count} candidates"
+    lines = [
+        f"🔎 *{item.title}* — {item.author}",
+        f"Claude refused {noun} on LibGen (last: {reasons[-1]}). "
+        f"Search Anna's Archive: {annas_search_url(item)}",
+    ]
+    if item.isbn:
+        lines.append(f"ISBN {item.isbn}")
+    return "\n".join(lines)
+
+
+def verify_details(item: ShelfItem, candidate: Candidate) -> dict:
+    """What the ingest endpoint's Claude check compares: her book and this file."""
+    return {
+        "isbn": item.isbn,
+        "published": item.published,
+        "description": item.description,
+        "candidate": {
+            "title": candidate.title, "author": candidate.author,
+            "publisher": candidate.publisher, "year": candidate.year,
+            "language": candidate.language, "ext": candidate.ext,
+            "size_bytes": candidate.size_bytes,
+        },
+    }
 
 
 def format_owned(item: ShelfItem) -> str:
@@ -214,20 +253,30 @@ class GoodreadsSync:
         ]))
 
     async def _process_one(self, item: ShelfItem, result: CycleResult) -> None:
-        candidates, isbn_md5s = await self._gather_candidates(item)
+        candidates, isbn_md5s, empty = await self._gather_candidates(item)
         match = select_candidate(item, candidates, isbn_matched_md5s=isbn_md5s)
 
         if match.candidate is None and self.fallback_source and not is_placeholder(item.title):
-            extra, extra_isbn = await self._gather_candidates(
+            extra, extra_isbn, _ = await self._gather_candidates(
                 item, source=self.fallback_source, required=False,
             )
             if extra:
                 candidates = candidates + extra
-                match = select_candidate(
-                    item, candidates, isbn_matched_md5s=isbn_md5s | extra_isbn,
-                )
+                isbn_md5s = isbn_md5s | extra_isbn
+                match = select_candidate(item, candidates, isbn_matched_md5s=isbn_md5s)
 
         if match.candidate is None:
+            if empty and match.reason != "placeholder_title":
+                # libgen answers some searches with an empty page, then the same
+                # search seconds later with six files (Romanov, 2026-09-18). The
+                # page is identical to a real absence, so only a later cycle can
+                # tell them apart; the last round's answer is final.
+                attempts = self.store.defer(item, f"libgen answered empty ({match.reason})")
+                if attempts < MAX_ATTEMPTS:
+                    logger.info("Empty libgen answer for %r; retrying later (%d/%d)",
+                                item.title, attempts, MAX_ATTEMPTS)
+                    result.deferred += 1
+                    return
             outcome = _REASON_TO_OUTCOME.get(match.reason, Outcome.NO_MATCH)
             self.store.record(item, outcome, reason=match.reason)
             if outcome is Outcome.SKIPPED:
@@ -249,32 +298,50 @@ class GoodreadsSync:
             )
             return
 
-        response = await self.ingest(
-            md5=match.candidate.md5, title=item.title, author=item.author,
-        )
+        ranked = rank_candidates(item, candidates, isbn_matched_md5s=isbn_md5s)
+        refusals: list[str] = []
+        for candidate, reason in ranked[:MAX_CANDIDATES]:
+            # The endpoint asks Claude about the record, downloads, then asks
+            # about the file itself; "rejected" means either answer was not yes.
+            response = await self.ingest(
+                md5=candidate.md5, title=item.title, author=item.author,
+                details=verify_details(item, candidate),
+            )
+            status = response.get("status")
 
-        if response.get("status") == "duplicate":
-            self.store.record(item, Outcome.OWNED, reason="already in Calibre",
-                              md5=match.candidate.md5)
-            await self._say(result, format_owned(item))
+            if status == "rejected":
+                refusals.append(response.get("reason") or "no reason given")
+                logger.info("Claude refused %s for %r (%s): %s", candidate.md5[:8],
+                            item.title, response.get("stage"), refusals[-1])
+                continue
+
+            if status == "duplicate":
+                self.store.record(item, Outcome.OWNED, reason="already in Calibre",
+                                  md5=candidate.md5)
+                await self._say(result, format_owned(item))
+                return
+
+            book_id = response.get("book_id")
+            self.store.record(item, Outcome.DOWNLOADED, reason=reason,
+                              md5=candidate.md5, calibre_id=book_id)
+            result.downloaded += 1
+            # Forwarding to the Kindle is the ingest endpoint's job — it holds the
+            # SMTP credentials and knows which formats actually landed in Calibre —
+            # so this only reports what it did. A response with none of these fields
+            # means forwarding is switched off, and the line reads as it always did.
+            if response.get("kindle_sent"):
+                result.sent_to_kindle += 1
+            await self._say(result, format_success(
+                item, candidate.ext, reason,
+                kindle_sent=bool(response.get("kindle_sent")),
+                kindle_error=response.get("kindle_error"),
+                kindle_skipped=response.get("kindle_skipped"),
+            ))
             return
 
-        book_id = response.get("book_id")
-        self.store.record(item, Outcome.DOWNLOADED, reason=match.reason,
-                          md5=match.candidate.md5, calibre_id=book_id)
-        result.downloaded += 1
-        # Forwarding to the Kindle is the ingest endpoint's job — it holds the
-        # SMTP credentials and knows which formats actually landed in Calibre —
-        # so this only reports what it did. A response with none of these fields
-        # means forwarding is switched off, and the line reads as it always did.
-        if response.get("kindle_sent"):
-            result.sent_to_kindle += 1
-        await self._say(result, format_success(
-            item, match.candidate.ext, match.reason,
-            kindle_sent=bool(response.get("kindle_sent")),
-            kindle_error=response.get("kindle_error"),
-            kindle_skipped=response.get("kindle_skipped"),
-        ))
+        self.store.record(item, Outcome.REJECTED, reason="; ".join(refusals)[:500])
+        result.missed += 1
+        await self._say(result, format_rejected(item, refusals))
 
     async def _gather_candidates(self, item: ShelfItem, source=None, required: bool = True):
         """Collect candidates from a source, ISBN first.
@@ -285,18 +352,23 @@ class GoodreadsSync:
         `required=False` marks an optional source — an outage there is swallowed,
         because it must not turn a book the primary already answered for into a
         deferred one.
+
+        The third value says whether libgen answered emptily somewhere it should
+        not have: an ISBN lookup with no files, or no files for any query.
         """
         if is_placeholder(item.title):
-            return [], set()
+            return [], set(), False
 
         source = source or self.source
         candidates, isbn_md5s = [], set()
+        isbn_empty = False
 
         try:
             if item.isbn:
                 by_isbn = await source.search_by_isbn(item.isbn)
                 candidates.extend(by_isbn)
                 isbn_md5s = {c.md5 for c in by_isbn}
+                isbn_empty = not by_isbn
 
             for query in search_queries(item):
                 candidates.extend(await source.search_candidates(query))
@@ -306,9 +378,9 @@ class GoodreadsSync:
             if required:
                 raise
             logger.info("Optional source unavailable for %r; continuing", item.title)
-            return [], set()
+            return [], set(), False
 
         deduped = {}
         for candidate in candidates:
             deduped.setdefault(candidate.md5, candidate)
-        return list(deduped.values()), isbn_md5s
+        return list(deduped.values()), isbn_md5s, isbn_empty or not deduped

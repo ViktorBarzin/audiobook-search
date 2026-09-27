@@ -5,6 +5,12 @@ and rejections are checked by hand once, over a real sample, before downloads ar
 switched on. Nothing here writes to Calibre, Slack or the database.
 
     python -m backend.goodreads.replay --limit 50
+    python -m backend.goodreads.replay --limit 50 --verify --json
+
+--verify runs the live gate too: Claude checks each ranked candidate's record,
+the file is downloaded into memory, Claude checks its contents, and the first
+candidate passing both is the pick. Files are never written or imported. It
+needs CLAUDE_AGENT_URL and CLAUDE_AGENT_TOKEN, so run it in the book-search pod.
 """
 
 from __future__ import annotations
@@ -12,25 +18,74 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 import httpx
 
 from backend.goodreads.feed import fetch_shelf
-from backend.goodreads.matcher import is_placeholder, select_candidate
+from backend.goodreads.matcher import is_placeholder, rank_candidates, select_candidate
 from backend.goodreads.sources import SourceUnavailable
-from backend.goodreads.sync import search_queries
+from backend.goodreads.sync import MAX_CANDIDATES, search_queries, verify_details
+from backend.goodreads.verify import (
+    ClaudeVerifier,
+    VerifierUnavailable,
+    extract_evidence,
+    offered_from,
+    wanted_from,
+)
 from backend.libgen import LibGenScraper
 
 GREEN, YELLOW, RED, DIM, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
 
-async def replay(user_id: str, shelf: str, limit: int, as_json: bool) -> int:
+async def run_gate(item, candidates, isbn_md5s, source, verifier) -> dict:
+    """Walk the ranked candidates through both Claude checks, as the endpoint does."""
+    steps = []
+    for candidate, reason in rank_candidates(item, candidates, isbn_md5s)[:MAX_CANDIDATES]:
+        details = verify_details(item, candidate)
+        wanted, offered = wanted_from(item.title, item.author, details), offered_from(details)
+        step = {"md5": candidate.md5, "title": candidate.title, "author": candidate.author,
+                "ext": candidate.ext, "language": candidate.language, "matched_by": reason}
+        steps.append(step)
+        try:
+            verdict = await verifier.check_record(wanted, offered)
+            step["record"] = ("yes: " if verdict.ok else "no: ") + verdict.reason
+            if not verdict.ok:
+                continue
+            data, filename = await source.download_file(candidate.md5)
+            if not data:
+                step["file"] = "download failed"
+                continue
+            ext = filename.rsplit(".", 1)[-1] if filename and "." in filename else candidate.ext
+            evidence = extract_evidence(data, ext)
+            del data
+            if evidence is None:
+                step["file"] = f"not readable ({ext}); record check only"
+                return {"accepted": step, "steps": steps}
+            step["file_says"] = f"{evidence.title} / {evidence.author} / {evidence.language}"
+            verdict = await verifier.check_file(wanted, offered, evidence)
+            step["file"] = ("yes: " if verdict.ok else "no: ") + verdict.reason
+            if verdict.ok:
+                return {"accepted": step, "steps": steps}
+        except VerifierUnavailable as exc:
+            step["error"] = f"Claude unavailable: {exc}"
+            return {"accepted": None, "steps": steps, "unavailable": True}
+    return {"accepted": None, "steps": steps}
+
+
+async def replay(user_id: str, shelf: str, limit: int, as_json: bool,
+                 verify: bool = False) -> int:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         feed = await fetch_shelf(client, user_id, shelf, per_page=100)
 
     items = feed.items[:limit]
     source = LibGenScraper()
+    verifier = ClaudeVerifier(os.getenv("CLAUDE_AGENT_URL", ""),
+                              os.getenv("CLAUDE_AGENT_TOKEN", "")) if verify else None
+    if verify and not verifier.configured:
+        print("--verify needs CLAUDE_AGENT_URL and CLAUDE_AGENT_TOKEN", file=sys.stderr)
+        return 2
     rows = []
 
     for item in items:
@@ -59,7 +114,14 @@ async def replay(user_id: str, shelf: str, limit: int, as_json: bool) -> int:
         match = select_candidate(item, candidates, isbn_matched_md5s=isbn_md5s)
         if unavailable and match.candidate is None:
             match = type(match)(None, "source_unavailable")
+        gate = None
+        if verifier and match.candidate:
+            gate = await run_gate(item, candidates, isbn_md5s, source, verifier)
+            print(f"  gate {item.title[:40]!r}: "
+                  f"{'ACCEPT ' + gate['accepted']['md5'][:8] if gate['accepted'] else 'REFUSE'}",
+                  file=sys.stderr)
         rows.append({
+            "gate": gate,
             "goodreads_title": item.title,
             "goodreads_author": item.author,
             "isbn": item.isbn,
@@ -105,8 +167,10 @@ def main() -> int:
     parser.add_argument("--shelf", default="to-read")
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--verify", action="store_true",
+                        help="run the Claude checks and download picks into memory")
     args = parser.parse_args()
-    return asyncio.run(replay(args.user_id, args.shelf, args.limit, args.json))
+    return asyncio.run(replay(args.user_id, args.shelf, args.limit, args.json, args.verify))
 
 
 if __name__ == "__main__":

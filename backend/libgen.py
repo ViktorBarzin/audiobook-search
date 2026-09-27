@@ -282,7 +282,10 @@ class LibGenScraper:
                 "req": query,
                 "columns[]": ["t", "a"],
                 "objects[]": "f",
-                "topics[]": "l",
+                # l = the main (mostly non-fiction) collection, f = fiction.
+                # Asking for l alone hid every novel on Anca's shelf: six books
+                # between 2026-09-08 and 2026-09-27 missed while libgen had them.
+                "topics[]": ["l", "f"],
                 "res": "25",
             },
             what=repr(query),

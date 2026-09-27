@@ -14,6 +14,7 @@ import time
 import httpx
 
 from backend.goodreads.feed import FeedError, FeedStatus, fetch_all, fetch_shelf
+from backend.goodreads.sources import SourceUnavailable
 from backend.goodreads.store import MemorySeenStore, PostgresSeenStore
 from backend.goodreads.sync import DELAY_BETWEEN_BOOKS_S, GoodreadsSync
 from backend.libgen import LibGenScraper
@@ -63,13 +64,21 @@ def build_notifier(client: httpx.AsyncClient):
 
 
 def build_ingest(client: httpx.AsyncClient):
-    async def ingest(*, md5: str, title: str, author: str) -> dict:
+    async def ingest(*, md5: str, title: str, author: str, details: dict | None = None) -> dict:
+        body = {"md5": md5, "title": title, "author": author, "shelf_id": SHELF_ID}
+        if details is not None:
+            # Asks the endpoint to run the Claude check before and after download.
+            body["verify"] = details
         response = await client.post(
             f"{BOOK_SEARCH_URL}/api/goodreads/ingest",
-            json={"md5": md5, "title": title, "author": author, "shelf_id": SHELF_ID},
+            json=body,
             headers={"X-Api-Key": API_KEY},
-            timeout=600,
+            # Two Claude answers can each wait behind other agents' work.
+            timeout=1200,
         )
+        if response.status_code == 503:
+            # The Claude check could not answer: a delay, not a verdict.
+            raise SourceUnavailable(f"ingest unavailable: {response.text[:200]}")
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
         return response.json()

@@ -31,7 +31,9 @@ _SIZE_UNITS = {"b": 1, "kb": 1_000, "mb": 1_000_000, "gb": 1_000_000_000}
 _MD5_RE = re.compile(r"md5=([a-f0-9]{32})", re.IGNORECASE)
 
 # Column layout of the libgen.li file table.
-_COL_TITLE, _COL_AUTHOR, _COL_LANG, _COL_SIZE, _COL_EXT = 0, 1, 4, 6, 7
+_COL_TITLE, _COL_AUTHOR, _COL_PUBLISHER, _COL_YEAR, _COL_LANG, _COL_SIZE, _COL_EXT = (
+    0, 1, 2, 3, 4, 6, 7
+)
 _MIN_COLS = 9
 
 
@@ -83,6 +85,8 @@ def rows_to_candidates(html: str, source: str = "libgen") -> list[Candidate]:
             language=cell(_COL_LANG) or None,
             size_bytes=parse_size_bytes(cell(_COL_SIZE)),
             source=source,
+            publisher=cell(_COL_PUBLISHER) or None,
+            year=cell(_COL_YEAR) or None,
         ))
 
     return candidates
