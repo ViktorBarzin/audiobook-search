@@ -300,13 +300,27 @@ class GoodreadsSync:
 
         ranked = rank_candidates(item, candidates, isbn_matched_md5s=isbn_md5s)
         refusals: list[str] = []
+        failure: Exception | None = None
         for candidate, reason in ranked[:MAX_CANDIDATES]:
             # The endpoint asks Claude about the record, downloads, then asks
             # about the file itself; "rejected" means either answer was not yes.
-            response = await self.ingest(
-                md5=candidate.md5, title=item.title, author=item.author,
-                details=verify_details(item, candidate),
-            )
+            try:
+                response = await self.ingest(
+                    md5=candidate.md5, title=item.title, author=item.author,
+                    details=verify_details(item, candidate),
+                )
+            except SourceUnavailable:
+                # Claude or the endpoint is down: the next file would meet the
+                # same outage, so the whole book waits for a later cycle.
+                raise
+            except Exception as exc:
+                # A broken file (libgen's mirror cut Release Me off at 2 of 2.8
+                # MB on every attempt, 2026-09-27) says nothing about the other
+                # copies on offer, so try the next one before waiting.
+                failure = exc
+                logger.warning("Fetching %s for %r failed; trying the next file: %s",
+                               candidate.md5[:8], item.title, exc)
+                continue
             status = response.get("status")
 
             if status == "rejected":
@@ -338,6 +352,11 @@ class GoodreadsSync:
                 kindle_skipped=response.get("kindle_skipped"),
             ))
             return
+
+        if failure is not None:
+            # At least one file never arrived, so it may still be the book: the
+            # refusals so far are not the last word, and the book waits.
+            raise failure
 
         self.store.record(item, Outcome.REJECTED, reason="; ".join(refusals)[:500])
         result.missed += 1

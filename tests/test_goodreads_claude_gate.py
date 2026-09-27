@@ -193,3 +193,51 @@ async def test_a_miss_with_a_real_isbn_answer_is_final_straight_away():
 
     assert result.missed == 1
     assert store.outcome("2") == Outcome.NO_MATCH
+
+
+# --------------------------------------------------------------------------- #
+# A download that keeps breaking moves on to the next file                     #
+# --------------------------------------------------------------------------- #
+
+async def test_a_failed_download_tries_the_next_candidate_in_the_same_cycle():
+    """libgen's mirror answered 503 three times for Romanov's first file on
+    2026-09-27 while five other copies of the same book were on offer."""
+    first, second, *_ = four_copies()
+    ingest = ScriptedIngest({first.md5: RuntimeError("HTTP 502: download failed")})
+    sync, store, notifier = await seeded_sync(CountingSource([first, second]), ingest)
+    book = shelf_item("2", title="Romanov", author="Nadine Brandes", isbn=None)
+
+    result = await sync.process([book])
+
+    assert [c["md5"] for c in ingest.calls] == [first.md5, second.md5]
+    assert result.downloaded == 1
+    assert store.outcome("2") == Outcome.DOWNLOADED
+
+
+async def test_when_every_candidate_fails_to_download_the_book_waits_for_a_later_cycle():
+    first, second, *_ = four_copies()
+    ingest = ScriptedIngest({first.md5: RuntimeError("HTTP 502: download failed"),
+                             second.md5: RuntimeError("HTTP 502: download failed")})
+    sync, store, notifier = await seeded_sync(CountingSource([first, second]), ingest)
+    book = shelf_item("2", title="Romanov", author="Nadine Brandes", isbn=None)
+
+    result = await sync.process([book])
+
+    assert result.deferred == 1
+    assert store.outcome("2") == Outcome.PENDING
+    assert notifier.messages == []
+
+
+async def test_a_refusal_plus_a_failed_download_is_not_a_final_refusal():
+    """One file was refused, the other never arrived: the second might still
+    be the book, so the book waits rather than being reported as refused."""
+    first, second, *_ = four_copies()
+    ingest = ScriptedIngest({first.md5: {"status": "rejected", "stage": "file", "reason": "sample"},
+                             second.md5: RuntimeError("HTTP 502: download failed")})
+    sync, store, notifier = await seeded_sync(CountingSource([first, second]), ingest)
+    book = shelf_item("2", title="Romanov", author="Nadine Brandes", isbn=None)
+
+    result = await sync.process([book])
+
+    assert result.deferred == 1
+    assert store.outcome("2") == Outcome.PENDING
