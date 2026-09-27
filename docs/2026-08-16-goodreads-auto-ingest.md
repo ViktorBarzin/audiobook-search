@@ -1,17 +1,19 @@
 # Goodreads → Calibre auto-ingest for Anca
 
-**Status:** built and live · **Date:** 2026-08-16 · **Owner:** Viktor
+**Status:** built and live · **Date:** 2026-08-16, revised 2026-09-27 · **Owner:** Viktor
 **Repo:** `book-search` · **Namespace:** `ebooks`
 
 ## What this delivers
 
-When Anca adds a book to her Goodreads `to-read` shelf, it is found, downloaded, imported
-into Calibre and placed on a shelf owned by her calibre-web account — within about two
-minutes, with nobody in the loop. She does nothing differently; she keeps using Goodreads
-exactly as she does today.
+When Anca adds a book to her Goodreads `to-read` shelf, it is found, checked by Claude,
+downloaded, imported into Calibre, placed on a shelf owned by her calibre-web account and
+sent to her Kindle, with nobody in the loop. She does nothing differently; she keeps using
+Goodreads exactly as she does today.
 
-Scope boundaries: Kindle sending stays manual, there is no review or approval step, and the
-existing interactive book-search UI behaves exactly as it does today.
+Scope boundaries: there is no human review or approval step (the Claude check added on
+2026-09-27 takes that role), and the existing interactive book-search UI behaves exactly as
+it does today. Kindle sending started manual and became automatic on 2026-08-21; see
+[Kindle forwarding](#kindle-forwarding) and the [2026-09-27 review](#review-2026-09-27).
 
 ## Starting state (verified live, 2026-08-15/16)
 
@@ -92,9 +94,9 @@ book-search already uses can write to a public shelf owned by her user.
 |---|---|
 | Trigger shelf | `to-read` |
 | Existing 576 books | Seeded as already-seen; no downloads. Backfill stays available as an explicit command |
-| Destination | Calibre library + a shelf owned by her CWA user. No automatic Kindle send |
-| Not-confident match | Skip. No review queue — the pipeline is fully autonomous |
-| Retry policy | One attempt per book |
+| Destination | Calibre library + a shelf owned by her CWA user, then her Kindle (automatic since 2026-08-21; skips books already in Calibre, pdf-only books and files over 14 MB) |
+| Not-confident match | Skip. No human review queue; since 2026-09-27 a Claude check confirms each confident match, up to three candidates per book |
+| Retry policy | One attempt per book; outages, and since 2026-09-27 empty libgen answers, are retried on later cycles, up to three rounds |
 | Placement | New module in `book-search`, run as a small always-on poller |
 | Watch cadence | 2-minute loop using conditional GET |
 | State store | Shared Postgres (`pg-cluster`, ns `dbaas`) |
@@ -114,7 +116,9 @@ flowchart TD
     P["goodreads-sync poller<br/>2-min loop, If-None-Match"]
     DB[("Postgres goodreads_seen<br/>ns dbaas")]
     M["Matcher<br/>ISBN → title+author"]
-    LG["LibGen<br/>search + ads.php→get.php"]
+    LG["LibGen<br/>fiction + non-fiction search, ads.php→get.php"]
+    CL["Claude check<br/>claude-agent-service<br/>record, then file"]
+    KI["Anca's Kindle<br/>via mail relay"]
     AA["Anna's Archive<br/>domains via Wikipedia"]
     VPN["NordVPN egress<br/>gluetun UK, HTTP proxy"]
     BS["book-search /download<br/>dedupe → ingest dir"]
@@ -131,10 +135,12 @@ flowchart TD
     AA -.->|"blocked by IP"| VPN
     VPN -.-> LG
     VPN -.-> AA
-    M -->|"confident match"| BS
-    M -->|"no match / rejected"| DB
+    M -->|"confident match, up to 3"| BS
+    M -->|"no match / refused"| DB
+    BS <-->|"yes / no"| CL
     BS --> CWA
     CWA -->|"book_id"| SH
+    SH --> KI
     BS --> SL
     SH --> SL
 ```
@@ -174,9 +180,19 @@ Applied per item; anything not clearing the bar is recorded and skipped.
    The author surname must match, and the normalized title must match in full rather than by
    prefix or substring.
 5. **Sanity filters.** Reject rows whose parsed cells contain HTML fragments, rows below the
-   existing 5 KB floor, and any row whose language is not English.
-6. **File choice** among surviving candidates: epub → azw3/mobi/fb2 → pdf, then the largest
-   plausible file.
+   existing 5 KB floor, and any row whose language is not English. A blank language counts as
+   unknown rather than foreign (since 2026-09-27): such a row is accepted only on a full title
+   and author match, never on an ISBN hit alone.
+6. **File choice** among surviving candidates: named English before unknown language, then
+   epub → azw3/mobi/fb2 → pdf, then the largest plausible file.
+7. **Claude check** (since 2026-09-27). The top three confident candidates go, in order, to
+   the ingest endpoint, which asks Claude whether the libgen record is the book she shelved,
+   downloads it, then asks again with the file's own metadata and opening text (epub, fb2 and
+   pdf; mobi and azw3 rely on the record check). Only a clear "yes" imports the book. See
+   [the 2026-09-27 review](#review-2026-09-27).
+
+The title search covers both of libgen's collections, `topics[]=l` (main) and `f` (fiction).
+Until 2026-09-27 it asked for `l` alone, which hid most novels.
 
 Everything downstream of the match reuses existing code: `/download` with `source=libgen`,
 `_publish_ingest_file()`, the CWA HTTP upload, `_wait_for_calibre()` for the `book_id`, then
@@ -227,17 +243,18 @@ since LibGen currently carries the whole pipeline.
 ## Reporting
 
 Every book she adds produces exactly one line in `#alerts`, and nothing is said on quiet
-cycles. Silence for a book that was handled reads as though nothing happened, so all four
-outcomes speak:
+cycles. Silence for a book that was handled reads as though nothing happened, so every
+outcome speaks:
 
 | Outcome | Message |
 |---|---|
-| Downloaded | `📖 Title — Author → Anca's shelf (epub, matched by isbn)` |
+| Downloaded | `📖 Title — Author → Anca's shelf + Kindle (epub, matched by isbn)`, plus a note when the Kindle send was skipped or failed |
 | Already held | `📚 Title — Author: already in Calibre, nothing to fetch` |
 | Not found | `🔎 Title — Author` + an Anna's Archive search link + the ISBN |
+| Refused by the Claude check | `🔎 Title — Author` + "Claude refused all N candidates (last: reason)" + the same link |
 | Given up after retries | `⚠️ Title — Author` + the same search link |
 
-The two failure messages carry a ready-made Anna's Archive search because that is what
+The failure messages carry a ready-made Anna's Archive search because that is what
 happens next: AA only answers a person in a browser, so Viktor opens the link, finds the
 book by hand, and shares it back (see below). Repeated errors — a source down, the feed
 unreachable — are posted once and suppressed until the condition changes, so a broken
@@ -290,6 +307,8 @@ Re-running the gate at any time:
 
 ```sh
 python3 -m backend.goodreads.replay --limit 50
+# with the Claude check and in-memory downloads (run in the book-search pod):
+python3 -m backend.goodreads.replay --limit 50 --verify --json
 ```
 
 ## What we learned building it
@@ -393,16 +412,83 @@ number counted matches a strict matcher correctly refuses. Of 50 recent shelf it
 21 download, 20 are absent from LibGen, 8 have no confident match, 1 is an unpublished
 placeholder.
 
+## Kindle forwarding
+
+Shipped off on 2026-08-16 and switched on 2026-08-21: every book the pipeline fetches is
+emailed from Calibre to Anca's Kindle address through the mail relay (Brevo). Three kinds of
+book are deliberately not sent, and each is named in its `#alerts` line: a book that was
+already in Calibre before she shelved it (it may already be on her device), a pdf-only book
+(it does not reflow on a 6-inch screen), and a file over 14 MB (Brevo refuses messages over
+20 MB once the attachment is encoded). Viktor reconfirmed this scope on 2026-09-27; other
+routes into Calibre (phone shares, direct uploads) keep their own choice of recipient.
+
+## Review, 2026-09-27
+
+Viktor asked for a check that the pipeline still delivers to her Kindle.
+
+**What was working.** The poller, the feed check, Calibre import, shelving and the Kindle
+send. Brevo's event log shows *Believe Me* delivered to her Kindle address at 03:23 BST on
+2026-08-27, twelve seconds after it reached Calibre.
+
+**What was not.** Every book she added from 2026-09-08 to 2026-09-27 (eight in a row)
+missed, and none reached Calibre by hand afterwards. Six of the seven English ones were on
+LibGen with a matching English epub. The title search asked for `topics[]=l`, LibGen's main
+collection, which leaves out its fiction collection, and her shelf is mostly novels. This had
+been the case since launch; *The Tokyo Zodiac Murders*, which needed fetching by hash in
+August, is found by the title search now. Two smaller faults showed up alongside it: LibGen
+sometimes answers an ISBN lookup with an empty page that looks exactly like a real absence
+(the same lookup returned six files seconds later), and two matcher rules refused correct
+rows (an ISBN-10 ending in X inside a title, and a blank language field read as foreign).
+
+**What changed.**
+
+| Change | Why |
+|---|---|
+| Search both collections, `l` and `f` | Her novels live in `f` |
+| Empty answers retried on later cycles, up to three rounds | An empty page is not proof of absence |
+| ISBN-10 check letter treated as bookkeeping; blank language treated as unknown | Both refused correct books |
+| Claude check before and after download, up to three candidates | Viktor asked for a second opinion on each pick |
+
+The Claude check runs in the ingest endpoint, through claude-agent-service's chat endpoint
+with the token book-search already holds for its rescue agent. It asks about the LibGen
+record first, so a refused file is never downloaded, and then about the downloaded file's
+own metadata and opening text. Only a clear "yes" imports the book. If Claude cannot be
+reached, the book waits for a later cycle rather than going through unchecked.
+
+**Go-live replay.** The gate ran over the 50 newest shelf items with the new code, with
+downloads held in memory only, and every pick was checked by hand:
+
+```stats
+28 | picks accepted, all correct
+1 | wrong pick caught by Claude
+2 | picks held up by LibGen download errors
+67% | of English books now arrive (was 42%)
+```
+
+The caught pick was *Medea*: the matcher accepted "Medea: SparkNotes Literature Guide"
+(the title matches once the subtitle is dropped, and the author cell names Euripides), and
+Claude refused it as a study guide. The two download errors were LibGen's mirror closing
+connections and answering 503; Claude had already said yes to both records, and live they
+are retried on a later cycle. Of the 19 skipped items, 5 are Romanian titles, 8 are not on
+LibGen, and 6 are omnibus editions or much-translated classics the strict title rule
+declines, as it did before.
+
+**Open questions.** The retries of the eight missed books are the first live runs of the
+Claude check; their outcome is recorded below once they finish.
+
 ## Known limitations
 
 These follow from decisions above and are recorded so they are not surprises later.
 
 - **New releases are usually missed.** Books published within the last few months are often
   absent from LibGen; one attempt per book means a title that appears later is not picked up.
-  *May We Feed the King*, which she shelved on 9 August, is an example.
+  *May We Feed the King*, which she shelved on 9 August, was first recorded as an example of
+  this; the 2026-09-27 review found the fiction-collection gap may explain it instead.
 - **Romanian and French titles are skipped** under the English-only rule; two of her last 25
   additions fall into this group.
-- **A pdf-only book is delivered as a pdf**, which reads poorly on a Kindle even though the
-  import counts as a success.
+- **A pdf-only book is delivered as a pdf** to Calibre and her shelf, and is not sent to her
+  Kindle, where it would read poorly.
+- **A scanned pdf, a mobi or an azw3 gets the record check only**, since the Claude check has
+  no text to read in them.
 - **The library is shared**, so her wishlist books appear in the same 410-book library you
   use. The shelf distinguishes them; the library does not.
