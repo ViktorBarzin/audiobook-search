@@ -47,14 +47,13 @@ Decisions the design adds:
 
 ```mermaid
 flowchart TD
-  A["Photo<br/>shortcut (share or camera) or web upload"] --> B["Claude reads the cover<br/>title, author, language, ISBN if printed"]
-  B -->|"no readable book"| X["⚠️ what Claude could read<br/>nothing downloaded"]
-  B --> C{"already in Calibre?"}
-  C -->|yes| K["send that copy<br/>24 h send guard"]
-  C -->|no| D["matcher, in the cover's language"]
-  D --> E["Claude check<br/>record, then file"]
-  E --> F["share ending<br/>Calibre, Kindle, one ✅ or ⚠️ line"]
-  D -->|"no_route or refused"| R["free retry after 15 min<br/>then book-rescuer"]
+  A["Photo"] --> B["Claude reads the cover<br/>unreadable: ⚠️, stop"]
+  B --> C{"in<br/>Calibre?"}
+  C -->|no| D["matcher,<br/>cover's<br/>language"]
+  D --> E["Claude<br/>check"]
+  E --> F["share ending<br/>✅ or ⚠️"]
+  C -->|yes| K["send<br/>copy"]
+  D -->|"no file"| R["retry,<br/>rescuer"]
 ```
 
 The ✅ or ⚠️ line names the book Claude read, so a misread cover is visible on
