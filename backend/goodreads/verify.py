@@ -26,6 +26,7 @@ from xml.etree import ElementTree as ET
 import httpx
 from bs4 import BeautifulSoup
 
+from backend.goodreads.matcher import canonical_language
 from backend.goodreads.sources import SourceUnavailable
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,22 @@ in English.
 Say "unsure" when the evidence is not enough to tell."""
 
 
+def _language_name(language: str | None) -> str:
+    """"Bulgarian" for "bg" or "bulgarian"; English when nothing was asked for."""
+    return (canonical_language(language) or "english").title()
+
+
+def system_prompt(language: str | None = None) -> str:
+    """The rules, for a book wanted in `language`. English gets SYSTEM_PROMPT
+    unchanged; a photo share of a Bulgarian cover wants the Bulgarian text."""
+    name = _language_name(language)
+    if name == "English":
+        return SYSTEM_PROMPT
+    return (SYSTEM_PROMPT
+            .replace("an English translation", f"a translation into {name}")
+            .replace("not in English", f"not in {name}"))
+
+
 class VerifierUnavailable(SourceUnavailable):
     """Claude could not give a verdict: the book waits for a later cycle."""
 
@@ -66,13 +83,17 @@ class Verdict:
 
 @dataclass
 class WantedBook:
-    """The book as Goodreads describes it."""
+    """The book as the reader asked for it: a Goodreads row or a cover photo."""
 
     title: str
     author: str | None
     isbn: str | None = None
     published: str | None = None
     description: str | None = None
+    # The language the reader wants the text in; None means English.
+    language: str | None = None
+    # Where the request came from: "goodreads" or "photo".
+    source: str = "goodreads"
 
 
 @dataclass
@@ -110,9 +131,13 @@ def _lines(pairs) -> str:
 
 def _wanted_block(wanted: WantedBook) -> str:
     description = (wanted.description or "")[:MAX_DESCRIPTION_CHARS]
-    return "WANTED (from the reader's Goodreads shelf)\n" + _lines([
+    where = ("read from a photo of the book's cover" if wanted.source == "photo"
+             else "from the reader's Goodreads shelf")
+    language = _language_name(wanted.language) if wanted.language else None
+    return f"WANTED ({where})\n" + _lines([
         ("Title", wanted.title), ("Author", wanted.author), ("ISBN", wanted.isbn),
-        ("First published", wanted.published), ("Description", description),
+        ("Language", language), ("First published", wanted.published),
+        ("Description", description),
     ])
 
 
@@ -143,7 +168,7 @@ def file_prompt(wanted: WantedBook, offered: OfferedFile, evidence: FileEvidence
     return (f"{_wanted_block(wanted)}\n\n{_offered_block(offered)}\n\n"
             f"{_evidence_block(evidence)}\n\n"
             "The file has been downloaded. Judge by what the file itself contains: "
-            "is it the wanted book, in English?")
+            f"is it the wanted book, in {_language_name(wanted.language)}?")
 
 
 _OBJECT_RE = re.compile(r"\{.*\}", re.S)
@@ -183,19 +208,19 @@ class ClaudeVerifier:
         return bool(self.url and self.token)
 
     async def check_record(self, wanted: WantedBook, offered: OfferedFile) -> Verdict:
-        return await self._ask(record_prompt(wanted, offered))
+        return await self._ask(record_prompt(wanted, offered), wanted.language)
 
     async def check_file(self, wanted: WantedBook, offered: OfferedFile,
                          evidence: FileEvidence) -> Verdict:
-        return await self._ask(file_prompt(wanted, offered, evidence))
+        return await self._ask(file_prompt(wanted, offered, evidence), wanted.language)
 
-    async def _ask(self, prompt: str) -> Verdict:
+    async def _ask(self, prompt: str, language: str | None = None) -> Verdict:
         if not self.configured:
             raise VerifierUnavailable("Claude check is not configured")
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt(language)},
                 {"role": "user", "content": prompt},
             ],
         }
