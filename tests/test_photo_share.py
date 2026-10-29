@@ -465,3 +465,12 @@ def test_photos_older_than_a_week_are_deleted(world, state_dir):
 
     assert not old.exists()
     assert new.exists()
+
+
+def test_the_web_page_offers_the_photo_upload_and_the_recipients(world):
+    page = TestClient(bs_main.app).get("/").text
+
+    assert 'id="photoInput"' in page
+    assert 'accept="image/*"' in page
+    assert '<option value="anca">Anca\'s Kindle</option>' in page
+    assert "__PHOTO_RECIPIENTS__" not in page

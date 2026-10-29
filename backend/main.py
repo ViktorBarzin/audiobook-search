@@ -2,6 +2,7 @@ import os
 import asyncio
 import hashlib
 import hmac
+import html
 import io
 import json
 import logging
@@ -5073,6 +5074,63 @@ async def web_ui():
         .search-box button:hover { background: #d4a044; }
         .search-box button:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
 
+        /* ── Photo share ── */
+        .photo-share {
+            margin-top: 16px;
+            padding: 14px 16px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            background: var(--bg-card);
+        }
+        .photo-share-head {
+            font-size: 13px;
+            color: var(--text-dim);
+            margin-bottom: 10px;
+        }
+        .photo-share-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: stretch;
+        }
+        .photo-share-row > * {
+            font-family: var(--font-body);
+            font-size: 15px;
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border);
+            background: var(--bg-input);
+            color: var(--text-bright);
+            padding: 10px 14px;
+            min-height: 44px;
+        }
+        .photo-pick {
+            flex: 1 1 180px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+        .photo-share-row select { flex: 0 1 180px; }
+        .photo-share-row button {
+            flex: 0 0 auto;
+            border: none;
+            background: var(--accent-amber);
+            color: var(--bg-deep);
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .photo-share-row button:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
+        .photo-result {
+            margin-top: 10px;
+            font-size: 15px;
+            color: var(--text-bright);
+            min-height: 1.2em;
+            overflow-wrap: anywhere;
+        }
+        .photo-result:empty { display: none; }
+
         /* ── Filter Tabs ── */
         .filter-tabs {
             display: flex;
@@ -5619,6 +5677,19 @@ async def web_ui():
             <div class="filter-tabs" id="sourceFilterTabs" style="display:none">
                 <button class="filter-tab active" data-source="all" onclick="setSourceFilter(this)">All Sources</button>
             </div>
+            <div class="photo-share">
+                <div class="photo-share-head">Or get a book from a photo of its front cover</div>
+                <div class="photo-share-row">
+                    <label class="photo-pick" for="photoInput"><span id="photoName">Choose or take a photo</span></label>
+                    <input type="file" id="photoInput" accept="image/*" hidden onchange="photoChosen()">
+                    <select id="photoRecipient" aria-label="Send to">
+                        <option value="">Calibre only</option>
+                        __PHOTO_RECIPIENTS__
+                    </select>
+                    <button id="photoBtn" onclick="sendPhoto()" disabled>Get this book</button>
+                </div>
+                <div id="photoResult" class="photo-result" aria-live="polite"></div>
+            </div>
         </div>
 
         <div id="sourcesBar" class="sources-bar"></div>
@@ -5651,6 +5722,43 @@ async def web_ui():
 </div>
 
 <script>
+    function photoChosen() {
+        const file = document.getElementById('photoInput').files[0];
+        document.getElementById('photoName').textContent = file ? file.name : 'Choose or take a photo';
+        document.getElementById('photoBtn').disabled = !file;
+    }
+
+    async function sendPhoto() {
+        const file = document.getElementById('photoInput').files[0];
+        if (!file) return;
+        const btn = document.getElementById('photoBtn');
+        const result = document.getElementById('photoResult');
+        btn.disabled = true;
+        result.textContent = 'Uploading the photo\u2026';
+        const form = new FormData();
+        form.append('photo', file);
+        form.append('deliver_to', document.getElementById('photoRecipient').value);
+        try {
+            const resp = await fetch('/photo-share', {method: 'POST', body: form});
+            const data = await resp.json();
+            result.textContent = data.message || data.detail || 'book-search did not answer.';
+            if (!data.job_id) return;
+            // The same answers the phone gets: each ask holds up to 20 s.
+            for (let i = 0; i < 40; i++) {
+                const started = Date.now();
+                const wait = await fetch('/api/download-status/wait?job_id=' + encodeURIComponent(data.job_id));
+                const text = await wait.text();
+                result.textContent = text;
+                if (text.startsWith('\u2705') || text.startsWith('\u26a0')) return;
+                if (Date.now() - started < 2000) await new Promise(r => setTimeout(r, 5000));
+            }
+        } catch (e) {
+            result.textContent = '\u26a0\ufe0f The upload failed: ' + e.message;
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
     let currentMagnetUrl = null;
     let currentContentType = 'audiobook';
     let currentSource = '';
@@ -6153,4 +6261,8 @@ async def web_ui():
 </body>
 </html>
 """
-    return html_content
+    options = "".join(
+        f'<option value="{html.escape(name)}">{html.escape(name.capitalize())}\'s Kindle</option>'
+        for name in sorted(KINDLE_RECIPIENTS)
+    )
+    return html_content.replace("__PHOTO_RECIPIENTS__", options)
