@@ -121,9 +121,20 @@ class MatchResult:
     reason: str
 
 
+# Pre-reform Cyrillic letters and their modern spelling: Russian before 1918,
+# Bulgarian before 1945. A photo of an old edition reads in the old spelling
+# while libgen lists the book in the modern one.
+_OLD_CYRILLIC = str.maketrans({"ѣ": "е", "і": "и", "ѳ": "ф", "ѵ": "и", "ѫ": "ъ", "ѭ": "ю"})
+# Both orthographies ended every hard-final word in ъ; neither modern one
+# ends a word in it, so dropping it changes no modern title.
+_FINAL_HARD_SIGN_RE = re.compile(r"ъ\b")
+
+
 def _fold(text: str) -> str:
     """Lowercase, strip accents and punctuation, collapse whitespace."""
-    folded = unicodedata.normalize("NFKD", text or "")
+    folded = (text or "").lower().translate(_OLD_CYRILLIC)
+    folded = _FINAL_HARD_SIGN_RE.sub("", folded)
+    folded = unicodedata.normalize("NFKD", folded)
     # Dropping the combining marks turns "é" into "e" as the ASCII fold did,
     # and leaves other scripts' letters in place.
     folded = "".join(ch for ch in folded if not unicodedata.combining(ch))

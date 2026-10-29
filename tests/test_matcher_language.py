@@ -82,3 +82,23 @@ def test_named_language_ranks_before_an_unknown_one():
     ranked = rank_candidates(item("Под игото", "Иван Вазов"), [unknown, named], language="bulgarian")
 
     assert [c.md5 for c, _ in ranked] == ["n" * 32, "u" * 32]
+
+
+@pytest.mark.parametrize("old,modern", [
+    ("Подъ игото", "Под игото"),          # Bulgarian before 1945: a final ъ on every hard ending
+    ("Иванъ Вазовъ", "Иван Вазов"),
+    ("Война и миръ", "Война и мир"),        # Russian before 1918
+    ("Отцы и дѣти", "Отцы и дети"),
+    ("Мѫдрость", "Мъдрость"),
+])
+def test_pre_reform_cyrillic_folds_to_modern_spelling(old, modern):
+    """A photo of an old edition reads in its old spelling; libgen mostly
+    lists the book in the modern one (Под игото, 2026-10-29)."""
+    assert normalize_title(old) == normalize_title(modern)
+
+
+def test_an_old_spelling_cover_matches_modern_rows():
+    match = select_candidate(item("Подъ игото", "Иванъ Вазовъ"),
+                             [cand("Под игото b f 7621785", "Иван Вазов")], language="bulgarian")
+
+    assert match.candidate is not None
