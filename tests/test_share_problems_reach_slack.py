@@ -111,7 +111,7 @@ class FailingLibgen:
 
 
 async def test_a_job_that_fails_posts_one_warning(monkeypatch, slack):
-    async def no_title_match(title, author, skip=frozenset(), want=None):
+    async def no_title_match(title, author, skip=frozenset(), want=None, **kwargs):
         return None, None, None
 
     monkeypatch.setattr(bs_main, "libgen_scraper", FailingLibgen())
