@@ -55,5 +55,20 @@ mail relay.
 _Avoid_: failed send
 
 **Share**:
-A book sent to book-search by hand from a phone, naming its own recipient.
+A book sent to book-search by hand, from the phone shortcut or the web page,
+naming its own recipient. It is a link share or a photo share.
 _Avoid_: shortcut download, manual ingest
+
+**Link share**:
+A share that starts from a book's page on Anna's Archive or libgen.
+_Avoid_: URL share, AA share
+
+**Photo share**:
+A share that starts from a photo of one book's front cover.
+_Avoid_: scan, image search
+
+**Cover reading**:
+What Claude reads off a photographed cover: title, author, the language on the
+cover, and the ISBN when one is printed. The matcher works from it the way the
+Goodreads pipeline works from an addition.
+_Avoid_: recognition, OCR, identification
