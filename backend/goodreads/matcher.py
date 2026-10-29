@@ -31,6 +31,33 @@ MIN_SIZE_BYTES = 5_000
 
 ENGLISH = {"english", "en", "eng"}
 
+# What libgen, Claude and people write for one language, folded. libgen names
+# languages in English ("Bulgarian"); Claude reading a cover may answer with a
+# code or the language's own name. A language missing here still matches when
+# both sides spell it the same way.
+LANGUAGE_ALIASES = {
+    "english": ENGLISH,
+    "bulgarian": {"bg", "bul", "български", "bulgarski"},
+    "russian": {"ru", "rus", "русский"},
+    "ukrainian": {"uk", "ukr", "українська"},
+    "german": {"de", "deu", "ger", "deutsch"},
+    "french": {"fr", "fra", "fre", "francais"},
+    "spanish": {"es", "spa", "espanol", "castellano"},
+    "italian": {"it", "ita", "italiano"},
+    "portuguese": {"pt", "por", "portugues"},
+    "romanian": {"ro", "ron", "rum", "romana"},
+    "greek": {"el", "ell", "gre", "ελληνικα"},
+    "polish": {"pl", "pol", "polski"},
+    "dutch": {"nl", "nld", "dut", "nederlands"},
+    "turkish": {"tr", "tur", "turkce"},
+    "serbian": {"sr", "srp", "српски", "srpski"},
+    "macedonian": {"mk", "mkd", "mac", "македонски"},
+    "japanese": {"ja", "jpn"},
+    "chinese": {"zh", "zho", "chi"},
+}
+_ALIAS_TO_LANGUAGE = {alias: name for name, aliases in LANGUAGE_ALIASES.items()
+                      for alias in (*aliases, name)}
+
 # Words libgen appends to a title that describe the edition rather than the work.
 # Anything outside this set in a trailing position means a different book.
 EDITION_NOISE = {
@@ -53,7 +80,9 @@ HTML_NOISE_RE = re.compile(r"href=|<[a-z]+[ >]|edition\.php|\.php\?", re.IGNOREC
 _SERIES_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
 # 'Book 3', 'Volume 5', 'Part 2' — identifies which book, not which printing.
 _VOLUME_RE = re.compile(r"^(books?|vols?|volumes?|parts?|no)\s*\d+")
-_PUNCT_RE = re.compile(r"[^a-z0-9 ]")
+# Letters of any script survive: a Bulgarian title is all Cyrillic, and folding
+# it to ASCII left nothing to compare.
+_PUNCT_RE = re.compile(r"[^\w ]|_")
 _WS_RE = re.compile(r"\s+")
 
 
@@ -95,7 +124,9 @@ class MatchResult:
 def _fold(text: str) -> str:
     """Lowercase, strip accents and punctuation, collapse whitespace."""
     folded = unicodedata.normalize("NFKD", text or "")
-    folded = folded.encode("ascii", "ignore").decode()
+    # Dropping the combining marks turns "é" into "e" as the ASCII fold did,
+    # and leaves other scripts' letters in place.
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
     folded = _PUNCT_RE.sub(" ", folded.lower())
     return _WS_RE.sub(" ", folded).strip()
 
@@ -141,8 +172,22 @@ def looks_like_markup(text: str | None) -> bool:
     return bool(HTML_NOISE_RE.search(text or ""))
 
 
+def canonical_language(language: str | None) -> str:
+    """One name per language ("bulgarian" for "bg"), or the folded text itself."""
+    folded = _fold(language or "")
+    return _ALIAS_TO_LANGUAGE.get(folded, folded)
+
+
+def in_language(language: str | None, target: str = "english") -> bool:
+    """Does a language field name the target? libgen sometimes lists several
+    ("Bulgarian, English"), and any one of them counts."""
+    wanted = canonical_language(target) or "english"
+    return any(canonical_language(part) == wanted
+               for part in re.split(r"[,;/]", language or "") if part.strip())
+
+
 def is_english(language: str | None) -> bool:
-    return _fold(language or "") in ENGLISH
+    return in_language(language, "english")
 
 
 def _authors_agree(wanted: str, offered: str | None) -> bool:
@@ -207,29 +252,30 @@ def _language_known(candidate: Candidate) -> bool:
     return bool(_fold(candidate.language or ""))
 
 
-def _is_usable(candidate: Candidate, allow_unknown_language: bool = False) -> bool:
+def _is_usable(candidate: Candidate, allow_unknown_language: bool = False,
+               language: str = "english") -> bool:
     """Format, size and language all acceptable.
 
     A blank language is unknown rather than foreign: libgen leaves the field
     empty on many English files (The Midnight Train, 2026-09-08). The Goodreads
     ranking passes allow_unknown_language and then accepts such a file only on a
     full title and author match, never on an ISBN hit alone. Other callers (the
-    share path's title-only pick) keep requiring English.
+    share path's title-only pick) keep requiring the language by name.
     """
     if candidate.ext.lower() not in FORMAT_PREFERENCE:
         return False
     if allow_unknown_language and not _language_known(candidate):
         pass
-    elif not is_english(candidate.language):
+    elif not in_language(candidate.language, language):
         return False
     if candidate.size_bytes is not None and candidate.size_bytes < MIN_SIZE_BYTES:
         return False
     return True
 
 
-def _rank(candidate: Candidate) -> tuple[int, int, int]:
-    """Named English before unknown, then best format, then the largest file."""
-    unknown = 0 if is_english(candidate.language) else 1
+def _rank(candidate: Candidate, language: str = "english") -> tuple[int, int, int]:
+    """The language named before unknown, then best format, then the largest file."""
+    unknown = 0 if in_language(candidate.language, language) else 1
     fmt = FORMAT_PREFERENCE.index(candidate.ext.lower())
     return (unknown, fmt, -(candidate.size_bytes or 0))
 
@@ -238,25 +284,30 @@ def rank_candidates(
     item: ShelfItem,
     candidates: list[Candidate],
     isbn_matched_md5s: set[str] | None = None,
+    language: str = "english",
 ) -> list[tuple[Candidate, str]]:
     """Every candidate confidently this book, best first, with why it qualified.
 
-    ISBN hits lead because the identifier settles identity; they must name
-    English, since no title reasoning backs them up. Title-and-author matches
+    ISBN hits lead because the identifier settles identity; they must name the
+    language (English unless asked otherwise), since no title reasoning backs
+    them up. Title-and-author matches
     follow. The poller walks this list when Claude refuses the first pick.
     """
     if is_placeholder(item.title):
         return []
     isbn_md5s = isbn_matched_md5s or set()
-    usable = [c for c in candidates if _is_usable(c, allow_unknown_language=True)]
+    usable = [c for c in candidates if _is_usable(c, allow_unknown_language=True, language=language)]
 
-    by_isbn = sorted((c for c in usable if c.md5 in isbn_md5s and is_english(c.language)),
-                     key=_rank)
+    def rank(c: Candidate) -> tuple[int, int, int]:
+        return _rank(c, language)
+
+    by_isbn = sorted((c for c in usable if c.md5 in isbn_md5s and in_language(c.language, language)),
+                     key=rank)
     confident = sorted(
         (c for c in usable
          if c not in by_isbn
          and _titles_agree(item.title, c.title) and _authors_agree(item.author, c.author)),
-        key=_rank,
+        key=rank,
     )
     return [(c, "isbn") for c in by_isbn] + [(c, "title_author") for c in confident]
 
@@ -265,6 +316,7 @@ def select_candidate(
     item: ShelfItem,
     candidates: list[Candidate],
     isbn_matched_md5s: set[str] | None = None,
+    language: str = "english",
 ) -> MatchResult:
     """Pick the one file worth downloading for this shelf item, or explain why not.
 
@@ -277,16 +329,17 @@ def select_candidate(
     if not candidates:
         return MatchResult(None, "not_found")
 
-    ranked = rank_candidates(item, candidates, isbn_matched_md5s)
+    ranked = rank_candidates(item, candidates, isbn_matched_md5s, language=language)
     if ranked:
         candidate, reason = ranked[0]
         return MatchResult(candidate, reason)
 
-    # Distinguish 'exists but not in English' from 'nothing usable at all',
-    # because only the first is worth reporting as a near-miss. Only a language
-    # libgen actually names counts as foreign.
-    if not any(_is_usable(c, allow_unknown_language=True) for c in candidates) and any(
-        _language_known(c) and not is_english(c.language) for c in candidates
+    # Distinguish 'exists but not in this language' from 'nothing usable at
+    # all', because only the first is worth reporting as a near-miss. Only a
+    # language libgen actually names counts as foreign.
+    if not any(_is_usable(c, allow_unknown_language=True, language=language) for c in candidates) and any(
+        _language_known(c) and not in_language(c.language, language) for c in candidates
     ):
-        return MatchResult(None, "no_english_edition")
+        english = canonical_language(language) in ("", "english")
+        return MatchResult(None, "no_english_edition" if english else "no_edition_in_language")
     return MatchResult(None, "no_confident_match")
