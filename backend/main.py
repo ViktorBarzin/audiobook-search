@@ -38,6 +38,7 @@ from backend.goodreads.matcher import (
     _titles_agree,
     author_surname,
     is_placeholder,
+    modern_spelling,
     normalize_author,
     normalize_title,
     select_candidate,
@@ -1306,9 +1307,14 @@ def _libgen_queries(title: str, author: str) -> list[str]:
             forms.append(query)
 
     add(f"{title} {author}")
+    # An old edition's spelling finds only old-spelling scans; libgen lists
+    # most copies in the modern one (Под игото, 2026-10-29).
+    add(f"{modern_spelling(title)} {modern_spelling(author)}")
     main = title.split(":")[0].strip()
     add(f"{main} {author}")
+    add(f"{modern_spelling(main)} {modern_spelling(author)}")
     add(main)
+    add(modern_spelling(main))
     return forms
 
 
@@ -3428,9 +3434,10 @@ async def _process_photo(job_id: str, jpeg: bytes | None = None) -> None:
                     "Share the photo again later"))
                 return
             if not reading.readable:
-                seen = f" (Claude saw {_untrusted(reading.note, 150).rstrip('.')})" if reading.note else ""
+                seen = (f" What Claude saw: {_untrusted(reading.note, 150).rstrip('.')}."
+                        if reading.note else "")
                 job.update(status="failed", code="unreadable", reason=(
-                    f"no book cover could be read in that photo{seen}. "
+                    f"no book cover could be read in that photo.{seen} "
                     "Take the photo of the front cover, straight on"))
                 return
             job.update(title=reading.title, author=reading.author or "Unknown Author",

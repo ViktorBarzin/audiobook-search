@@ -102,3 +102,23 @@ def test_an_old_spelling_cover_matches_modern_rows():
                              [cand("Под игото b f 7621785", "Иван Вазов")], language="bulgarian")
 
     assert match.candidate is not None
+
+
+def test_modern_spelling_keeps_case_and_drops_old_letters():
+    from backend.goodreads.matcher import modern_spelling
+
+    assert modern_spelling("Подъ игото") == "Под игото"
+    assert modern_spelling("Иванъ Вазовъ") == "Иван Вазов"
+    assert modern_spelling("Отцы и дѣти") == "Отцы и дети"
+    assert modern_spelling("Dune") == "Dune"
+
+
+def test_libgen_is_also_searched_in_modern_spelling():
+    """The retry of 2026-10-29 searched 'Подъ игото Иванъ Вазовъ', and libgen
+    answered with the one old-spelling scan, not the modern EPUBs."""
+    import backend.main as bs_main
+
+    queries = bs_main._libgen_queries("Подъ игото", "Иванъ Вазовъ")
+
+    assert "Под игото Иван Вазов" in queries
+    assert queries.index("Под игото Иван Вазов") < queries.index("Подъ игото")

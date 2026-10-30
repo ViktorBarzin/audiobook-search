@@ -130,6 +130,13 @@ _OLD_CYRILLIC = str.maketrans({"ѣ": "е", "і": "и", "ѳ": "ф", "ѵ": "и", "
 _FINAL_HARD_SIGN_RE = re.compile(r"ъ\b")
 
 
+def modern_spelling(text: str) -> str:
+    """Pre-reform Cyrillic in today's letters, case kept, for a search query."""
+    table = {**_OLD_CYRILLIC,
+             **{ord(chr(k).upper()): v.upper() for k, v in _OLD_CYRILLIC.items()}}
+    return re.sub(r"[ъЪ]\b", "", (text or "").translate(table))
+
+
 def _fold(text: str) -> str:
     """Lowercase, strip accents and punctuation, collapse whitespace."""
     folded = (text or "").lower().translate(_OLD_CYRILLIC)
