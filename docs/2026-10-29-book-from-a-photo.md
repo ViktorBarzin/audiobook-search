@@ -1,6 +1,6 @@
 # Book from a photo
 
-**Status:** server and web upload live; shortcut tested on the iPhone, waiting on the Mac to sign it · **Date:** 2026-10-29, revised 2026-10-30 · **Owner:** Viktor ·
+**Status:** live: server, web upload and the signed shortcut; both phones still to reinstall · **Date:** 2026-10-29, revised 2026-10-30 · **Owner:** Viktor ·
 **Repos:** `book-search`, `claude-agent-service` (used as is) · **Namespace:** `ebooks`
 
 ## What this delivers
@@ -80,8 +80,8 @@ the phone, on the web page and in Slack, for example
   `_settle_job`. A photo share with no file gets the free retry and the rescue
   agent like a link share; the retry looks again from the reading.
 - The web page has a photo picker, a recipient choice and the share's result.
-- The shortcut generator builds the combined shortcut. Its signed files are
-  not rebuilt yet, so `/shortcut` still serves today's link shortcut.
+- The shortcut generator builds the combined shortcut, and `/shortcut` serves
+  both signed variants (signed on the Mac on 2026-10-30).
 
 ## Checked on the live system
 
@@ -98,15 +98,15 @@ the phone, on the web page and in Slack, for example
 | shortcut, choose from library | `✅ The War of the Worlds by H. G. Wells → Calibre (epub, 47 s)` |
 | shortcut, camera | the ⚠️ line for a blurry photo, shown in Quick Look after the waits |
 | shortcut, Safari page | Safari still hands over the page with images accepted; `✅ … → Calibre (epub, 19 s)` in Quick Look |
-| shortcut, photo shared from Photos | failed: coercing the photo to a Safari page threw. Fixed in the generator by reading the input's type; not yet tested on the phone |
+| shortcut, photo shared from Photos (first build) | failed: coercing the photo to a Safari page threw. Fixed in the generator by reading the input's type |
+| shortcut, photo shared from Photos (signed build) | `✅ The War of the Worlds by H. G. Wells was already in Calibre` in Quick Look |
+| shortcut, Safari page (signed build) | `✅ Bram Stoker's Dracula → Calibre (epub, 14 s)` in Quick Look |
 
 ## Not done yet
 
-- Sign both variants once the Mac is back, test the Photos share and the
-  Safari share with the type check on the iPhone, then ship the signed files.
-- Remove the Slack start line for link shares with that install, as the
-  2026-09-24 doc planned.
 - Both phones reinstall the shortcut from `/shortcut`, with the current key.
+- Then remove the Slack start line for link shares, as the 2026-09-24 doc
+  planned; it stays until both phones have the shortcut that shows the result.
 
 ## Open questions
 

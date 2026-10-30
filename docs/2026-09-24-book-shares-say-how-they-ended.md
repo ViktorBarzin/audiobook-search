@@ -1,6 +1,6 @@
 # Book shares that always say how they ended
 
-**Status:** steps 1 to 4 live; step 5 (the new shortcut) waits on the London Mac · **Date:** 2026-09-24 · **Owner:** Viktor ·
+**Status:** steps 1 to 4 live; step 5's shortcut is served from `/shortcut` (2026-10-30), and the Slack start line goes once both phones reinstall · **Date:** 2026-09-24 · **Owner:** Viktor ·
 **Repos:** `book-search`, `infra` (`stacks/ebooks`, `.claude/agents/book-rescuer.md`) · **Namespace:** `ebooks`
 
 ## Why
