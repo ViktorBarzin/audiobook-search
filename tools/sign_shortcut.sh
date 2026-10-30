@@ -21,6 +21,7 @@
 #       kubectl -n wireguard exec <pod> -c relayN -- apk add --no-cache socat
 #
 # Usage: tools/sign_shortcut.sh [pod-name]
+#        MAC_HOST=viktorbarzin@<mac-address> tools/sign_shortcut.sh
 set -eu
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,7 +29,10 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 # import question asks for; neither address is baked in.
 VARIANTS=("" "anca")
 
-POD="${1:-$(kubectl -n wireguard get pod -l app=wireguard -o jsonpath='{.items[0].metadata.name}')}"
+POD="${1:-}"
+if [ -z "${MAC_HOST:-}" ] && [ -z "$POD" ]; then
+  POD="$(kubectl -n wireguard get pod -l app=wireguard -o jsonpath='{.items[0].metadata.name}')"
+fi
 HOST=viktorbarzin@10.3.5.2
 # The relay container name changes each time one is created, since an
 # ephemeral container cannot be removed from a live pod and its name must
@@ -37,6 +41,13 @@ RELAY_CONTAINER="${RELAY_CONTAINER:-relay1}"
 RELAY="kubectl -n wireguard exec -i $POD -c $RELAY_CONTAINER -- socat - TCP:10.3.5.2:22"
 SSH_OPTS=(-o "ProxyCommand=$RELAY" -o StrictHostKeyChecking=accept-new
           -o ConnectTimeout=20 -o BatchMode=yes)
+# When the Mac is on the London LAN the devvm reaches it directly, with no
+# relay: MAC_HOST=viktorbarzin@192.168.8.194 (homelab ios doctor names the
+# current address, which rotates).
+if [ -n "${MAC_HOST:-}" ]; then
+  HOST="$MAC_HOST"
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes)
+fi
 
 for variant in "${VARIANTS[@]}"; do
   stem="download-to-calibre${variant:+-$variant}"
@@ -48,7 +59,7 @@ echo "== uploading unsigned $stem ($(stat -c%s "$UNSIGNED") bytes) =="
 # base64 over the ssh channel, because scp has no route of its own here.
 # macOS base64 wants -i/-o rather than positional arguments.
 base64 -w0 "$UNSIGNED" | ssh "${SSH_OPTS[@]}" "$HOST" \
-  'cat > /tmp/dtc.b64 && base64 -d -i /tmp/dtc.b64 -o /tmp/dtc-unsigned.shortcut'
+  'cat > /tmp/dtc.b64 && /usr/bin/base64 -d -i /tmp/dtc.b64 -o /tmp/dtc-unsigned.shortcut'
 
 echo "== signing (mode: anyone) =="
 ssh "${SSH_OPTS[@]}" "$HOST" \
@@ -56,7 +67,7 @@ ssh "${SSH_OPTS[@]}" "$HOST" \
    shortcuts sign --mode anyone --input /tmp/dtc-unsigned.shortcut --output /tmp/dtc-signed.shortcut'
 
 echo "== downloading signed =="
-ssh "${SSH_OPTS[@]}" "$HOST" 'base64 -i /tmp/dtc-signed.shortcut' | tr -d '\n' | base64 -d > "$SIGNED"
+ssh "${SSH_OPTS[@]}" "$HOST" '/usr/bin/base64 -i /tmp/dtc-signed.shortcut' | tr -d '\n' | base64 -d > "$SIGNED"
 
 ssh "${SSH_OPTS[@]}" "$HOST" 'rm -f /tmp/dtc.b64 /tmp/dtc-unsigned.shortcut /tmp/dtc-signed.shortcut'
 

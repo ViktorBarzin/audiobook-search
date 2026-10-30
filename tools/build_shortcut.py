@@ -37,7 +37,7 @@ PLACEHOLDER = "￼"
 
 ENDPOINT = "https://book-search.viktorbarzin.me/api/download-url"
 
-# "Show in Share Sheet", so the shortcut appears when sharing from Safari.
+# "Show in Share Sheet", so the shortcut appears when sharing from Safari or Photos.
 WORKFLOW_TYPES = ["ActionExtension"]
 # ONLY the Safari web page. Accepting WFURLContentItem alongside it made
 # Safari's share sheet hand over the URL representation instead, and Shortcuts
@@ -46,7 +46,10 @@ WORKFLOW_TYPES = ["ActionExtension"]
 # Shortcuts couldn't convert from URL to Safari Web Page" (2026-09-06). The URL
 # and title coerce from a URL, but page contents genuinely need a rendered
 # page, which is the one thing this flow cannot do without.
-INPUT_CLASSES = ["WFSafariWebPageContentItem"]
+# A photo shared from Photos arrives as an image. Whether accepting images
+# changes what Safari hands over, as accepting URLs did, is checked on the
+# iPhone before this ships (docs/2026-10-29-book-from-a-photo.md).
+INPUT_CLASSES = ["WFSafariWebPageContentItem", "WFImageContentItem"]
 
 
 def new_uuid() -> str:
@@ -144,50 +147,158 @@ def text_action(out_uuid: str, value: str = "") -> dict:
     }
 
 
+WAIT_ENDPOINT = "https://book-search.viktorbarzin.me/api/download-status/wait"
+# Six asks of up to 20 s each: iOS gives up on one request at about 25 s, and
+# the phone waits about two minutes in all before the answer moves to Slack.
+WAITS_IN_LOOP = 5
+# A JPEG of this size is plenty for Claude to read a cover, and small enough
+# to upload quickly from a phone. The server shrinks it further either way.
+PHOTO_LONGEST_EDGE = "1600"
+
+
+def variable_input(attachment: dict) -> dict:
+    """The WFInput of an If action: a variable, not a text string."""
+    return {"Type": "Variable", "Variable": attachment}
+
+
+def control(identifier: str, group: str, mode: int, **params) -> dict:
+    """One part of a block: 0 opens it, 1 is Otherwise or a menu case, 2 ends it."""
+    return {
+        "WFWorkflowActionIdentifier": identifier,
+        "WFWorkflowActionParameters": {"GroupingIdentifier": group,
+                                       "WFControlFlowMode": mode, **params},
+    }
+
+
+def action(identifier: str, **params) -> dict:
+    return {"WFWorkflowActionIdentifier": identifier, "WFWorkflowActionParameters": params}
+
+
+def post(body: dict, out_uuid: str, key_uuid: str, deliver_to: str) -> dict:
+    """POST a body to the share endpoint.
+
+    A STATIC url. Embedding variables in a string did not work: the first real
+    run on 2026-09-06 posted url=, title= and kindle_email= all empty, four
+    times over, while the API key in a header arrived fine. An inline
+    attachment described by attachmentsByRange resolved to nothing; a
+    whole-value attachment inside a dictionary resolved correctly.
+
+    ONE attachment in the headers, and it is first. Everything after the first
+    item in the dictionary arrives empty, whatever it references (measured
+    live 2026-09-07 with both shortcuts installed fresh). So who to email is a
+    literal string naming a recipient and the server holds the addresses,
+    which also keeps them out of this file, since /shortcut is served without
+    authentication.
+    """
+    return action(
+        "is.workflow.actions.downloadurl",
+        UUID=out_uuid,
+        WFHTTPMethod="POST",
+        WFURL=ENDPOINT,
+        WFHTTPHeaders=dictionary_value([
+            ("X-Api-Key", action_output(key_uuid, "Text")),
+            ("X-Deliver-To", text_token([deliver_to])),
+        ]),
+        WFHTTPBodyType="File",
+        WFRequestVariable=body,
+    )
+
+
+def wait(out_uuid: str, job_uuid: str, last: bool = False) -> dict:
+    """Ask the wait endpoint for the share's answer. The job id rides in the
+    first header, the one position whose variable resolves."""
+    headers = [("X-Job-Id", action_output(job_uuid, "Dictionary Value"))]
+    if last:
+        headers.append(("X-Last-Wait", text_token(["1"])))
+    return action(
+        "is.workflow.actions.downloadurl",
+        UUID=out_uuid,
+        WFHTTPMethod="GET",
+        WFURL=WAIT_ENDPOINT,
+        WFHTTPHeaders=dictionary_value(headers),
+    )
+
+
+def show(attachment: dict) -> dict:
+    """Show the answer with Quick Look, which takes the variable whole.
+
+    Show Result would embed it in a text string, and an embedded variable is
+    the construct that arrived empty on 2026-09-06.
+    """
+    return action("is.workflow.actions.previewdocument", WFInput=attachment)
+
+
 def build(name: str = "Download to Calibre", deliver_to: str = "") -> dict:
-    key_uuid = new_uuid()
-    page_uuid = new_uuid()
+    """One shortcut for a shared Anna's Archive page and for a photo of a cover.
+
+    Shared from Safari, it posts the rendered page, as it always has. Shared
+    from Photos, it posts the photo as a JPEG. Run from the home screen with
+    nothing shared, it asks for a new photo or one from the library. Either way
+    it then asks the wait endpoint six times and shows the last answer: the
+    line the share ended with, or where its result will land.
+    """
+    key_uuid, page_uuid, page_reply = new_uuid(), new_uuid(), new_uuid()
+    photo_reply, reply_if, photo_if = new_uuid(), new_uuid(), new_uuid()
+    menu_uuid, given_uuid, resized, jpeg = new_uuid(), new_uuid(), new_uuid(), new_uuid()
+    job_uuid, last_uuid, type_uuid = new_uuid(), new_uuid(), new_uuid()
+    by_kind, has_input, menu, repeat = new_uuid(), new_uuid(), new_uuid(), new_uuid()
+    take, choose = "Take a photo", "Choose from library"
 
     actions = [
         text_action(key_uuid),
-        # The page is the only thing the phone actually needs to send. Anna's
-        # Archive names its own md5 in every download link on it, and the title
-        # and the author are on it too, so the server needs neither a URL nor a
-        # title alongside.
+        # What was shared: "Safari web page", "Photo media", "Image", or
+        # nothing. Coercing the input to a page instead worked for nothing
+        # and threw for a photo from Photos ("couldn't convert from Photo media
+        # to Safari Web Page", rig, 2026-10-30).
+        action("is.workflow.actions.getitemtype", UUID=type_uuid, WFInput=extension_input()),
+        control("is.workflow.actions.conditional", by_kind, 0,
+                WFInput=variable_input(action_output(type_uuid, "Type")),
+                WFCondition=99, WFConditionalActionString=text_token(["Safari"])),
+        # The page is all the server needs: Anna's Archive names its own md5
+        # in every download link on it, and the title and author are there too.
         safari_property("Page Contents", page_uuid),
-        {
-            "WFWorkflowActionIdentifier": "is.workflow.actions.downloadurl",
-            "WFWorkflowActionParameters": {
-                "UUID": new_uuid(),
-                "WFHTTPMethod": "POST",
-                # A STATIC url. Embedding variables in a string did not
-                # work: the first real run on 2026-09-06 posted url=, title=
-                # and kindle_email= all empty, four times over, while the API
-                # key in a header arrived fine. An inline attachment described
-                # by attachmentsByRange resolved to nothing; a whole-value
-                # attachment inside a dictionary resolved correctly. So every
-                # value now rides in a header, which is the shape that works.
-                "WFURL": ENDPOINT,
-                # ONE attachment, and it is first. Everything after the first
-                # item in this dictionary arrives empty, whatever it
-                # references. Measured live 2026-09-07 with both shortcuts
-                # installed fresh: X-Api-Key resolved while X-Book-Url,
-                # X-Book-Title and X-Kindle-Email did not, and the last of
-                # those read a Text action exactly like the api key does. That
-                # corrects the earlier reading, which blamed the URL Encode
-                # step. Position in the dictionary is what decides.
-                #
-                # So who to email is a literal string naming a recipient and
-                # the server holds the addresses, which also keeps them out of
-                # this file, since /shortcut is served without authentication.
-                "WFHTTPHeaders": dictionary_value([
-                    ("X-Api-Key", action_output(key_uuid, "Text")),
-                    ("X-Deliver-To", text_token([deliver_to])),
-                ]),
-                "WFHTTPBodyType": "File",
-                "WFRequestVariable": action_output(page_uuid, "Page Contents"),
-            },
-        },
+        post(action_output(page_uuid, "Page Contents"), page_reply, key_uuid, deliver_to),
+        control("is.workflow.actions.conditional", by_kind, 1),
+        control("is.workflow.actions.conditional", has_input, 0,
+                WFInput=variable_input(extension_input()), WFCondition=100),
+        action("is.workflow.actions.getvariable", UUID=given_uuid, WFVariable=extension_input()),
+        control("is.workflow.actions.conditional", has_input, 1),
+        control("is.workflow.actions.choosefrommenu", menu, 0,
+                WFMenuPrompt="Book from a photo",
+                WFMenuItems=[{"WFItemType": 0, "WFValue": text_token([take])},
+                             {"WFItemType": 0, "WFValue": text_token([choose])}]),
+        control("is.workflow.actions.choosefrommenu", menu, 1,
+                WFMenuItemTitle=take, WFMenuItemAttributedTitle=text_token([take])),
+        action("is.workflow.actions.takephoto", UUID=new_uuid(), WFPhotoCount=1,
+               WFCameraCaptureShowPreview=True),
+        control("is.workflow.actions.choosefrommenu", menu, 1,
+                WFMenuItemTitle=choose, WFMenuItemAttributedTitle=text_token([choose])),
+        action("is.workflow.actions.selectphoto", UUID=new_uuid(), WFSelectMultiplePhotos=False),
+        control("is.workflow.actions.choosefrommenu", menu, 2, UUID=menu_uuid),
+        control("is.workflow.actions.conditional", has_input, 2, UUID=photo_if),
+        # iPhone photos are HEIC and several megabytes; a JPEG of 1600 px
+        # uploads in a moment and every server-side reader opens it.
+        action("is.workflow.actions.image.resize", UUID=resized,
+               WFImage=action_output(photo_if, "If Result"),
+               WFImageResizeKey="Longest Edge", WFImageResizeLength=PHOTO_LONGEST_EDGE),
+        action("is.workflow.actions.image.convert", UUID=jpeg,
+               WFInput=action_output(resized, "Resized Image"), WFImageFormat="JPEG",
+               WFImageCompressionQuality=0.8, WFImagePreserveMetadata=False),
+        post(action_output(jpeg, "Converted Image"), photo_reply, key_uuid, deliver_to),
+        control("is.workflow.actions.conditional", by_kind, 2, UUID=reply_if),
+        action("is.workflow.actions.getvalueforkey", UUID=job_uuid,
+               WFInput=action_output(reply_if, "If Result"),
+               WFGetDictionaryValueType="Value", WFDictionaryKey="job_id"),
+        control("is.workflow.actions.repeat.count", repeat, 0, WFRepeatCount=WAITS_IN_LOOP),
+    ]
+    # No If on the answer: "Contents of URL" is a file to Shortcuts, so a text
+    # comparison on it imports broken (rig, 2026-10-30). A finished share
+    # answers each ask at once, so the remaining asks cost nothing.
+    actions += [wait(new_uuid(), job_uuid)]
+    actions += [
+        control("is.workflow.actions.repeat.count", repeat, 2, UUID=new_uuid()),
+        wait(last_uuid, job_uuid, last=True),
+        show(action_output(last_uuid, "Contents of URL")),
     ]
 
     return {

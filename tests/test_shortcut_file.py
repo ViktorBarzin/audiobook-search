@@ -37,7 +37,7 @@ def test_it_shows_up_in_the_share_sheet_for_a_web_page(shortcut):
 def test_every_variable_points_at_an_action_that_produces_it(shortcut):
     """A dangling OutputUUID is the classic hand-rolled-plist bug."""
     actions = shortcut["WFWorkflowActions"]
-    produced = {a["WFWorkflowActionParameters"]["UUID"] for a in actions}
+    produced = {a["WFWorkflowActionParameters"].get("UUID") for a in actions} - {None}
 
     referenced = set()
 
@@ -133,17 +133,24 @@ def test_the_page_is_the_only_thing_read_off_safari(shortcut):
     assert reads == ["Page Contents"]
 
 
-def test_the_request_posts_to_a_static_url_with_headers(shortcut):
-    request = shortcut["WFWorkflowActions"][-1]
-    assert request["WFWorkflowActionIdentifier"] == "is.workflow.actions.downloadurl"
-    params = request["WFWorkflowActionParameters"]
+def posts(shortcut):
+    return [a["WFWorkflowActionParameters"] for a in shortcut["WFWorkflowActions"]
+            if a["WFWorkflowActionIdentifier"] == "is.workflow.actions.downloadurl"
+            and a["WFWorkflowActionParameters"]["WFHTTPMethod"] == "POST"]
 
-    assert params["WFHTTPMethod"] == "POST"
-    assert params["WFURL"] == ENDPOINT, "no variables embedded in the url"
-    headers = params["WFHTTPHeaders"]
-    assert headers["WFSerializationType"] == "WFDictionaryFieldValue"
-    # The page is far too large for a header, so it stays the request body.
-    assert params["WFHTTPBodyType"] == "File"
+
+def test_the_request_posts_to_a_static_url_with_headers(shortcut):
+    requests = posts(shortcut)
+    assert len(requests) == 2, "one post for a page, one for a photo"
+    for params in requests:
+        assert params["WFURL"] == ENDPOINT, "no variables embedded in the url"
+        headers = params["WFHTTPHeaders"]
+        assert headers["WFSerializationType"] == "WFDictionaryFieldValue"
+        # A page or a photo is far too large for a header, so it is the body.
+        assert params["WFHTTPBodyType"] == "File"
+        first = headers["Value"]["WFDictionaryFieldValueItems"][0]
+        assert first["WFKey"]["Value"]["string"] == "X-Api-Key", (
+            "only the first header's variable resolves, and the key needs it")
 
 
 # --- the endpoint that hands it out ---------------------------------------
@@ -212,10 +219,13 @@ def test_the_two_variants_differ_only_in_name_and_recipient():
     assert shape(mine) == shape(hers), "the two must do the same thing"
 
     def recipient(d):
-        items = (d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
-                 ["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"])
-        by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
-        return by_name["X-Deliver-To"]["WFValue"]["Value"]["string"]
+        names = set()
+        for params in posts(d):
+            items = params["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+            by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
+            names.add(by_name["X-Deliver-To"]["WFValue"]["Value"]["string"])
+        assert len(names) == 1, "a page and a photo go to the same Kindle"
+        return names.pop()
 
     assert recipient(mine) == "", "his imports and stops"
     assert recipient(hers) == "anca", "hers names whose Kindle it is"
@@ -285,7 +295,7 @@ def test_the_committed_files_match_the_generator(variant, stem):
             return {
                 k: strip_uuids(v)
                 for k, v in node.items()
-                if k not in ("UUID", "OutputUUID")
+                if k not in ("UUID", "OutputUUID", "GroupingIdentifier")
             }
         if isinstance(node, list):
             return [strip_uuids(v) for v in node]
@@ -307,20 +317,84 @@ def test_both_variants_ship_a_signed_copy(stem):
         assert fh.read(4) == b"AEA1"
 
 
-def test_only_a_safari_web_page_is_accepted_as_input():
+def test_a_safari_page_and_an_image_are_the_only_inputs():
     """Running from Safari's share sheet on a book page failed on 2026-09-06:
 
         Get Details of Safari Web Page failed because Shortcuts couldn't
         convert from URL to Safari Web Page.
 
     Accepting WFURLContentItem alongside the page let the share sheet hand over
-    the URL representation, and a URL cannot be converted back into a page.
-    The URL and title coerce from a URL; page contents do not, and they are the
-    one thing this flow exists to collect.
+    the URL representation, and a URL cannot be converted back into a page. So
+    URLs stay out. Images come in for photo shares (2026-10-29).
     """
     d = build()
 
-    assert d["WFWorkflowInputContentItemClasses"] == ["WFSafariWebPageContentItem"]
+    assert d["WFWorkflowInputContentItemClasses"] == ["WFSafariWebPageContentItem", "WFImageContentItem"]
+
+
+def test_every_block_that_opens_is_closed(shortcut):
+    """An If, a menu or a repeat without its end does not import."""
+    modes: dict[str, list[int]] = {}
+    for a in shortcut["WFWorkflowActions"]:
+        params = a["WFWorkflowActionParameters"]
+        if "GroupingIdentifier" in params:
+            modes.setdefault(params["GroupingIdentifier"], []).append(params["WFControlFlowMode"])
+    assert modes
+    for group, seen in modes.items():
+        assert seen[0] == 0 and seen[-1] == 2 and all(m == 1 for m in seen[1:-1]), (group, seen)
+
+
+def test_a_page_is_told_from_a_photo_by_its_type(shortcut):
+    """Coercing a photo to a Safari page threw on the rig (2026-10-30), so the
+    branch reads the input's type and looks for "Safari" in it."""
+    actions = shortcut["WFWorkflowActions"]
+    ids = [a["WFWorkflowActionIdentifier"] for a in actions]
+    assert ids[1] == "is.workflow.actions.getitemtype"
+    first_if = actions[2]["WFWorkflowActionParameters"]
+    assert first_if["WFCondition"] == 99
+    assert first_if["WFConditionalActionString"]["Value"]["string"] == "Safari"
+    assert "Aggrandizements" not in str(actions) or "WFCoercionVariableAggrandizement" not in str(actions)
+
+
+def test_with_nothing_shared_it_offers_the_camera_and_the_library(shortcut):
+    ids = [a["WFWorkflowActionIdentifier"] for a in shortcut["WFWorkflowActions"]]
+    assert "is.workflow.actions.takephoto" in ids
+    assert "is.workflow.actions.selectphoto" in ids
+    menu = next(a["WFWorkflowActionParameters"] for a in shortcut["WFWorkflowActions"]
+                if a["WFWorkflowActionIdentifier"] == "is.workflow.actions.choosefrommenu")
+    assert [i["WFValue"]["Value"]["string"] for i in menu["WFMenuItems"]] == [
+        "Take a photo", "Choose from library"]
+
+
+def test_a_photo_is_posted_as_a_small_jpeg(shortcut):
+    by_id = {a["WFWorkflowActionIdentifier"]: a["WFWorkflowActionParameters"]
+             for a in shortcut["WFWorkflowActions"]}
+    assert by_id["is.workflow.actions.image.convert"]["WFImageFormat"] == "JPEG"
+    assert by_id["is.workflow.actions.image.resize"]["WFImageResizeKey"] == "Longest Edge"
+    photo_post = posts(shortcut)[1]
+    assert photo_post["WFRequestVariable"]["Value"]["OutputName"] == "Converted Image"
+
+
+def test_it_waits_for_the_answer_and_shows_it(shortcut):
+    """Six asks of the wait endpoint, the job id in the first header."""
+    waits = [a["WFWorkflowActionParameters"] for a in shortcut["WFWorkflowActions"]
+             if a["WFWorkflowActionIdentifier"] == "is.workflow.actions.downloadurl"
+             and a["WFWorkflowActionParameters"]["WFHTTPMethod"] == "GET"]
+    assert len(waits) == 2, "one inside the repeat, one last ask after it"
+    for params in waits:
+        first = params["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"][0]
+        assert first["WFKey"]["Value"]["string"] == "X-Job-Id"
+    repeat = next(a["WFWorkflowActionParameters"] for a in shortcut["WFWorkflowActions"]
+                  if a["WFWorkflowActionIdentifier"] == "is.workflow.actions.repeat.count")
+    assert repeat["WFRepeatCount"] == 5
+    # A text test on "Contents of URL" imported broken on the rig (2026-10-30):
+    # the only text test is on the input's type, which is text.
+    conditions = [a["WFWorkflowActionParameters"] for a in shortcut["WFWorkflowActions"]
+                  if "WFConditionalActionString" in a["WFWorkflowActionParameters"]]
+    assert len(conditions) == 1
+    assert conditions[0]["WFInput"]["Variable"]["Value"]["OutputName"] == "Type"
+    last = shortcut["WFWorkflowActions"][-1]
+    assert last["WFWorkflowActionIdentifier"] == "is.workflow.actions.previewdocument"
 
 
 def test_page_contents_is_read_before_anything_can_coerce_the_input():
@@ -345,10 +419,9 @@ def test_no_value_is_embedded_in_a_string(monkeypatch):
     the shortcut must carry every value the second way.
     """
     d = build()
-    request = d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
-
-    assert isinstance(request["WFURL"], str), "the url must be a plain static string"
-    assert request["WFURL"].startswith("https://")
+    for request in posts(d):
+        assert isinstance(request["WFURL"], str), "the url must be a plain static string"
+        assert request["WFURL"].startswith("https://")
 
     def has_inline_attachment(node):
         if isinstance(node, dict):
@@ -368,11 +441,11 @@ def test_no_value_is_embedded_in_a_string(monkeypatch):
 def test_the_headers_are_the_api_key_and_the_recipient():
     """Nothing else travels. The page in the body carries the rest."""
     d = build()
-    request = d["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
-    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
-    names = [i["WFKey"]["Value"]["string"] for i in items]
+    for request in posts(d):
+        items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+        names = [i["WFKey"]["Value"]["string"] for i in items]
 
-    assert names == ["X-Api-Key", "X-Deliver-To"]
+        assert names == ["X-Api-Key", "X-Deliver-To"]
 
 
 def test_only_one_header_carries_a_variable(shortcut):
@@ -384,20 +457,22 @@ def test_only_one_header_carries_a_variable(shortcut):
     property or a Text action, so what decides is position, not kind. The page
     body is unaffected because it rides WFRequestVariable.
     """
-    request = shortcut["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
-    items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
-
     def is_attachment(item):
         return item["WFValue"].get("WFSerializationType") == "WFTextTokenAttachment"
 
-    assert is_attachment(items[0]), "the first header is the one that resolves"
-    assert not any(is_attachment(i) for i in items[1:]), (
-        "a second attachment in this dictionary silently arrives empty"
-    )
+    for action in shortcut["WFWorkflowActions"]:
+        params = action["WFWorkflowActionParameters"]
+        if "WFHTTPHeaders" not in params:
+            continue
+        items = params["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
+        assert is_attachment(items[0]), "the first header is the one that resolves"
+        assert not any(is_attachment(i) for i in items[1:]), (
+            "a second attachment in this dictionary silently arrives empty"
+        )
 
 
 def test_the_recipient_is_a_plain_string(shortcut):
-    request = shortcut["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+    request = posts(shortcut)[0]
     items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
     by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
 
@@ -410,7 +485,7 @@ def test_the_anca_variant_names_her(shortcut):
     from tools.build_shortcut import VARIANTS, build
 
     anca = build(*VARIANTS["anca"])
-    request = anca["WFWorkflowActions"][-1]["WFWorkflowActionParameters"]
+    request = posts(anca)[1]
     items = request["WFHTTPHeaders"]["Value"]["WFDictionaryFieldValueItems"]
     by_name = {i["WFKey"]["Value"]["string"]: i for i in items}
 
