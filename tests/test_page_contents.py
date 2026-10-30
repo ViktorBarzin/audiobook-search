@@ -248,3 +248,13 @@ async def test_libgen_by_hash_is_tried_even_when_a_page_supplied_a_detail(monkey
     assert ok is True
     assert libgen.hash_calls == [MD5], "the hash route must run first, detail or not"
     assert job["book_id"] == 900
+
+
+def test_a_libgen_page_does_not_name_the_book_after_the_site(monkeypatch):
+    """A libgen ads.php page shared from Safari on the rig (2026-10-30) ended
+    '✅ Library Genesis → Calibre': its <title> is the site's name."""
+    monkeypatch.setattr(bs_main, "annas_scraper", AnnasArchiveScraper())
+    page = ("<html><head><title>Library Genesis</title></head><body>"
+            "<a href='get.php?md5=14f27cd9323d3446814af3e8bc1e508d&key=X'>GET</a></body></html>")
+
+    assert bs_main._detail_from_page(page, "14f27cd9323d3446814af3e8bc1e508d") is None

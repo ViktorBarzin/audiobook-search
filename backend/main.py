@@ -2889,7 +2889,10 @@ def _detail_from_page(page: str | None, md5: str):
     # would shadow the title the share sheet did supply.
     if not detail.title or is_placeholder(detail.title):
         return None
-    if normalize_title(detail.title) in (normalize_title("Unknown"), normalize_title("Anna's Archive")):
+    # A site's own name is not a book's: libgen's ads.php page is titled
+    # "Library Genesis", and the library names the book once it is imported.
+    if normalize_title(detail.title) in (normalize_title("Unknown"), normalize_title("Anna's Archive"),
+                                         normalize_title("Library Genesis")):
         return None
     logger.info(
         "Parsed the posted page for %s: %r by %r (%d mirrors)",
