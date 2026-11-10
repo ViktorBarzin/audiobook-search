@@ -260,6 +260,13 @@ book by hand, and shares it back (see below). Repeated errors — a source down,
 unreachable — are posted once and suppressed until the condition changes, so a broken
 dependency cannot produce a message every two minutes.
 
+Since 2026-11-10 that latch is kept in Postgres (`goodreads_alert`, one row per kind:
+`feed` or `poller`), not in the poller's memory. A feed failure posts once and stays quiet
+until a feed read succeeds, even across pod restarts and even if the error text changes in
+between; every cycle still logs it. The in-memory version re-posted the same HTTP 404 14
+times between 2026-10-27 and 2026-11-10, once per restart and once after each one-off
+connection error.
+
 ## Adding a book by hand
 
 When the pipeline cannot find something, the manual route needs no file transfer from the

@@ -39,8 +39,9 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 # never looked at again until she happens to add something.
 FULL_REFRESH_SECONDS = int(os.getenv("GOODREADS_FULL_REFRESH_SECONDS", "900"))
 
-# A repeated failure (feed down, source down) should say so once, not every cycle.
-_last_error: str | None = None
+# A failure still open when the store cannot be reached: the fallback latch, so
+# a database outage degrades to "once per process" rather than "every cycle".
+_memory_alerts: set[str] = set()
 
 
 def etag_to_send(etag: str | None, last_full: float, now: float,
@@ -146,7 +147,7 @@ async def poll_forever() -> None:
                 result = await fetch_shelf(
                     client, GOODREADS_USER_ID, GOODREADS_SHELF, etag=send,
                 )
-                _clear_error()
+                clear_failure(store, "feed")
                 if result.status is FeedStatus.OK:
                     etag = result.etag or etag
                     outcome = await sync.process(result.items)
@@ -159,32 +160,48 @@ async def poll_forever() -> None:
                             outcome.downloaded, outcome.missed, outcome.errors,
                             outcome.would_download,
                         )
+                clear_failure(store, "poller")
             except FeedError as exc:
-                await _report_once(client, f"Goodreads feed unreadable: {exc}")
+                await report_failure(client, store, "feed", f"Goodreads feed unreadable: {exc}")
             except Exception as exc:
                 logger.exception("Poll cycle failed")
-                await _report_once(client, f"Goodreads poller error: {exc}")
+                await report_failure(client, store, "poller", f"Goodreads poller error: {exc}")
 
             await asyncio.sleep(POLL_SECONDS)
 
 
-def _clear_error() -> None:
-    global _last_error
-    _last_error = None
+def clear_failure(store: MemorySeenStore | PostgresSeenStore, kind: str) -> None:
+    """The failure of this kind is over; the next one posts again."""
+    _memory_alerts.discard(kind)
+    try:
+        if store.clear_alert(kind):
+            logger.info("Goodreads %s failure cleared", kind)
+    except Exception as exc:
+        logger.warning("Could not clear the %s alert in the store: %s", kind, exc)
 
 
-async def _report_once(client: httpx.AsyncClient, message: str) -> None:
-    """Post a failure the first time it appears, then stay quiet until it clears."""
-    global _last_error
+async def report_failure(
+    client: httpx.AsyncClient, store: MemorySeenStore | PostgresSeenStore, kind: str, message: str,
+) -> None:
+    """Log a failure every cycle; post it to Slack only when it first opens.
+
+    The latch is per kind ("feed", "poller") and lives in the store, so neither a
+    restart nor a different error text while the same thing is still broken posts
+    it again. Only clear_failure, called once the feed reads again, re-arms it.
+    """
     logger.error(message)
-    if message == _last_error:
+    try:
+        is_new = store.raise_alert(kind, message)
+    except Exception as exc:
+        logger.warning("Could not record the %s alert in the store: %s", kind, exc)
+        is_new = kind not in _memory_alerts
+    _memory_alerts.add(kind)
+    if not is_new or not SLACK_WEBHOOK_URL:
         return
-    _last_error = message
-    if SLACK_WEBHOOK_URL:
-        try:
-            await client.post(SLACK_WEBHOOK_URL, json={"text": f"⚠️ {message}"}, timeout=10)
-        except Exception as exc:
-            logger.warning("Could not report to Slack: %s", exc)
+    try:
+        await client.post(SLACK_WEBHOOK_URL, json={"text": f"⚠️ {message}"}, timeout=10)
+    except Exception as exc:
+        logger.warning("Could not report to Slack: %s", exc)
 
 
 if __name__ == "__main__":

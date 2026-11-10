@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS goodreads_seen (
 );
 ALTER TABLE goodreads_seen ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS goodreads_seen_outcome_idx ON goodreads_seen (outcome);
+CREATE TABLE IF NOT EXISTS goodreads_alert (
+    kind    TEXT PRIMARY KEY,
+    message TEXT NOT NULL,
+    since   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -57,6 +62,7 @@ class MemorySeenStore:
     def __init__(self):
         self._rows: dict[str, dict] = {}
         self._claim_age: dict[str, float] = {}
+        self._alerts: dict[str, str] = {}
 
     def ensure_schema(self) -> None:
         pass
@@ -130,6 +136,17 @@ class MemorySeenStore:
                 book_id, {"outcome": Outcome.SEEDED.value, "title": title},
             )
         return len(self._rows)
+
+    def raise_alert(self, kind: str, message: str) -> bool:
+        """Mark a failure as reported; True only when it was not already open."""
+        if kind in self._alerts:
+            return False
+        self._alerts[kind] = message
+        return True
+
+    def clear_alert(self, kind: str) -> bool:
+        """Close a reported failure; True when one was open."""
+        return self._alerts.pop(kind, None) is not None
 
     def record(self, item, outcome: Outcome, reason=None, md5=None, calibre_id=None) -> None:
         attempts = self._rows.get(item.book_id, {}).get("attempts", 0)
@@ -247,6 +264,25 @@ class PostgresSeenStore:
                 rows,
             )
         return len(rows)
+
+    def raise_alert(self, kind: str, message: str) -> bool:
+        """Mark a failure as reported; True only when it was not already open.
+
+        Kept in the database so a restarted poller does not post it again.
+        """
+        with self._connection().cursor() as cur:
+            cur.execute(
+                """INSERT INTO goodreads_alert (kind, message) VALUES (%s, %s)
+                   ON CONFLICT (kind) DO NOTHING RETURNING kind""",
+                (kind, message),
+            )
+            return cur.fetchone() is not None
+
+    def clear_alert(self, kind: str) -> bool:
+        """Close a reported failure; True when one was open."""
+        with self._connection().cursor() as cur:
+            cur.execute("DELETE FROM goodreads_alert WHERE kind = %s RETURNING kind", (kind,))
+            return cur.fetchone() is not None
 
     def release(self, item) -> None:
         """Give a claim back without recording an outcome."""
